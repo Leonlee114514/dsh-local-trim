@@ -282,12 +282,16 @@ await ok('扫本机 gguf：目录里只有 mmproj 时算没有模型', async () 
 })
 
 await ok('自选端口 + 指定 gguf：端口按用户填的走，报回来的也是它', async () => {
+  // CI 上没有 WorkBuddy 的 llama.cpp，所以把「磁盘上有什么」整段注入进来。
+  // 这条用例要验的是端口与别名的传递，不是这台机器装没装。
   const plan = planLaunch({
     port: 8095,
     modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
     ctx: 65536,
+    existsSync: (target) => /llama-server\.exe$/.test(target) || /^[A-Za-z]:\//.test(target),
+    listDir: (dir) => (/\/bin$/.test(dir) ? ['b11012'] : []),
   })
-  assert.equal(plan.ok, true)
+  assert.equal(plan.ok, true, plan.error)
   assert.equal(plan.port, 8095)
   assert.equal(plan.args[plan.args.indexOf('--port') + 1], '8095')
   assert.equal(plan.args[plan.args.indexOf('--alias') + 1], 'local_model')
