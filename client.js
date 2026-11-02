@@ -274,14 +274,15 @@ window.__ModuleLoader__.load({
                 row.local ? h('span', { style: S.hint }, '· 本地') : null,
                 h('span', { style: S.grow }),
                 h('span', { style: S.hint }, row.state?.label ?? ''),
-                // 点灯是红的才给「拉起」：后端已经在跑的时候这个按钮只会误导人
-                row.local === true && row.state?.tone === 'bad'
+                // 本地 provider 一律给「拉起」：灯是灰的（未检测）时也需要这个按钮，
+                // 真点下去也不会重复起进程 —— 服务端会先探测，已经在应答就直接回一句。
+                row.local === true
                   ? h(
                       'button',
                       {
                         style: S.small,
                         disabled: busy !== '',
-                        title: '在这台机器上找到后端并起一个脱离宿主的进程，等到端口应答',
+                        title: '在这台机器上找到后端并起一个脱离宿主的进程，等到端口应答（已经在跑就不会重复起）',
                         onClick: () => onLaunch(row),
                       },
                       busy === 'launch:' + row.id ? '拉起中…' : '拉起',
@@ -481,9 +482,11 @@ window.__ModuleLoader__.load({
 
       if (!mine) return null
 
+      // 刷新状态一律带上点灯：服务端有 15 秒缓存，多问一次不疼；
+      // 只拿 online:false 会把所有灯刷成「未检测」，顺便把「拉起」一起弄没。
       const refreshStatus = async () => {
         try {
-          const payload = await call('status', { online: false })
+          const payload = await call('status', {})
           setState((prev) => ({ ...prev, status: payload.status ?? prev.status, revision: payload.revision ?? prev.revision }))
         } catch {
           /* 状态刷新失败不影响已显示的内容 */
