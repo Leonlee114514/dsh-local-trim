@@ -18,6 +18,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      # lib/config.js 顶层 import 了 @deepseek-ai/schemastery（devDependency）；
+      # 不装依赖时下面的契约检查必然以 ERR_MODULE_NOT_FOUND 失败。
+      - name: Install dev dependencies
+        run: npm ci --no-audit --no-fund
       - name: Syntax check
         run: node --check lib/index.js
       - name: Module loads and exports the plugin contract
