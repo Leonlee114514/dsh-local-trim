@@ -1,6 +1,10 @@
 // 验证 routes: [] 的自动识别：本地端点命中、云端 provider 全部放行。
 // 不依赖 dsh 运行时，用最小假 ctx 复刻 apply 需要的那几个服务。
-import { apply, spliceInject } from '../lib/index.js'
+// 测试会调 apply()，把日志写到临时文件，别污染 ~/.dsh/local-llm/local-trim.log。
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+process.env.DSH_LOCAL_TRIM_LOG = process.env.DSH_LOCAL_TRIM_LOG || join(tmpdir(), 'dsh-local-trim.test.log')
+const { apply, spliceInject } = await import('../lib/index.js')
 
 globalThis.__dshPurgeHungPrompt = () => 'X'.repeat(200)
 
@@ -64,7 +68,7 @@ const check = (label, ok, extra = '') => {
   results.push(`  ${ok ? '✓' : '✗'} ${label}${extra ? '  ' + extra : ''}`)
 }
 
-apply(makeCtx(), { routes: [], injectText: 'LIGHT', schemaTrim: false, selfCheck: false })
+apply(makeCtx(), { routes: [], injectText: 'LIGHT', schemaTrim: false, selfCheck: false, provision: false })
 
 // 从注册的 handler 里取出 assemble 的那个
 const assembleHandler = calls.find((c) => c.event === 'system-prompt/assemble')?.handler
@@ -93,7 +97,7 @@ for (const provider of CLOUD) {
 
 // 不写 routes 时退回 local-qwen
 calls.length = 0
-apply(makeCtx(), { injectText: 'LIGHT', schemaTrim: false, selfCheck: false })
+apply(makeCtx(), { injectText: 'LIGHT', schemaTrim: false, selfCheck: false, provision: false })
 const h2 = calls.find((c) => c.event === 'system-prompt/assemble')?.handler
 const a1 = makeAssembly()
 check('routes 缺省仍只认 local-qwen（local-qwen 命中）', (await h2(a1, { agent: makeAgent('local-qwen') }, async () => a1)) !== a1)
@@ -102,7 +106,7 @@ check('routes 缺省时 ollama 不命中', (await h2(a2, { agent: makeAgent('oll
 
 // schemaTrim: false 时 tools 不动
 calls.length = 0
-apply(makeCtx(), { routes: [], injectText: 'LIGHT', schemaTrim: false, selfCheck: false })
+apply(makeCtx(), { routes: [], injectText: 'LIGHT', schemaTrim: false, selfCheck: false, provision: false })
 const h3 = calls.find((c) => c.event === 'system-prompt/assemble')?.handler
 const a3 = makeAssembly()
 const out3 = await h3(a3, { agent: makeAgent('local-qwen') }, async () => a3)
