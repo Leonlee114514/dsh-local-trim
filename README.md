@@ -45,6 +45,26 @@ token 会被立刻加回去。
 
 ## 安装
 
+### 方式一：`dsh plugin add`（推荐，v0.1.1 起）
+
+包已声明 `dsh.bundle`，装完自动生效，默认开启自动识别（`routes: []`）：
+
+```bash
+dsh plugin add github:Leonlee114514/dsh-local-trim
+```
+
+不想要自动识别就改自己 profile 的 `cordis.patch.yml`，把 `local-tool-trim` 的 `routes` 写死：
+
+```yaml
+- id: local-tool-trim
+  config:
+    routes: [my-local-provider]   # 只裁这一个 provider
+```
+
+### 方式二：本地源码 + `link:`
+
+适合改代码调试。
+
 ```bash
 # 1) 进你的 DSH profile 目录
 cd ~/.dsh/profiles/desktop          # Windows: %USERPROFILE%\.dsh\profiles\desktop
