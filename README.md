@@ -86,6 +86,48 @@ pnpm add link:../../../path/to/dsh-local-trim
 > `pnpm install` 都会把它当无主残留隔离删除（日志在 `.dsh-market/log.ndjson`）。一定要用
 > `pnpm add link:...` 或写进 `dependencies`。
 
+### 一步到位（v0.2.0 起）
+
+不想手写 `llm-pi-ai` 的 baseURL / 窗口 / 模型列表：插件启动时会自己探测本地端点，
+探到能连上的就把 provider 写进你的 `cordis.patch.yml`（持久化，重启还在），
+新 provider 立刻可选用，不需要重启 DSH。
+
+```yaml
+- insert:
+    - id: local-tool-trim
+      name: dsh-local-trim
+      inject: [ tools, systemPrompt ]
+      config:
+        provision: true     # 或写成对象，见下
+```
+
+`provision` 三态：
+
+| 写法 | 行为 |
+| --- | --- |
+| `false` | 完全不探测，插件只做裁剪 |
+| `true`（或不写） | 按顺序探 `8090`(llama.cpp) → `11434`(Ollama) → `8000`(vLLM) → `1234`(LM Studio)，命中第一个可用的 |
+| `{ endpoint: 'http://host:port/v1' }` | 只探这一个地址 |
+| `{ endpoints: [...], provider: 'my-local', overwrite: true }` | 自定义列表 / 名字 / 是否覆盖同名配置 |
+
+行为约定：
+
+- **已有可用的本地 provider 就完全不写入** —— 你手写的 `local-qwen` 不会被覆盖。
+- provider id 按端口推断：`8090 → local-llamacpp`、`11434 → local-ollama`、
+  `8000 → local-vllm`、`1234 → local-lmstudio`；可用 `provider:` 指定。
+- 窗口 / 输出长度从后端的 `/v1/models` 的 `meta.n_ctx`、`meta.n_predict` 读；
+  读不到就退回保守值。
+- 自动生成的 profile 带 `compat.chatTemplateKwargs.enable_thinking: false` ——
+  本地 chat template 默认开思考模式时，模型会把 `max_tokens` 全花在
+  `reasoning_content` 上，`content` 直接空字符串。不需要就在 `provision` 里写
+  `chatTemplateKwargs: null`。
+- 探测与写入失败都不会影响裁剪，把原因写进日志（默认
+  `~/.dsh/local-llm/local-trim.log`，可用 `DSH_LOCAL_TRIM_LOG` 改位置）。
+
+> 插件**热重载**期间写配置会被 HMR 事务拒绝（`HMR transactions cannot be nested`）。
+> 这时插件会记下待办，等下一个真实请求（`agent/created`）再写 —— 不需要你做什么。
+> 冷启动（装完插件重启 DSH）时第一次就成功。
+
 ### 最小配置
 
 ```yaml
@@ -225,6 +267,7 @@ providers:
         enabled: true
         routes: []
         promptTrim: true
+        provision: true      # 探测本地端点并自动写 provider；false 关闭
 
         # 本地模型用不到的段。名字取自各插件的 systemPrompt.section({ name })。
         # 这份清单对应的是「装了很多插件」的 profile：你装了哪几个插件，就删哪几个插件
@@ -325,7 +368,7 @@ EOF
 
 ## 启动自检
 
-插件装载时往 `~/.dsh/local-llm/local-trim.log` 写 9 项检查。下面是形态示例，数字取自
+插件装载时往 `~/.dsh/local-llm/local-trim.log` 写 10 项检查。下面是形态示例，数字取自
 某一份具体配置（你的会不一样，`<…>` 处随配置变化）：
 
 ```
@@ -338,6 +381,7 @@ EOF
 ✓ 裁剪段落            <dropSections 项数> 段 + <dropContexts 项数> 个 context
 ✓ 生效路由            自动识别（baseURL 指向回环/私有网段，或 provider 名带 local/ollama 等标记）
 ✓ schema 瘦身         description 140 / 参数 90
+✓ 一步到位            <探测结果，如「已有配置好的 local-llamacpp」>
 就绪：仅对 本地端点（自动识别） 生效，其它 provider 原样放行
 ```
 
