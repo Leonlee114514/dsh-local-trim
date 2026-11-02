@@ -112,6 +112,9 @@ check('maxTokens 取自 n_predict', profile.defaultMaxTokens === 8192)
 check('模型带 input:text', JSON.stringify(profile.models[0].input) === '["text"]')
 check('显示名带后端', profile.displayName.includes('llama.cpp'), profile.displayName)
 check('默认关思考（避免 content 被 reasoning 吃光）', profile.compat?.chatTemplateKwargs?.enable_thinking === false)
+check('thinkingFormat 一起写进 compat', profile.compat?.thinkingFormat === 'chat-template')
+check('模型声明 reasoningEfforts（否则 enable_thinking 发不出去）', profile.models?.[0]?.reasoningEfforts?.low === 'low')
+check('provider 带 apiKeyEnv（本地端点也会要求 Authorization 头）', typeof profile.apiKeyEnv === 'string' && profile.apiKeyEnv.length > 0)
 
 const noKwargs = buildProfile({
   provider: 'x',
