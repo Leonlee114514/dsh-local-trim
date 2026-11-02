@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only.",
   "type": "module",
   "main": "lib/index.js",
