@@ -23,7 +23,10 @@ jobs:
       - name: Install dev dependencies
         run: npm ci --no-audit --no-fund
       - name: Syntax check
-        run: node --check lib/index.js
+        run: |
+          for f in lib/index.js lib/bridge.js lib/status.js lib/import-model.js lib/provision.js client.js; do
+            node --check "$f" || exit 1
+          done
       - name: Module loads and exports the plugin contract
         run: |
           node --input-type=module -e "
@@ -43,6 +46,10 @@ jobs:
         run: node test/autodetect.mjs
       - name: One-step provision (probe + register)
         run: node test/provision.mjs
+      - name: Control panel view model and import flow
+        run: node test/panel.mjs
+      - name: Control panel bridge routes (apply + fake settings/backend)
+        run: node test/panel-host.mjs
       - name: Manifest is loadable
         run: |
           node --input-type=module -e "

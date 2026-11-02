@@ -380,30 +380,53 @@ EOF
 
 ---
 
-## 控制面板（v0.3.0 起）
+## 控制面板（v0.3.0 起，v0.3.2 改版）
 
 插件在 DSH Web 的**插件详情页**里挂了一块面板：左侧栏进「插件」，列表里点开
 `dsh-local-trim`，详情页底部就是它。面板直接读写这份 profile 的
 `cordis.patch.yml` 里 `local-tool-trim.config` 那一节，改完点保存即生效，不用重启。
 
-面板能改的东西：
+v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
 
-| 字段 | 作用 |
+**① 状态带** —— 一行徽章，每枚带颜色灯：
+
+| 徽章 | 含义 |
 | --- | --- |
-| 启用裁剪 / 按 baseURL 自动识别 | 总开关与 provider 识别方式 |
-| 裁剪系统提示词 / 瘦身工具 schema | 第 3、4 层各自的总开关 |
-| 工具描述上限 / 参数描述上限 | 第 4 层的两个阈值，0 表示不截断 |
-| 生效路由 | 只裁这些 provider（空行=自动识别，写名字=只认名字） |
-| 保留的工具 / 丢弃的提示词段 / 丢弃的 context | 三个白/黑名单，每行一项 |
-| 启动时打印自检 / 包装器体积日志 | `selfCheck` / `debugWrap` |
+| 接管 prompt.assemble | 生效方式（叠在 dsh-purge 外层 / 叠在既有访问器外层 / 接管原生），失败时直接把原因写在这里 |
+| 注入正文 | 一页纸注入有多少字符、来源是 `config` / `light-inject.md` / 内置 |
+| 一步到位 | 自动注册 provider 的结果 |
+| 提示词裁剪 / schema 瘦身 | 两层各自的开关状态 |
+| 设置可写 | 宿主有没有把本插件登记成可写设置条目 |
 
-面板底部还有两个按钮：**探测本地端点**（依次打 `8090` / `11434` / `8000` / `1234`，
-列出可用端点与模型）和**看日志**（读 `~/.dsh/local-llm/local-trim.log` 的尾部，
-不用去翻文件）。右上角显示当前 `revision`；如果这份配置在别处被改过，保存会提示冲突并
-自动重新读取。
+**② 裁剪收益条** —— 最近一次装配的进→出字符数、省了百分之几、段数变化、命中的 provider
+和时间。走云端 provider 时这里会显示「未裁剪」，那是正常的：云端一个字节都不动。
 
-面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，四个端点
-`describe` / `save` / `probe` / `log`，全部只接受 POST，且只放行本机来源
+**③ 模型 provider 表** —— 列出 settings 里所有 provider，本地的一个个点灯
+（`GET /v1/models`，15 秒内复用结果），显示在线耗时或错误原文；每个本地 provider 后面有
+**试跑** 按钮，发一条「只回一个字：好」的真实请求，回来显示毫秒数与回复内容。
+
+**④ 导入本地模型** —— 填端点（例如 `http://127.0.0.1:8090`，`/v1` 可省）→ **探测** →
+下拉里选一个模型 → **导入并试跑**。导入做四件事：
+
+1. `GET /v1/models`（不通用时退 `/api/tags`）拿到模型列表；
+2. 按端口猜后端名，生成 provider id（`local-llamacpp-qwen3-4b` 这种），也可以自己填；
+3. 写进 `llm-pi-ai` 的 `providers`，模型选好后在「模型」选择器里立刻能选到；
+4. 立刻发一条真实请求，把端到端耗时、回复内容、token 数（或后端原文错误）贴在面板上。
+
+试跑失败不会回收配置 —— 配置已经落地，把后端拉起或改好端点后点「试跑」即可，不用重新导入。
+默认会关掉 chat template 的思考模式（`enable_thinking: false`）：本地小模型开了思考会把
+`max_tokens` 全花在 reasoning 上、`content` 直接空字符串。需要思考的模型勾上「保留思考模式」。
+
+原来那些字段（开关、阈值、三个名单、注入正文、一步到位）都在最下面折叠的
+**高级配置** 里，位置变了，能力没变。
+
+**其他按钮**：**探测本地端点**（依次打 `8090` / `11434` / `8000` / `1234`）、**看日志**
+（读 `~/.dsh/local-llm/local-trim.log` 尾部）、**重新检测**（强制刷新点灯结果）。
+右上角显示当前 `revision`；这份配置在别处被改过时，保存会提示冲突并自动重新读取。
+
+面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，八个端点
+`describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test`，
+全部只接受 POST，且只放行本机来源
 （`sec-fetch-site: cross-site` 直接 403，`Origin` 必须与 Host 同源）。
 
 ### 面板不出现怎么办
@@ -520,7 +543,12 @@ node --check lib/index.js       # 语法
 node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
+node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
 ```
+
+`test/panel.mjs` 只测纯逻辑：`lib/status.js`（接管文案、收益计算、provider 判定与点灯计数）
+和 `lib/import-model.js`（入参校验、provider id 生成、profile 拼装、试跑请求与四类失败分支，
+全部用假 `fetch`）。真正的网络探测留给面板上的按钮和 `test/provision.mjs` 里的假端点。
 
 `lib/config.js` 顶层 `import z from '@deepseek-ai/schemastery'` —— 运行时由 DSH 宿主提供
 （`peerDependencies`，optional，不会再给装插件的人拉第二份副本），跑测试前需要

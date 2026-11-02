@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.3.1",
-  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a control panel inside the plugin detail page.",
+  "version": "0.3.2",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a status-aware control panel (import a local model, smoke-test it, watch trim savings) inside the plugin detail page.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
