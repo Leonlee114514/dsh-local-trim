@@ -1,0 +1,49 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax check
+        run: node --check lib/index.js
+      - name: Module loads and exports the plugin contract
+        run: |
+          node --input-type=module -e "
+            const m = await import('./lib/index.js');
+            const need = ['name', 'inject', 'apply'];
+            for (const k of need) {
+              if (!(k in m)) { console.error('missing export: ' + k); process.exit(1); }
+            }
+            if (m.name !== 'dsh-local-trim') { console.error('bad name: ' + m.name); process.exit(1); }
+            if (!Array.isArray(m.inject) || !m.inject.includes('tools')) { console.error('inject must include tools'); process.exit(1); }
+            if (!Array.isArray(m.DEFAULT_KEEP) || m.DEFAULT_KEEP.length === 0) { console.error('DEFAULT_KEEP empty'); process.exit(1); }
+            console.log('exports ok:', m.inject.join(','));
+          "
+      - name: Self-check (with and without dsh-purge)
+        run: node test/selfcheck.mjs
+      - name: Provider auto-detection
+        run: node test/autodetect.mjs
+      - name: Manifest is loadable
+        run: |
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+            if (!pkg.dsh?.bundle?.patch) { console.error('package.json missing dsh.bundle.patch'); process.exit(1); }
+            const patch = readFileSync(pkg.dsh.bundle.patch.replace(/^\.\//, ''), 'utf8');
+            if (!patch.includes('dsh-local-trim')) { console.error('patch does not reference the plugin'); process.exit(1); }
+            console.log('manifest ok:', pkg.version, pkg.dsh.bundle.patch);
+          "
