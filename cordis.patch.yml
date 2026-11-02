@@ -1,0 +1,18 @@
+# dsh-local-trim — bundle manifest entry.
+#
+# `dsh plugin add` applies this patch, which loads the plugin with auto-detection
+# on: any provider whose baseURL is loopback / a private-net address, or whose id
+# carries a local marker (local, ollama, llama, vllm, lmstudio, sglang, …), gets
+# the light harness. Cloud providers are untouched.
+#
+# Want it narrower? Override `routes` in your own profile's cordis.patch.yml,
+# under the same id:
+#   routes: [my-provider]   → trim exactly these provider ids, nothing else
+#   enabled: false          → installed but inert
+- insert:
+    - id: local-tool-trim
+      name: dsh-local-trim
+      inject: [tools, systemPrompt]
+      config:
+        enabled: true
+        routes: []
