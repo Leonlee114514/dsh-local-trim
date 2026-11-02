@@ -1,0 +1,39 @@
+{
+  "name": "dsh-local-trim",
+  "version": "0.1.0",
+  "description": "Give small local models a light harness: per-provider tool mask, prompt-section trimming, light instruction injection and tool-schema slimming for DeepSeek Harness.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "local-llm",
+    "llama.cpp",
+    "ollama",
+    "prompt-engineering",
+    "context-window"
+  ],
+  "license": "MIT",
+  "author": "Leonlee114514",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Leonlee114514/dsh-local-trim.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Leonlee114514/dsh-local-trim/issues"
+  },
+  "homepage": "https://github.com/Leonlee114514/dsh-local-trim#readme",
+  "engines": {
+    "node": ">=20"
+  }
+}
