@@ -82,10 +82,20 @@ await ok('找不到可执行文件时说清找过哪些路径', async () => {
   assert.ok(plan.tried.length >= 2)
 })
 
-await ok('需要模型参数的后端不瞎猜', async () => {
+await ok('装了 llama.cpp 但没给模型：报「要模型文件」并给出可抄的命令', async () => {
   const plan = planLaunch({ port: 8090, existsSync: () => true })
   assert.equal(plan.ok, false)
-  assert.match(plan.error, /需要模型参数/)
+  assert.match(plan.error, /需要模型文件/)
+  // 找到的可执行文件要出现在提示里，用户才能直接抄
+  assert.match(plan.error, /llama-server/)
+  assert.match(plan.error, /-m /)
+})
+
+await ok('没装 llama.cpp：报「没找到」并列出查过的地方', async () => {
+  const plan = planLaunch({ port: 8090, existsSync: () => false })
+  assert.equal(plan.ok, false)
+  assert.match(plan.error, /本机没找到 llama\.cpp/)
+  assert.ok(Array.isArray(plan.tried) && plan.tried.length > 0, 'tried 应列出候选路径')
 })
 
 await ok('不认识的端口给出可执行的下一步', async () => {
