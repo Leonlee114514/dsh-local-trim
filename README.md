@@ -117,10 +117,21 @@ pnpm add link:../../../path/to/dsh-local-trim
   `8000 → local-vllm`、`1234 → local-lmstudio`；可用 `provider:` 指定。
 - 窗口 / 输出长度从后端的 `/v1/models` 的 `meta.n_ctx`、`meta.n_predict` 读；
   读不到就退回保守值。
-- 自动生成的 profile 带 `compat.chatTemplateKwargs.enable_thinking: false` ——
-  本地 chat template 默认开思考模式时，模型会把 `max_tokens` 全花在
-  `reasoning_content` 上，`content` 直接空字符串。不需要就在 `provision` 里写
-  `chatTemplateKwargs: null`。
+- 自动生成的 profile 带三样东西，少一样都可能拿不到回答：
+  1. `compat.thinkingFormat: 'chat-template'` +
+     `compat.chatTemplateKwargs.enable_thinking: false` —— 本地 chat template
+     默认开思考模式，`max_tokens` 会全花在 `reasoning_content` 上、`content`
+     返回空串。但 pi-ai 只在 `thinkingFormat` 是 `chat-template` 一类的分支里
+     才把 `chatTemplateKwargs` 翻成请求体的 `chat_template_kwargs`；默认的
+     `openai` 分支不翻，写了也发不出去。（`qwen` 分支发的是顶层
+     `enable_thinking`，llama.cpp 不认。）
+  2. 模型上的 `reasoningEfforts: { off: null, low: low }` —— 上面那个分支的前提
+     是 `model.reasoning === true`，而它由这个字段推出来。
+  3. `apiKeyEnv` —— 本地端点不校验 key，但 provider 没有 credential 声明时
+     pi-ai 不带 `Authorization` 头，llama.cpp 会**静默返回空 completion**
+     （不是 401，非常难查）。默认指向 `DSH_LOCAL_LLM_API_KEY`，值为空也行。
+
+  不需要关思考就在 `provision` 里写 `chatTemplateKwargs: null`。
 - 探测与写入失败都不会影响裁剪，把原因写进日志（默认
   `~/.dsh/local-llm/local-trim.log`，可用 `DSH_LOCAL_TRIM_LOG` 改位置）。
 
@@ -174,6 +185,7 @@ llama-server -m model.gguf --mmproj mmproj.gguf \
     providers:
       my-local:                       # provider id 自己定，带 local 标记会被自动识别
         displayName: 本地 llama.cpp
+        apiKeyEnv: DSH_LOCAL_LLM_API_KEY  # 见上文第 3 点：缺了会静默返回空串
         api: openai-completions
         baseURL: http://127.0.0.1:8090/v1
         defaultContextWindow: 65536     # 必须和 -c 一致
@@ -183,10 +195,12 @@ llama-server -m model.gguf --mmproj mmproj.gguf \
         compat:
           supportsUsageInStreaming: true
           maxTokensField: max_tokens
+          thinkingFormat: chat-template   # 见上文第 1 点：不写这一行，下面白写
           chatTemplateKwargs:
             enable_thinking: false
         models:
           - id: my-local
+            reasoningEfforts: { off: null, low: low }   # 见上文第 2 点
             contextWindow: 65536
             maxTokens: 8192
             input: [ text ]
