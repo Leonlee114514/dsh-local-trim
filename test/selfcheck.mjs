@@ -7,7 +7,11 @@
  *         期望：接管原生函数，裁剪照样生效。
  */
 
-import { apply, spliceInject, DEFAULT_KEEP } from '../lib/index.js'
+// 测试会调 apply()，把日志写到临时文件，别污染 ~/.dsh/local-llm/local-trim.log。
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+process.env.DSH_LOCAL_TRIM_LOG = process.env.DSH_LOCAL_TRIM_LOG || join(tmpdir(), 'dsh-local-trim.test.log')
+const { apply, spliceInject, DEFAULT_KEEP } = await import('../lib/index.js')
 
 const ASSEMBLE_GUARD = Symbol.for('dsh-purge.assembleGuard')
 const TAKEOVER = Symbol.for('dsh-local-trim.takeover')
@@ -139,6 +143,7 @@ async function scenario(withPurge) {
     toolDescLimit: 40,
     toolParamDescLimit: 30,
     selfCheck: true,
+    provision: false,
   })
 
   // dsh-purge 的 rewriteFn：把整份 BIG_INJECT 重新置顶（模拟 25K 重写）
