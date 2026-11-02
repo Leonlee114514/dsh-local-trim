@@ -331,8 +331,60 @@ await ok('连不上时给异常文本', async () => {
   assert.match(result.error, /ECONNREFUSED/)
 })
 
-await ok('缺 baseURL / 模型时提前返回', async () => {
-  assert.equal((await smokeTest({ fetchImpl: async () => {}, baseURL: '', model: 'm' })).ok, false)
+// Ollama 的 OpenAI 兼容层不认 chat_template_kwargs，只认 reasoning_effort: 'none'。
+// 第一次回空正文时，smokeTest 必须自己换写法再试一次，而不是报「试跑通过 + 空回复」。
+await ok('思考模式吃掉正文时自动换 reasoning_effort 再试', async () => {
+  const bodies = []
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body)
+    bodies.push(body)
+    const thinking = body.reasoning_effort === undefined
+    return {
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          choices: [
+            {
+              message: thinking ? { content: '', reasoning: '让我想想…' } : { content: '好' },
+              finish_reason: thinking ? 'length' : 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 12, completion_tokens: thinking ? 24 : 2 },
+        }),
+    }
+  }
+  const result = await smokeTest({
+    fetchImpl,
+    baseURL: 'http://127.0.0.1:11434',
+    model: 'qwen3:8b',
+    chatTemplateKwargs: { enable_thinking: false },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '好')
+  assert.equal(result.attempt, 'reasoning_effort')
+  assert.equal(bodies.length, 2)
+  assert.deepEqual(bodies[0].chat_template_kwargs, { enable_thinking: false })
+  assert.equal(bodies[1].reasoning_effort, 'none')
+})
+
+await ok('两种写法都空正文时给可执行错误，不算通过', async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    text: async () =>
+      JSON.stringify({
+        choices: [{ message: { content: '', reasoning: '一直想' }, finish_reason: 'length' }],
+        usage: { prompt_tokens: 12, completion_tokens: 24 },
+      }),
+  })
+  const result = await smokeTest({ fetchImpl, baseURL: 'http://127.0.0.1:8090', model: 'qwen3:4b' })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /空正文/)
+  assert.match(result.error, /思考/)
+})
+
+await ok('缺 baseURL / 模型时提前返回', async () => {  assert.equal((await smokeTest({ fetchImpl: async () => {}, baseURL: '', model: 'm' })).ok, false)
   assert.equal((await smokeTest({ fetchImpl: async () => {}, baseURL: 'http://127.0.0.1:8090', model: '' })).ok, false)
 })
 
