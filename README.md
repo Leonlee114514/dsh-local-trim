@@ -102,9 +102,9 @@ pnpm add link:../../../path/to/dsh-local-trim
 
 | 写法 | 含义 |
 | --- | --- |
-| 不写 | 退回首版行为，只认 `local-qwen` |
+| 不写 | 早期默认：只认 `local-qwen` 这一个名字（建议显式写 `[]` 或写具体名字） |
 | `[]` | **自动识别**：provider 的 baseURL 指向回环/私有网段，或 provider 名带 local/ollama/vllm/lmstudio 等标记 |
-| `[local-qwen, ollama]` | 只认写出来的名字（精确匹配，`local-qwen-turbo` 不会命中） |
+| `[my-provider, ollama]` | 只认写出来的名字（精确匹配，`my-provider-turbo` 不会命中） |
 
 自动识别的 baseURL 特征：`127.0.0.1` / `localhost` / `0.0.0.0` / `[::1]` /
 `host.docker.internal` / `10.x` / `192.168.x` / `172.16–31.x`。
@@ -130,7 +130,7 @@ llama-server -m model.gguf --mmproj mmproj.gguf \
 - id: llm-pi-ai
   config:
     providers:
-      local-qwen:
+      my-local:                       # provider id 自己定，带 local 标记会被自动识别
         displayName: 本地 llama.cpp
         api: openai-completions
         baseURL: http://127.0.0.1:8090/v1
@@ -253,8 +253,9 @@ providers:
           - mnemon:memory-view
           - mnemon:runtime-memory
 
-        # 白名单同时写规范名和 dsh-ops 的 ops_* 名：localqwen profile 注册的是
-        # bash/read/glob/grep，desktop profile 注册的是 ops_bash/ops_read_files/…
+        # 白名单同时写规范名和 dsh-ops 的 ops_* 名：不同 profile 装的工具包不一样，
+        # 有的注册 bash/read/glob/grep，有的注册 ops_bash/ops_read_files/…，
+        # 两种名字都列上，这份配置就能同时用在两种 profile 上。
         keep:
           - bash
           - pwsh
@@ -317,7 +318,8 @@ EOF
 4. 唯一的全局副作用是重新定义了 `prompt.assemble` 的访问器，但它的行为对非本地 provider
    完全等价于原函数。
 
-实测：`workbuddy`（云端）和 `local-qwen`（本地）交替调用，云端返回正常、本地工具调用正常。
+实测：同一个会话里交替切云端 provider 和本地 provider，云端返回正常、本地工具调用正常，
+两边的工具面互不影响。
 
 ---
 
