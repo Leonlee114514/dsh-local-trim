@@ -519,7 +519,12 @@ done
 node --check lib/index.js       # 语法
 node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
+node test/provision.mjs         # 探测 → 写 settings 的一步到位
 ```
+
+`lib/config.js` 顶层 `import z from '@deepseek-ai/schemastery'` —— 运行时由 DSH 宿主提供
+（`peerDependencies`，optional，不会再给装插件的人拉第二份副本），跑测试前需要
+`npm ci`（它同时也写在 `devDependencies` 里）。CI 就是这么做的。
 
 `scripts/restore-bash.ps1` 修 pnpm 把 `@dsh-ops/bash-win32-x64` 当不匹配平台剪掉的问题
 （arm64 Windows 上会遇到）：重新 pack 该可选依赖并放回 `node_modules/@dsh-ops/`。
