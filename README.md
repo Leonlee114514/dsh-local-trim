@@ -3,17 +3,23 @@
 给本地小模型一套**轻量 harness**：让 llama.cpp / Ollama / vLLM / LM Studio 这类本地端点也能在
 [DeepSeek Harness](https://github.com/deepseek-ai) 里顺畅干活，而云端 provider 一个字节都不动。
 
-**装完实测**：一次普通对话的请求体从 **55860 B** 降到 **22385 B**（-60%），系统提示词正文从
-**42868 字符**降到 **2215 字符**（-95%），工具 JSON 从 **18473 B** 降到 **13013 B**（-30%）。
-本地模型工具调用能力实测未退化（`ops_bash` / `ops_glob` / `ops_read_files` 两步串行都正确）。
+**它做什么**：把工具面、系统提示词、工具 schema 三个面同时收窄，并把注入的整份系统提示词
+换成一页纸。本地模型工具调用能力实测未退化（`ops_bash` / `ops_glob` / `ops_read_files`
+两步串行都正确）。
+
+> 这里不给具体的请求体数值。绝对值由你自己的 harness 决定 —— 装了多少插件、注册了多少工具、
+> 系统提示词有哪几段，每个人的基线不同，裁剪空间也就不同。想知道自己省了多少，
+> 用文末「验证裁剪真的生效了」那段，在装与不装之间各抓一次请求来对比。
 
 ---
 
 ## 为什么需要它
 
-DSH 默认面向云端大模型：一个 desktop profile 打开就有 **147 项工具**（≈42.3K tokens）加
-**≈21K 字符**的系统提示词，一次对话 53–63K。本地模型常见窗口是 16K–64K，直接
-`CONTEXT_WINDOW_EXCEEDED`；就算窗口够，小模型被上百个工具描述和几万字规则围着，调用正确率也会掉。
+DSH 默认面向云端大模型：一个装满插件的 profile 打开就是几十上百项工具，加一整份长篇系统
+提示词。本地模型常见窗口是 16K–64K，装得多一点就 `CONTEXT_WINDOW_EXCEEDED`；就算窗口够，
+小模型被上百个工具描述和几万字规则围着，调用正确率也会掉。
+
+具体多大取决于你装了什么 —— 这正是下面要做按 provider 裁剪的原因。
 
 DSH 没有「按模型裁工具」的开关：
 
@@ -38,7 +44,7 @@ DSH 没有「按模型裁工具」的开关：
 
 第 3 层有个关键细节：宿主 `dsh-agent-loop` 在渲染完 prompt 后会检查
 `globalThis.__dshPurgeHungPrompt()` 返回的原文的**前 80 字符和后 96 字符**是否都还在渲染结果里；
-只要缺一个，就把整份 25K 原文再前置一遍。所以替换注入时必须原样保留这两段取样，否则省下的
+只要缺一个，就把整份原文再前置一遍。所以替换注入时必须原样保留这两段取样，否则省下的
 token 会被立刻加回去。
 
 ---
@@ -208,7 +214,7 @@ providers:
 
 ---
 
-## 完整配置（实测在用的那一份）
+## 完整配置
 
 ```yaml
 - insert:
@@ -220,27 +226,28 @@ providers:
         routes: []
         promptTrim: true
 
-        # 本地模型用不到的段。名字取自各插件的 systemPrompt.section({ name })，
-        # 注释里的数字是实测字节数。装了什么插件就删什么段，别抄全套。
+        # 本地模型用不到的段。名字取自各插件的 systemPrompt.section({ name })。
+        # 这份清单对应的是「装了很多插件」的 profile：你装了哪几个插件，就删哪几个插件
+        # 产出的段，别整套照抄。名字对不上的段会被静默忽略，不会报错。
         dropSections:
-          - tool:mindmap                          # 5849
-          - free-search:engines                   # 1973
-          - dsh-purge:anchor                      # 1477
-          - dshpg-capabilities                    # 1050
-          - mnemon:routing                        # ~900
-          - plugin:dsh-imagegen                   # 3134
-          - ui:deliverable-file-references        # 1192
-          - app:web-surface                       # 862
-          - tool:goal                             # 528
-          - tool:ralph                            # 434
-          - tool:workflow                         # 325
-          - tool:session-query                    # 315
-          - tool:pty                              # 308
-          - dsh-excel-chat:interaction            # 277
-          - dsh-ops:repository-tooling:mode-standard   # 2476
+          - tool:mindmap
+          - free-search:engines
+          - dsh-purge:anchor
+          - dshpg-capabilities
+          - mnemon:routing
+          - plugin:dsh-imagegen
+          - ui:deliverable-file-references
+          - app:web-surface
+          - tool:goal
+          - tool:ralph
+          - tool:workflow
+          - tool:session-query
+          - tool:pty
+          - dsh-excel-chat:interaction
+          - dsh-ops:repository-tooling:mode-standard
           - dsh-ops:repository-tooling:mode-ptc
           - dsh-ops:repository-tooling:mode-cordis
-          - harness:source                        # 325
+          - harness:source
 
         dropContexts:
           - mnemon:memory-view
@@ -270,7 +277,8 @@ providers:
           - read_image
 
         # 描述截断长度。再往下会把 "Omit or leave empty when using" 这类半句留下，
-        # 反而降低调用正确率。实测 17 个工具 16666→13013 字节。
+        # 反而降低调用正确率 —— 半句话比长话更容易误导模型调用。
+        # 设 0 表示该面不截断（保留原文）。
         toolDescLimit: 140
         toolParamDescLimit: 90
 ```
@@ -293,8 +301,8 @@ cat > ~/.dsh/local-llm/light-inject.md <<'EOF'
 EOF
 ```
 
-内置默认（`DEFAULT_INJECT`）是一页纸的版本：身份 + 5 条行为准则 + 工具速查 + 输出格式，
-约 640 字符。
+内置默认（`DEFAULT_INJECT`）是一页纸的版本：身份 + 5 条行为准则 + 工具速查 + 输出格式。
+正文多长不影响正确性，只影响省下的量 —— 想更省就写更短，但别把工具用法删到模型认不出。
 
 ---
 
@@ -315,16 +323,17 @@ EOF
 
 ## 启动自检
 
-插件装载时往 `~/.dsh/local-llm/local-trim.log` 写 9 项检查：
+插件装载时往 `~/.dsh/local-llm/local-trim.log` 写 9 项检查。下面是形态示例，数字取自
+某一份具体配置（你的会不一样，`<…>` 处随配置变化）：
 
 ```
 ✓ tools 服务          可 restrict
 ✓ systemPrompt 服务   可用
 ✓ dsh-purge           已装（本插件在其外层收尾，无需改它源码）
 ✓ assemble 接管       accessor+purge-slot
-✓ 轻量注入正文        648 字符，来源 ~/.dsh/local-llm/light-inject.md
-✓ 工具白名单          19 项
-✓ 裁剪段落            18 段 + 2 个 context
+✓ 轻量注入正文        <字符数>，来源 ~/.dsh/local-llm/light-inject.md
+✓ 工具白名单          <keep 项数> 项
+✓ 裁剪段落            <dropSections 项数> 段 + <dropContexts 项数> 个 context
 ✓ 生效路由            自动识别（baseURL 指向回环/私有网段，或 provider 名带 local/ollama 等标记）
 ✓ schema 瘦身         description 140 / 参数 90
 就绪：仅对 本地端点（自动识别） 生效，其它 provider 原样放行
@@ -334,7 +343,7 @@ EOF
 
 ---
 
-## 验证请求真的变小了
+## 验证裁剪真的生效了
 
 llama.cpp 加 `--log-prompts-dir` 会把每次请求落盘：
 
@@ -351,8 +360,9 @@ for k in "LOCAL LIGHT" "PRIME DIRECTIVE" "Mindmap editing"; do
 done
 ```
 
-期望：`SIZE` 两万多、`LOCAL LIGHT: 1`、其余 `0`。如果 `PRIME DIRECTIVE: 1` 说明注入被
-外层重写覆盖了 —— 检查 `local-trim.log` 里的 `assemble 接管` 那一行。
+期望：`LOCAL LIGHT: 1`、`PRIME DIRECTIVE: 0`、`Mindmap editing: 0`。`SIZE` 跟你自己的
+配置有关，不看绝对值，看的是「注入换成了轻量版、那些大段不再出现」。如果 `PRIME DIRECTIVE: 1`
+说明注入被外层重写覆盖了 —— 检查 `local-trim.log` 里的 `assemble 接管` 那一行。
 
 ---
 
@@ -370,7 +380,7 @@ done
    `Symbol.for('dsh-purge.assembleGuard')`，让它只刷自己的 slot、不重装访问器覆盖你。
 
 4. **注入段必须 `interpolate: false`，并且保留头 80 / 尾 96 字符。** 否则
-   `renderPrompt` 会用变量改写正文，破坏宿主取样判定，25K 原文立刻被重新前置。
+   `renderPrompt` 会用变量改写正文，破坏宿主取样判定，整份原文立刻被重新前置。
 
 5. **`llm-pi-ai` 改 `defaultContextWindow` 要重启实例。** HMR 不覆盖 provider 解析，
    改了不重启的话 bili / 代理层拿到的还是旧窗口。
