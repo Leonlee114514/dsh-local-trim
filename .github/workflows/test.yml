@@ -37,6 +37,8 @@ jobs:
         run: node test/selfcheck.mjs
       - name: Provider auto-detection
         run: node test/autodetect.mjs
+      - name: One-step provision (probe + register)
+        run: node test/provision.mjs
       - name: Manifest is loadable
         run: |
           node --input-type=module -e "
