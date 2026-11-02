@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.1.1",
-  "description": "Give small local models a light harness: per-provider tool mask, prompt-section trimming, light instruction injection and tool-schema slimming for DeepSeek Harness.",
+  "version": "0.2.0",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
