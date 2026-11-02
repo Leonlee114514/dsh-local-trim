@@ -420,6 +420,27 @@ v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
 原来那些字段（开关、阈值、三个名单、注入正文、一步到位）都在最下面折叠的
 **高级配置** 里，位置变了，能力没变。
 
+**⑤ 一键拉起（v0.3.4 起）** —— provider 表里每个**点着红灯的本地 provider** 后面多一个
+**拉起** 按钮。点它就按这个 provider 的端口去找后端并起起来，然后轮询等它应答：
+
+| 端口 | 后端 | 怎么起 |
+| --- | --- | --- |
+| 11434 | Ollama | 找到 `ollama(.exe)` 后 `serve`，并带上 `OLLAMA_HOST=127.0.0.1:11434` |
+| 8090 | llama.cpp | 需要模型参数，插件不猜 —— 在高级配置里填完整命令 |
+| 8000 | vLLM | 同上 |
+| 1234 | LM Studio | 同上（GUI 应用，通常自己开着） |
+
+顺序是：**先探测**，端口本来就在应答就直接告诉你「没有重复拉起」；没应答才找可执行文件
+（`OLLAMA_BIN` 环境变量 → `~/AI/ollama/ollama.exe` → `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`
+→ `C:\Program Files\Ollama\ollama.exe` → PATH），拉起后按 `拉起后等端口（秒）` 轮询
+`/v1/models`，成功后顺手把点灯缓存清掉。找不到可执行文件或该后端必须带模型参数时，
+错误里会写清**找过哪些路径**或**缺什么**，不会静默失败。
+
+高级配置里的 **一键拉起命令** 留空就走上面的自动逻辑；填了（例如
+`C:\Users\you\AI\ollama\ollama.exe serve --verbose`）就原样执行，优先于自动探测。
+起进程用 `detached + stdio:ignore`，不挂在宿主进程的管道上，所以**关掉 DSH 不会把它带走**，
+要开机自启得自己挂（Windows 计划任务或启动项）。
+
 **其他按钮**：**探测本地端点**（依次打 `8090` / `11434` / `8000` / `1234`）、**看日志**
 （读 `~/.dsh/local-llm/local-trim.log` 尾部）、**重新检测**（强制刷新点灯结果）。
 右上角显示当前 `revision`；这份配置在别处被改过时，保存会提示冲突并自动重新读取。
@@ -428,8 +449,8 @@ v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
 面板不会整块报错：它自动退回 `describe` 视图，并在顶部提示「重启一次 DSH 就能看到点灯、
 收益条和模型导入」。插件是 JS 模块，装在宿主进程里，改完源码要让宿主重新 apply 一次。
 
-面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，八个端点
-`describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test`，
+面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，九个端点
+`describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test` / `launch`，
 全部只接受 POST，且只放行本机来源
 （`sec-fetch-site: cross-site` 直接 403，`Origin` 必须与 Host 同源）。
 
@@ -548,7 +569,8 @@ node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
-node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 8 条 bridge 路由全打一遍
+node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 9 条 bridge 路由全打一遍
+node test/launcher.mjs          # 一键拉起：找可执行文件、命令行切分、等端口（不真起进程）
 ```
 
 `test/panel.mjs` 只测纯逻辑：`lib/status.js`（接管文案、收益计算、provider 判定与点灯计数）
@@ -559,6 +581,11 @@ node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 8
 llama.cpp（`/v1/models` + `/v1/chat/completions`）跑真的 `apply(ctx)`，让插件自己注册路由，
 然后逐条断言 status / check / import / test 的返回 —— 包括同源守卫 403、同名不覆盖、
 端点连不上、模型不在列表里、provider 不存在这几种失败路径。它不需要真起 DSH。
+
+`test/launcher.mjs` 覆盖一键拉起的纯逻辑：端口解析、命令行切分（认双引号）、
+`whichOnPath` 补扩展名、四种后端的计划生成、找不到可执行文件与「需要模型参数」两条错误路径、
+自定义命令优先、`runDetached` 的 `detached/stdio/env` 传参，以及 `waitForEndpoint` 的
+命中与超时。`spawnImpl` 与 `probe` 全部注入，CI 上不会留下后台进程。
 
 `lib/config.js` 顶层 `import z from '@deepseek-ai/schemastery'` —— 运行时由 DSH 宿主提供
 （`peerDependencies`，optional，不会再给装插件的人拉第二份副本），跑测试前需要

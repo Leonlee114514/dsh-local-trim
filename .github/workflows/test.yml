@@ -24,7 +24,7 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Syntax check
         run: |
-          for f in lib/index.js lib/bridge.js lib/status.js lib/import-model.js lib/provision.js client.js; do
+          for f in lib/index.js lib/bridge.js lib/status.js lib/import-model.js lib/launcher.js lib/provision.js client.js; do
             node --check "$f" || exit 1
           done
       - name: Module loads and exports the plugin contract
@@ -50,6 +50,8 @@ jobs:
         run: node test/panel.mjs
       - name: Control panel bridge routes (apply + fake settings/backend)
         run: node test/panel-host.mjs
+      - name: One-click backend launch (plan + wait, no real spawn)
+        run: node test/launcher.mjs
       - name: Manifest is loadable
         run: |
           node --input-type=module -e "

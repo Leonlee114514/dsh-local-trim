@@ -171,6 +171,7 @@ window.__ModuleLoader__.load({
     const NUM_ROWS = [
       ['toolDescLimit', '工具描述上限'],
       ['toolParamDescLimit', '参数描述上限'],
+      ['launchTimeout', '拉起后等端口（秒）'],
     ]
     const LIST_ROWS = [
       ['routes', '生效路由', '留空 = 自动识别本地端点；写名字（每行一个）就只认这些 provider。'],
@@ -247,7 +248,7 @@ window.__ModuleLoader__.load({
     }
 
     // ── provider 表 ───────────────────────────────────────────────────────
-    function ProviderList({ rows, counts, busy, onTest, onCheck }) {
+    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch }) {
       const list = Array.isArray(rows) ? rows : []
       return h(
         'div',
@@ -273,6 +274,19 @@ window.__ModuleLoader__.load({
                 row.local ? h('span', { style: S.hint }, '· 本地') : null,
                 h('span', { style: S.grow }),
                 h('span', { style: S.hint }, row.state?.label ?? ''),
+                // 点灯是红的才给「拉起」：后端已经在跑的时候这个按钮只会误导人
+                row.local === true && row.state?.tone === 'bad'
+                  ? h(
+                      'button',
+                      {
+                        style: S.small,
+                        disabled: busy !== '',
+                        title: '在这台机器上找到后端并起一个脱离宿主的进程，等到端口应答',
+                        onClick: () => onLaunch(row),
+                      },
+                      busy === 'launch:' + row.id ? '拉起中…' : '拉起',
+                    )
+                  : null,
                 h(
                   'button',
                   {
@@ -400,6 +414,7 @@ window.__ModuleLoader__.load({
         overwrite: false,
       })
       const [importResult, setImportResult] = React.useState(null)
+      const [launchResult, setLaunchResult] = React.useState(null)
 
       const mine = subject?.kind === 'bundle' && subject?.pkg?.name === PACKAGE_NAME
 
@@ -409,6 +424,7 @@ window.__ModuleLoader__.load({
           numbers: Object.fromEntries(NUM_ROWS.map(([key]) => [key, values[key]])),
           lists: Object.fromEntries(LIST_ROWS.map(([key]) => [key, toLines(values[key])])),
           injectText: String(values.injectText ?? ''),
+          launchCommand: String(values.launchCommand ?? ''),
           provision: values.provision !== false,
         })
         setState({ loading: false, ...extra })
@@ -486,8 +502,22 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const test = async (row) => {
-        setBusy('test:' + row.id)
+      // 一键拉起后端：插件在本机找可执行文件、起脱离宿主的进程、等端口应答
+      const launch = async (row) => {
+        setBusy('launch:' + row.id)
+        setLaunchResult(null)
+        try {
+          const result = await call('launch', { baseURL: row.baseURL, port: undefined })
+          setLaunchResult(result)
+          await refreshStatus()
+        } catch (error) {
+          setLaunchResult({ ok: false, error: String(error?.message ?? error) })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      const test = async (row) => {        setBusy('test:' + row.id)
         setImportResult({
           ok: true,
           text: '正在对 ' + row.id + ' 发一条真实请求…',
@@ -576,6 +606,7 @@ window.__ModuleLoader__.load({
         }
         for (const [key] of LIST_ROWS) out[key] = fromLines(draft.lists[key])
         out.injectText = draft.injectText.trim()
+        out.launchCommand = draft.launchCommand.trim()
         out.provision = draft.provision === true
         return out
       }
@@ -684,7 +715,26 @@ window.__ModuleLoader__.load({
           busy,
           onTest: test,
           onCheck: check,
+          onLaunch: launch,
         }),
+
+        launchResult !== null
+          ? h(
+              'div',
+              { style: launchResult.ok ? S.good : S.bad },
+              launchResult.ok
+                ? launchResult.already
+                  ? launchResult.message
+                  : `已拉起 ${launchResult.label}（pid ${launchResult.pid}），${launchResult.ms}ms 后端口 ${launchResult.port} 应答` +
+                    (Array.isArray(launchResult.models) && launchResult.models.length > 0
+                      ? '：' + launchResult.models.join(', ')
+                      : '')
+                : `拉起失败：${launchResult.error}` +
+                  (Array.isArray(launchResult.tried) && launchResult.tried.length > 0
+                    ? '（找过：' + launchResult.tried.join(' / ') + '）'
+                    : ''),
+            )
+          : null,
 
         // ④ 导入
         h(ImportBox, { form, setForm, busy, onProbe: probeEndpoint, onImport: runImport, result: importResult }),
@@ -724,6 +774,25 @@ window.__ModuleLoader__.load({
                   setDraft((prev) => ({ ...prev, numbers: { ...prev.numbers, [key]: event.target.value } })),
               }),
             ),
+          ),
+
+          h(
+            'div',
+            { style: { margin: '10px 0' } },
+            h('div', { style: { color: MUTED } }, '一键拉起命令'),
+            h(
+              'div',
+              { style: S.hint },
+              '留空 = 按端口自动找（11434 Ollama / 8090 llama.cpp / 8000 vLLM / 1234 LM Studio）。' +
+                '填了就原样执行，例：C:\\Users\\you\\AI\\ollama\\ollama.exe serve',
+            ),
+            h('input', {
+              style: { ...S.input, width: '100%' },
+              value: draft.launchCommand,
+              placeholder: '留空 = 自动找',
+              spellCheck: false,
+              onChange: (event) => setDraft((prev) => ({ ...prev, launchCommand: event.target.value })),
+            }),
           ),
 
           h('p', { style: S.title }, '列表'),

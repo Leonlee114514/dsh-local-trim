@@ -164,8 +164,8 @@ const callRoute = async (name, body) => {
   return { status, body: text.length > 0 ? JSON.parse(text) : undefined }
 }
 
-console.log('\n=== 1. 八条路由都注册上了 ===')
-for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test']) {
+console.log('\n=== 1. 九条路由都注册上了 ===')
+for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch']) {
   check(name, routes.has('/api/dsh-local-trim/' + name))
 }
 
@@ -263,6 +263,26 @@ console.log('\n=== 10. test：provider 不存在时说明白 ===')
   const { body } = await callRoute('test', { provider: 'nope' })
   check('ok=false', body.ok === false)
   check('错误里点名 provider', /没有 provider/.test(body.error ?? ''), body.error ?? '')
+}
+
+console.log('\n=== 11. launch：端口已经在应答就不重复拉起 ===')
+{
+  // 8090 在假 fetch 的白名单里，所以这里只验证「先探测再决定」这条早退分支，
+  // 不会在这台机器上真的 spawn 一个后端。
+  const { status, body } = await callRoute('launch', { baseURL: 'http://127.0.0.1:8090/v1' })
+  check('200 + ok', status === 200 && body.ok === true, JSON.stringify(body.error ?? ''))
+  check('already=true', body.already === true, String(body.already))
+  check('端口从 baseURL 解析出来', body.port === 8090, String(body.port))
+  check('带上现有模型列表', Array.isArray(body.models) && body.models.length > 0)
+  check('说明没有重复拉起', /本来就在应答/.test(body.message ?? ''), body.message ?? '')
+}
+
+console.log('\n=== 12. launch：不认识的后端给可执行的下一步 ===')
+{
+  const { body } = await callRoute('launch', { baseURL: 'http://127.0.0.1:9999/v1' })
+  check('ok=false', body.ok === false)
+  check('点名端口', /9999/.test(body.error ?? ''), body.error ?? '')
+  check('指向高级配置里的启动命令', /启动命令/.test(body.error ?? ''), body.error ?? '')
 }
 
 console.log(`\n${fail === 0 ? '=== 面板宿主侧集成全部通过 ===' : `=== ${fail} 项失败 ===`}`)
