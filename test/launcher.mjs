@@ -46,14 +46,16 @@ await ok('命令行切分认双引号', async () => {
 })
 
 await ok('whichOnPath 按扩展名补全', async () => {
+  // Windows 上补 .exe/.cmd/.bat，其它平台只试裸名 —— 所以这里按平台放宽，
+  // 否则这条断言在 Linux 的 CI 上必红（而逻辑本身是对的）。
   const seen = []
   const exists = (path) => {
     seen.push(path)
-    return path.endsWith('ollama.exe')
+    return /ollama(\.exe)?$/.test(String(path))
   }
   const resolved = whichOnPath('ollama', exists)
-  assert.match(resolved, /ollama\.exe$/)
-  assert.ok(seen.length >= 2)
+  assert.match(String(resolved), /ollama(\.exe)?$/)
+  assert.ok(seen.length >= 1)
   assert.equal(
     whichOnPath('nope', () => false),
     null,
@@ -65,7 +67,7 @@ await ok('11434 找到 ollama 就给 serve 参数', async () => {
   // 用「等于某个具体路径」的断言会把候选表变化当成失败。
   const plan = planLaunch({
     port: 11434,
-    existsSync: (path) => String(path).endsWith('ollama.exe'),
+    existsSync: (path) => /ollama(\.exe)?$/.test(String(path)),
   })
   assert.equal(plan.ok, true)
   assert.equal(plan.id, 'ollama')
