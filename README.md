@@ -421,12 +421,20 @@ done
 ```
 
 期望：`LOCAL LIGHT: 1`、`PRIME DIRECTIVE: 0`、`Mindmap editing: 0`。`SIZE` 跟你自己的
-配置有关，不看绝对值，看的是「注入换成了轻量版、那些大段不再出现」。如果 `PRIME DIRECTIVE: 1`
-说明注入被外层重写覆盖了 —— 检查 `local-trim.log` 里的 `assemble 接管` 那一行。
+配置有关，不看绝对值，看的是「注入换成了轻量版、那些大段不再出现」。
+
+如果 `PRIME DIRECTIVE: 1`，说明结果被某一层重写覆盖了。两步排查：
+
+1. 看 `local-trim.log` 里最新的 `assemble 接管` 行。理想值是 `accessor+purge-slot`；
+   出现 `already` 意味着外层是别的实例留下的包装器（见坑位 6）。
+2. 在配置里临时打开 `debugWrap: true`，重载后再发一次请求，日志会多出成对的
+   `包装器进入: N 段 / X 字符` 与 `包装器返回: M 段 / Y 字符`。如果「返回」的体积没有变小，
+   是 `trimAssembly` 判定这条请求不属于本地 provider（看 `routes` / baseURL 是否被识别）；
+   如果「进入」的体积本身就很小而请求很大，说明别的层在我们之后又灌了内容进来。
 
 ---
 
-## 五个踩过的坑
+## 六个踩过的坑
 
 1. **`tools.restrict({ allow })` 只认全局工具名。** scoped 注册名（如 `dsh-ops` 的 `ops_glob`）
    混进 allow 会让**整批**校验失败，一条限制都装不上。本插件从错误消息里把被拒的名字抠出来
@@ -444,6 +452,12 @@ done
 
 5. **`llm-pi-ai` 改 `defaultContextWindow` 要重启实例。** HMR 不覆盖 provider 解析，
    改了不重启的话 bili / 代理层拿到的还是旧窗口。
+
+6. **热重载会留下上一实例的包装器，不能看到标记就跳过。** 重载后旧实例的
+   `prompt.assemble` 包装器还在最外层，但它的 `ctx` 已失效 —— provider 判断失效 → 它自己
+   原样放行，而它内层仍会调 `dsh-purge` 把整份原文灌回去。所以接管时不能用全局布尔标记
+   判断「已经装过」，要带一个 **每次 `apply` 都不同的实例 token**；发现外层是别人的包装器时
+   **叠加**一层自己的，而不是放弃。进程重启后旧包装器自然消失，叠加的层数也就回到一。
 
 ---
 
