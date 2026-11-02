@@ -304,6 +304,123 @@ window.__ModuleLoader__.load({
     }
 
     // ── 导入区 ────────────────────────────────────────────────────────────
+    /**
+     * 本机模型 → 一键配置。
+     *
+     * 上一版的「导入」要求用户先把服务跑起来（因为要填端点）；可现实是「我刚下好一个
+     * gguf」—— 服务还不存在。这里把顺序倒过来：先列出磁盘上的模型文件，选一个，
+     * 插件负责起服务 + 写 provider + 试跑，一步到位。
+     */
+    function AdoptBox({ scan, setScan, busy, onScan, onAdopt, form, setForm, result }) {
+      const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
+      const chosen = models.find((item) => item.path === form.modelPath)
+      return h(
+        'div',
+        { style: { marginTop: 14 } },
+        h('div', { style: { fontWeight: 600, margin: '4px 0' } }, '本机模型 · 一键配置'),
+        h(
+          'div',
+          { style: S.hint },
+          '列出这台机器上已经下好的 .gguf，选一个，插件替你起 llama-server、写进 provider、再试跑一次。不用先有端点。',
+        ),
+        h(
+          'div',
+          { style: S.row },
+          h(
+            'button',
+            { style: S.button, onClick: onScan, disabled: busy !== '' },
+            busy === 'scan' ? '扫描中…' : scan === null ? '扫描本机模型' : '重新扫描',
+          ),
+          scan === null
+            ? null
+            : h(
+                'span',
+                { style: S.hint },
+                models.length === 0
+                  ? '没找到 .gguf。找过：' + (scan.dirs ?? []).join(' / ')
+                  : `找到 ${models.length} 个（已跳过视觉投影 mmproj）`,
+              ),
+        ),
+        models.length === 0
+          ? null
+          : h(
+              'div',
+              { style: S.row },
+              h('span', { style: S.label }, '模型文件'),
+              h(
+                'select',
+                {
+                  style: { ...S.select, maxWidth: 560 },
+                  value: form.modelPath,
+                  onChange: (event) => setForm({ ...form, modelPath: event.target.value }),
+                },
+                h('option', { value: '' }, '选一个（' + models.length + ' 个）'),
+                ...models.map((item) =>
+                  h(
+                    'option',
+                    { key: item.path, value: item.path },
+                    `${item.name} · ${(item.sizeBytes / 1e9).toFixed(1)}GB`,
+                  ),
+                ),
+              ),
+            ),
+        models.length === 0
+          ? null
+          : h(
+              'div',
+              { style: S.row },
+              h('span', { style: S.label }, '端口 / 上下文'),
+              h('input', {
+                style: { ...S.input, maxWidth: 90 },
+                value: String(form.port),
+                spellCheck: false,
+                onChange: (event) => setForm({ ...form, port: event.target.value }),
+              }),
+              h('input', {
+                style: { ...S.input, maxWidth: 110 },
+                value: String(form.contextWindow),
+                spellCheck: false,
+                onChange: (event) => setForm({ ...form, contextWindow: event.target.value }),
+              }),
+              h(
+                'label',
+                { style: { ...S.hint, display: 'inline-flex', gap: 6, alignItems: 'center' } },
+                h('input', {
+                  type: 'checkbox',
+                  checked: form.thinking === true,
+                  onChange: (event) => setForm({ ...form, thinking: event.target.checked }),
+                }),
+                '保留思考模式',
+              ),
+            ),
+        models.length === 0
+          ? null
+          : h(
+              'div',
+              { style: S.row },
+              h(
+                'button',
+                {
+                  style: { ...S.button, ...S.primary },
+                  onClick: onAdopt,
+                  disabled: busy !== '' || form.modelPath === '',
+                },
+                busy === 'adopt' ? '起服务 + 注册 + 试跑中…（首次加载权重十几秒）' : '一键配置并试跑',
+              ),
+              chosen === undefined
+                ? null
+                : h('span', { style: S.hint }, '别名取文件名：' + chosen.name.replace(/\.gguf$/i, '')),
+            ),
+        result === null
+          ? null
+          : h(
+              'pre',
+              { style: { ...(result.ok === true ? S.good : S.bad), ...S.pre } },
+              result.text,
+            ),
+      )
+    }
+
     function ImportBox({ form, setForm, busy, onProbe, onImport, result }) {
       const models = Array.isArray(form.models) ? form.models : []
       return h(
@@ -415,6 +532,9 @@ window.__ModuleLoader__.load({
         overwrite: false,
       })
       const [importResult, setImportResult] = React.useState(null)
+      const [scan, setScan] = React.useState(null)
+      const [adoptForm, setAdoptForm] = React.useState({ modelPath: '', port: 8090, contextWindow: 65536, thinking: false })
+      const [adoptResult, setAdoptResult] = React.useState(null)
       const [launchResult, setLaunchResult] = React.useState(null)
 
       const mine = subject?.kind === 'bundle' && subject?.pkg?.name === PACKAGE_NAME
@@ -568,6 +688,59 @@ window.__ModuleLoader__.load({
           setBusy('')
         }
       }
+
+      const scanModels = React.useCallback(async () => {
+        setBusy('scan')
+        setMessage(null)
+        try {
+          const result = await call('models', {})
+          setScan(result)
+          setAdoptForm((prev) => {
+            if (prev.modelPath !== '') return prev
+            const first = (result.models ?? []).find((item) => item.mmproj !== true)
+            return first === undefined ? prev : { ...prev, modelPath: first.path }
+          })
+        } catch (error) {
+          setMessage({ tone: 'bad', text: '扫描失败：' + String(error?.message ?? error) })
+        } finally {
+          setBusy('')
+        }
+      }, [])
+
+      const runAdopt = React.useCallback(async () => {
+        if (adoptForm.modelPath === '') return
+        setBusy('adopt')
+        setMessage(null)
+        setAdoptResult(null)
+        try {
+          const result = await call('adopt', {
+            modelPath: adoptForm.modelPath,
+            port: Number(adoptForm.port) || 8090,
+            contextWindow: Number(adoptForm.contextWindow) || 65536,
+            thinking: adoptForm.thinking === true,
+          })
+          const lines = []
+          if (result.launch?.already === true) lines.push('端口 ' + result.port + ' 本来就在跑，跳过拉起')
+          else if (result.launch?.ok === true) {
+            lines.push('已拉起 llama-server（pid ' + result.launch.pid + '），' + result.launch.ms + 'ms 后应答')
+          }
+          if (result.provider !== undefined) lines.push('provider：' + result.provider + ' → ' + result.model)
+          if (result.registered === true) lines.push('已写入 llm-pi-ai（重启后在选择器里可见）')
+          else if (result.reason) lines.push('未写入：' + result.reason)
+          if (result.smoke?.ok === true) {
+            lines.push('试跑 ' + result.smoke.ms + 'ms：「' + (result.smoke.text || '(空)') + '」')
+          } else if (result.smoke) {
+            lines.push('试跑失败：' + (result.smoke.error ?? '没拿到回复'))
+          }
+          if (result.ok !== true) lines.push('卡在 ' + (result.stage ?? '?') + '：' + (result.error ?? ''))
+          setAdoptResult({ ok: result.ok === true, text: lines.join('\n') })
+          if (result.ok === true) await load()
+        } catch (error) {
+          setAdoptResult({ ok: false, text: '一键配置失败：' + String(error?.message ?? error) })
+        } finally {
+          setBusy('')
+        }
+      }, [adoptForm, load])
 
       const runImport = async () => {
         setBusy('import')
@@ -738,6 +911,18 @@ window.__ModuleLoader__.load({
                     : ''),
             )
           : null,
+
+        // ③ 本机模型一键配置（下好就能用）
+        h(AdoptBox, {
+          scan,
+          setScan,
+          busy,
+          onScan: scanModels,
+          onAdopt: runAdopt,
+          form: adoptForm,
+          setForm: setAdoptForm,
+          result: adoptResult,
+        }),
 
         // ④ 导入
         h(ImportBox, { form, setForm, busy, onProbe: probeEndpoint, onImport: runImport, result: importResult }),

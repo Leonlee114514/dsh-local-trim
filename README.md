@@ -380,13 +380,13 @@ EOF
 
 ---
 
-## 控制面板（v0.3.0 起，v0.3.2 改版）
+## 控制面板（v0.3.0 起，v0.3.9 改版）
 
 插件在 DSH Web 的**插件详情页**里挂了一块面板：左侧栏进「插件」，列表里点开
 `dsh-local-trim`，详情页底部就是它。面板直接读写这份 profile 的
 `cordis.patch.yml` 里 `local-tool-trim.config` 那一节，改完点保存即生效，不用重启。
 
-v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
+v0.3.9 起版面按「先看状态，再动手」重排，从上到下五块：
 
 **① 状态带** —— 一行徽章，每枚带颜色灯：
 
@@ -405,7 +405,37 @@ v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
 （`GET /v1/models`，15 秒内复用结果），显示在线耗时或错误原文；每个本地 provider 后面有
 **试跑** 按钮，发一条「只回一个字：好」的真实请求，回来显示毫秒数与回复内容。
 
-**④ 导入本地模型** —— 填端点（例如 `http://127.0.0.1:8090`，`/v1` 可省）→ **探测** →
+**④ 本机模型 · 一键配置**（v0.3.9 起）—— 上一块要求你先有端点，可刚下完模型的
+时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个 gguf → 一键配置并试跑**。
+
+点「扫描本机模型」后插件会去这几个地方找 `.gguf`（每层最多下探两级，跳过
+`.mmproj.` 视觉投影，按文件大小降序，大的排前面）：
+
+```
+~/.workbuddy/local-models/files      ← WorkBuddy 下载目录，命中率最高
+~/AI/models
+~/models
+~/.lmstudio/models
+%LOCALAPPDATA%/LM-Studio/models
+~/Downloads
+```
+
+选中一个模型后填端口（默认 8090）和上下文（默认 65536），点**一键配置并试跑**，
+一条链走完三件事：
+
+1. 用这个 gguf 起 `llama-server`（自动找 `~/.workbuddy/local-models/bin/` 下最新的 build，
+   参数带 `--n-gpu-layers auto --fit on --jinja --cache-type-k/v q8_0`）；端口上已经有服务
+   在应答就跳过拉起，不重复起；
+2. 等 `GET /v1/models` 真应答，**以它报的模型 id 为准**（不是文件名）；
+3. 复用「导入」的注册逻辑写进 `llm-pi-ai`，然后发一条真实请求试跑。
+
+失败时面板会说卡在哪一步：`launch`（起不来，带查过的路径）/ `probe`（起来了但没报模型）/
+`register`（写 settings 被拒）。别自己猜。
+
+> 首次加载 17GB 权重需要十几秒到几十秒，这期间机器会明显变卡 —— 那是权重在往显存里搬，
+> 不是插件在空转。显存不够时 llama.cpp 会回落到 CPU，速度会掉一个数量级。
+
+**⑤ 导入本地模型** —— 填端点（例如 `http://127.0.0.1:8090`，`/v1` 可省）→ **探测** →
 下拉里选一个模型 → **导入并试跑**。导入做四件事：
 
 1. `GET /v1/models`（不通用时退 `/api/tags`）拿到模型列表；
@@ -592,8 +622,8 @@ node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
-node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 9 条 bridge 路由全打一遍
-node test/launcher.mjs          # 一键拉起：找可执行文件、命令行切分、等端口（不真起进程）
+node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 11 条 bridge 路由全打一遍
+node test/launcher.mjs          # 一键拉起 + 扫本机 gguf：找可执行文件、命令行切分、等端口（不真起进程）
 ```
 
 `test/panel.mjs` 只测纯逻辑：`lib/status.js`（接管文案、收益计算、provider 判定与点灯计数）
@@ -609,6 +639,9 @@ llama.cpp（`/v1/models` + `/v1/chat/completions`）跑真的 `apply(ctx)`，让
 `whichOnPath` 补扩展名、四种后端的计划生成、找不到可执行文件与「需要模型参数」两条错误路径、
 自定义命令优先、`runDetached` 的 `detached/stdio/env` 传参，以及 `waitForEndpoint` 的
 命中与超时。`spawnImpl` 与 `probe` 全部注入，CI 上不会留下后台进程。
+v0.3.9 起还覆盖 `scanLocalModels`（跳过 mmproj、按大小降序、目录下探）与「自选端口 +
+指定 gguf」的拼装（端口和 alias 都得按用户填的走）。本地不要为了验证去真起 17GB 的模型 ——
+`planLaunch` 已经把命令和参数摆出来了，看一眼就够；真要端到端跑，挑个空闲时段。
 
 `lib/config.js` 顶层 `import z from '@deepseek-ai/schemastery'` —— 运行时由 DSH 宿主提供
 （`peerDependencies`，optional，不会再给装插件的人拉第二份副本），跑测试前需要

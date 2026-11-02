@@ -17,6 +17,7 @@ import {
   whichOnPath,
   workbuddyRoot,
   llamaCppAutoArgs,
+  scanLocalModels,
 } from '../lib/launcher.js'
 
 let passed = 0
@@ -240,6 +241,56 @@ await ok('确实没有模型文件时才回「不替你猜」', async () => {
   })
   assert.equal(plan.ok, false)
   assert.match(plan.error, /需要模型文件/)
+})
+
+await ok('扫本机 gguf：跳过 mmproj、按大小降序', async () => {
+  const tree = {
+    '/m': ['big.gguf', 'small.gguf', 'vision.mmproj.gguf'],
+  }
+  const list = scanLocalModels({
+    dirs: ['/m'],
+    depth: 1,
+    exists: (p) => p === '/m' || tree[p] !== undefined || p.endsWith('.gguf'),
+    listDir: (dir) => tree[dir] ?? [],
+    statSize: (p) => (p.includes('big') ? 900 : p.includes('small') ? 100 : 50),
+  })
+  assert.equal(list.length, 3)
+  assert.equal(list[0].name, 'big.gguf')
+  assert.equal(list[1].name, 'small.gguf')
+  assert.equal(list.find((item) => item.name === 'vision.mmproj.gguf').mmproj, true)
+})
+
+await ok('扫本机 gguf：指定 modelPath 就用它，不再去目录里猜', async () => {
+  const auto = llamaCppAutoArgs({
+    modelPath: 'D:/models/other-qwen.gguf',
+    listDir: () => ['local_model.gguf'],
+    port: 8091,
+    ctx: 8192,
+  })
+  assert.equal(auto.ok, true)
+  assert.equal(auto.model, 'D:/models/other-qwen.gguf')
+  assert.equal(auto.args[auto.args.indexOf('--port') + 1], '8091')
+  assert.equal(auto.args[auto.args.indexOf('--alias') + 1], 'other-qwen')
+})
+
+await ok('扫本机 gguf：目录里只有 mmproj 时算没有模型', async () => {
+  const auto = llamaCppAutoArgs({
+    listDir: () => ['local_model.mmproj.gguf'],
+  })
+  assert.equal(auto.ok, false)
+  assert.equal(auto.reason, 'no-model')
+})
+
+await ok('自选端口 + 指定 gguf：端口按用户填的走，报回来的也是它', async () => {
+  const plan = planLaunch({
+    port: 8095,
+    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    ctx: 65536,
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.port, 8095)
+  assert.equal(plan.args[plan.args.indexOf('--port') + 1], '8095')
+  assert.equal(plan.args[plan.args.indexOf('--alias') + 1], 'local_model')
 })
 
 await ok('launcher 表里端口不重复', async () => {

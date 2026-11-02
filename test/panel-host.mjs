@@ -164,8 +164,8 @@ const callRoute = async (name, body) => {
   return { status, body: text.length > 0 ? JSON.parse(text) : undefined }
 }
 
-console.log('\n=== 1. 九条路由都注册上了 ===')
-for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch']) {
+console.log('\n=== 1. 十一条路由都注册上了 ===')
+for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch', 'models', 'adopt']) {
   check(name, routes.has('/api/dsh-local-trim/' + name))
 }
 
@@ -283,6 +283,52 @@ console.log('\n=== 12. launch：不认识的后端给可执行的下一步 ===')
   check('ok=false', body.ok === false)
   check('点名端口', /9999/.test(body.error ?? ''), body.error ?? '')
   check('指向高级配置里的启动命令', /启动命令/.test(body.error ?? ''), body.error ?? '')
+}
+
+console.log('\n=== 13. models：列出本机已下好的 gguf ===')
+{
+  const { status, body } = await callRoute('models', {})
+  check('200 + ok', status === 200 && body.ok === true, JSON.stringify(body.error ?? ''))
+  check('带 models 数组', Array.isArray(body.models))
+  check('带搜过的目录清单', Array.isArray(body.dirs) && body.dirs.length > 0, String((body.dirs ?? []).length))
+  check(
+    '每条都有 path / name / sizeBytes',
+    (body.models ?? []).every((item) => typeof item.path === 'string' && typeof item.name === 'string'),
+  )
+  check('mmproj 被标出来（供前端过滤）', (body.models ?? []).every((item) => typeof item.mmproj === 'boolean'))
+}
+
+console.log('\n=== 14. adopt：没选模型文件时直接说清楚 ===')
+{
+  const { status, body } = await callRoute('adopt', {})
+  check('200（业务失败不抛）', status === 200, String(status))
+  check('ok=false', body.ok === false)
+  check('要求先选 .gguf', /先选一个本机模型文件/.test(body.error ?? ''), body.error ?? '')
+}
+
+console.log('\n=== 15. adopt：非 gguf 文件被挡下 ===')
+{
+  const { body } = await callRoute('adopt', { modelPath: 'C:/tmp/model.bin' })
+  check('ok=false', body.ok === false)
+  check('只认 .gguf', /只能选 .gguf/.test(body.error ?? ''), body.error ?? '')
+}
+
+console.log('\n=== 16. adopt：端口已经在跑时，跳过拉起直接注册 + 试跑 ===')
+{
+  // 8090 在假 fetch 白名单里 → launchPanel 走「本来就在应答」早退，
+  // 于是这条用例覆盖的是 adopt 的后半段：探到真实模型 id → 写 provider → 试跑。
+  const { status, body } = await callRoute('adopt', {
+    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    port: 8090,
+    contextWindow: 65536,
+    overwrite: true,
+  })
+  check('200 + ok', status === 200 && body.ok === true, JSON.stringify(body.error ?? '') + ' stage=' + (body.stage ?? ''))
+  check('阶段是 ready', body.stage === 'ready', String(body.stage))
+  check('复用已有服务，没重复拉起', body.launch?.already === true, String(body.launch?.already))
+  check('模型 id 取自 /v1/models', typeof body.model === 'string' && body.model.length > 0, String(body.model))
+  check('provider 注册上了', body.registered === true, String(body.registered))
+  check('试跑成功', body.smoke?.ok === true, JSON.stringify(body.smoke?.error ?? ''))
 }
 
 console.log(`\n${fail === 0 ? '=== 面板宿主侧集成全部通过 ===' : `=== ${fail} 项失败 ===`}`)
