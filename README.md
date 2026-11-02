@@ -610,7 +610,7 @@ done
 - `dsh-purge` 未安装时也能工作（接管原生 `prompt.assemble`），只是没有头 80 / 尾 96 的
   保留逻辑（没有那层兜底就不需要）。
 - 段名来自各插件的 `systemPrompt.section({ name })`，插件升级改段名后要在 `dropSections` 里同步。
-- `--cache-type-k/v q8_0` 这类 llama.cpp 侧优化不在本插件范围内。
+- llama.cpp 侧的调参只到「一键拉起时给一组能跑的默认值」（`--n-gpu-layers auto --fit on --cache-type-k/v q8_0`）；要换量化、换 KV cache 精度、限并发，改高级配置里的启动命令，插件不替你优化推理性能。
 
 ---
 
