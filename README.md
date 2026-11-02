@@ -420,21 +420,32 @@ v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
 原来那些字段（开关、阈值、三个名单、注入正文、一步到位）都在最下面折叠的
 **高级配置** 里，位置变了，能力没变。
 
-**⑤ 一键拉起（v0.3.4 起）** —— provider 表里每个**点着红灯的本地 provider** 后面多一个
-**拉起** 按钮。点它就按这个 provider 的端口去找后端并起起来，然后轮询等它应答：
+**⑤ 一键拉起（v0.3.4 起，v0.3.7 会自己捡模型）** —— provider 表里每个**本地 provider**
+后面都多一个 **拉起** 按钮。点它就按这个 provider 的端口去找后端并起起来，然后轮询等它应答：
 
 | 端口 | 后端 | 怎么起 |
 | --- | --- | --- |
 | 11434 | Ollama | 找到 `ollama(.exe)` 后 `serve`，并带上 `OLLAMA_HOST=127.0.0.1:11434` |
-| 8090 | llama.cpp | 需要模型参数，插件不猜 —— 在高级配置里填完整命令 |
-| 8000 | vLLM | 同上 |
+| 8090 | llama.cpp | 先找 `llama-server.exe`，再在 WorkBuddy 的模型目录里捡现成的 gguf，**参数自己拼** |
+| 8000 | vLLM | 需要模型参数，插件不猜 —— 在高级配置里填完整命令 |
 | 1234 | LM Studio | 同上（GUI 应用，通常自己开着） |
+
+llama.cpp 这一条是 v0.3.7 的重点：模型已经下好了就别让人再下一次 20GB。插件按这个顺序找
+
+1. `llama-server.exe`：`~/.workbuddy/local-models/bin/<build>/`（取最新 build）→ `LLAMA_SERVER_BIN`
+   → `~/AI/llama.cpp/` → PATH；
+2. gguf：`~/.workbuddy/local-models/files/*.gguf`，优先 `local_model.gguf`，跳过 `.mmproj.`（那是视觉投影）；
+3. 拼参数：`-m <gguf> --host 127.0.0.1 --port 8090 --alias <provider 的模型 id> --n-gpu-layers auto
+   --fit on --parallel 1 --jinja --cache-type-k q8_0 --cache-type-v q8_0 -c 65536 --n-predict 8192`。
+
+这套参数是按 32GB 统一内存实测出来的：权重 17GB 上卡，q8_0 KV 单 slot 才压得住 64K 上下文。
+**两个组件都找到才自动拼**；缺模型文件才回「需要模型文件才能起」，缺可执行文件才回「本机没找到」，
+错误里带着查过的路径。
 
 顺序是：**先探测**，端口本来就在应答就直接告诉你「没有重复拉起」；没应答才找可执行文件
 （`OLLAMA_BIN` 环境变量 → `~/AI/ollama/ollama.exe` → `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`
 → `C:\Program Files\Ollama\ollama.exe` → PATH），拉起后按 `拉起后等端口（秒）` 轮询
-`/v1/models`，成功后顺手把点灯缓存清掉。找不到可执行文件或该后端必须带模型参数时，
-错误里会写清**找过哪些路径**或**缺什么**，不会静默失败。
+`/v1/models`，成功后顺手把点灯缓存清掉。
 
 高级配置里的 **一键拉起命令** 留空就走上面的自动逻辑；填了（例如
 `C:\Users\you\AI\ollama\ollama.exe serve --verbose`）就原样执行，优先于自动探测。
@@ -453,6 +464,18 @@ v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
 `describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test` / `launch`，
 全部只接受 POST，且只放行本机来源
 （`sec-fetch-site: cross-site` 直接 403，`Origin` 必须与 Host 同源）。
+
+### 保存报「被 home patch 覆盖」怎么办
+
+如果这个插件的配置整段写在 profile 的 `cordis.patch.yml` 里（很多人是手写进去的），
+`settings.update` 会要求「合成后的 config 与要写的完全一致」，而那段 patch 里还有
+`routes` / `dropSections` 这些面板不负责的键 —— 于是整段写入被拒，面板会提示
+`这份配置整段来自 profile 的 cordis.patch.yml（home patch 层），面板不能整段覆盖`。
+
+两条路：① 直接改那个文件里 `local-tool-trim.config` 的对应键；② 把 patch 里这个插件的
+`config:` 段删掉（只留 `id` / `name` / `inject`），重启后配置归 settings 管，面板就能改。
+面板的**只读视图**（状态带、收益条、点灯、试跑、拉起）在两种情况下都能用。
+
 
 ### 面板不出现怎么办
 

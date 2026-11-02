@@ -15,6 +15,8 @@ import {
   splitCommand,
   waitForEndpoint,
   whichOnPath,
+  workbuddyRoot,
+  llamaCppAutoArgs,
 } from '../lib/launcher.js'
 
 let passed = 0
@@ -83,7 +85,8 @@ await ok('找不到可执行文件时说清找过哪些路径', async () => {
 })
 
 await ok('装了 llama.cpp 但没给模型：报「要模型文件」并给出可抄的命令', async () => {
-  const plan = planLaunch({ port: 8090, existsSync: () => true })
+  // listDir 置空：这组只验证「装了但要模型」的文案，别去读真实的模型目录
+  const plan = planLaunch({ port: 8090, existsSync: () => true, listDir: () => [] })
   assert.equal(plan.ok, false)
   assert.match(plan.error, /需要模型文件/)
   // 找到的可执行文件要出现在提示里，用户才能直接抄
@@ -92,7 +95,7 @@ await ok('装了 llama.cpp 但没给模型：报「要模型文件」并给出�
 })
 
 await ok('没装 llama.cpp：报「没找到」并列出查过的地方', async () => {
-  const plan = planLaunch({ port: 8090, existsSync: () => false })
+  const plan = planLaunch({ port: 8090, existsSync: () => false, listDir: () => [] })
   assert.equal(plan.ok, false)
   assert.match(plan.error, /本机没找到 llama\.cpp/)
   assert.ok(Array.isArray(plan.tried) && plan.tried.length > 0, 'tried 应列出候选路径')
@@ -185,6 +188,58 @@ await ok('waitForEndpoint 超时带上最后一次错误', async () => {
   assert.equal(result.ok, false)
   assert.match(result.error, /等了 2 秒/)
   assert.match(result.error, /ECONNREFUSED/)
+})
+
+await ok('认得出 WorkBuddy 里那套 llama.cpp + gguf', async () => {
+  const root = workbuddyRoot()
+  const bin = root + '/bin/b11012/llama-server.exe'
+  const auto = llamaCppAutoArgs({
+    listDir: (dir) => {
+      if (dir === root + '/bin') return ['b11012']
+      if (dir === root + '/files') return ['local_model.gguf', 'local_model.mmproj.gguf']
+      return []
+    },
+    exists: (p) => p === bin,
+    port: 8090,
+    ctx: 65536,
+  })
+  assert.equal(auto.ok, true)
+  assert.match(auto.model, /local_model.gguf$/)
+  // 视觉投影不能当主模型
+  assert.equal(auto.args.includes('local_model.mmproj.gguf'), false)
+  assert.ok(auto.args.includes('-m') && auto.args.includes('--jinja'))
+  assert.equal(auto.args[auto.args.indexOf('-c') + 1], '65536')
+})
+
+await ok('发现组件齐全时直接拼出可跑的命令，不要用户手抄', async () => {
+  const root = workbuddyRoot()
+  const bin = root + '/bin/b11012/llama-server.exe'
+  const plan = planLaunch({
+    port: 8090,
+    alias: 'qwen35moe-local',
+    listDir: (dir) => {
+      if (dir === root + '/bin') return ['b11012']
+      if (dir === root + '/files') return ['local_model.gguf']
+      return []
+    },
+    existsSync: (p) => p === bin,
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.source, 'discovered')
+  assert.equal(plan.command, bin)
+  assert.equal(plan.args[plan.args.indexOf('--alias') + 1], 'qwen35moe-local')
+})
+
+await ok('确实没有模型文件时才回「不替你猜」', async () => {
+  const root = workbuddyRoot()
+  const bin = root + '/bin/b11012/llama-server.exe'
+  const plan = planLaunch({
+    port: 8090,
+    listDir: (dir) => (dir === root + '/bin' ? ['b11012'] : []),
+    existsSync: (p) => p === bin,
+  })
+  assert.equal(plan.ok, false)
+  assert.match(plan.error, /需要模型文件/)
 })
 
 await ok('launcher 表里端口不重复', async () => {

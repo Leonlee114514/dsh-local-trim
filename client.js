@@ -510,7 +510,7 @@ window.__ModuleLoader__.load({
         setBusy('launch:' + row.id)
         setLaunchResult(null)
         try {
-          const result = await call('launch', { baseURL: row.baseURL, port: undefined })
+          const result = await call('launch', { baseURL: row.baseURL, model: row.modelIds?.[0] })
           setLaunchResult(result)
           await refreshStatus()
         } catch (error) {
