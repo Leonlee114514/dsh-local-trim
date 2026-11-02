@@ -1,15 +1,17 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.2.2",
-  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only.",
+  "version": "0.3.0",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a control panel inside the plugin detail page.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/",
+    "client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -17,6 +19,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    },
+    "engines": {
+      "dsh": ">=0.1.7-rc.1"
     }
   },
   "keywords": [
@@ -41,5 +52,8 @@
   "homepage": "https://github.com/Leonlee114514/dsh-local-trim#readme",
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
   }
 }
