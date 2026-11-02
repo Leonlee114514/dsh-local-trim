@@ -424,6 +424,10 @@ v0.3.2 起版面按「先看状态，再动手」重排，从上到下四块：
 （读 `~/.dsh/local-llm/local-trim.log` 尾部）、**重新检测**（强制刷新点灯结果）。
 右上角显示当前 `revision`；这份配置在别处被改过时，保存会提示冲突并自动重新读取。
 
+宿主里跑的还是旧代码时（只有 describe / save / probe / log 四条路由，没有 `status`），
+面板不会整块报错：它自动退回 `describe` 视图，并在顶部提示「重启一次 DSH 就能看到点灯、
+收益条和模型导入」。插件是 JS 模块，装在宿主进程里，改完源码要让宿主重新 apply 一次。
+
 面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，八个端点
 `describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test`，
 全部只接受 POST，且只放行本机来源
@@ -544,11 +548,17 @@ node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
+node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 8 条 bridge 路由全打一遍
 ```
 
 `test/panel.mjs` 只测纯逻辑：`lib/status.js`（接管文案、收益计算、provider 判定与点灯计数）
 和 `lib/import-model.js`（入参校验、provider id 生成、profile 拼装、试跑请求与四类失败分支，
-全部用假 `fetch`）。真正的网络探测留给面板上的按钮和 `test/provision.mjs` 里的假端点。
+全部用假 `fetch`）。
+
+`test/panel-host.mjs` 是宿主侧集成：用一份内存 settings、一个假 `webServer`、一个假
+llama.cpp（`/v1/models` + `/v1/chat/completions`）跑真的 `apply(ctx)`，让插件自己注册路由，
+然后逐条断言 status / check / import / test 的返回 —— 包括同源守卫 403、同名不覆盖、
+端点连不上、模型不在列表里、provider 不存在这几种失败路径。它不需要真起 DSH。
 
 `lib/config.js` 顶层 `import z from '@deepseek-ai/schemastery'` —— 运行时由 DSH 宿主提供
 （`peerDependencies`，optional，不会再给装插件的人拉第二份副本），跑测试前需要
