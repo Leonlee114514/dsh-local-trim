@@ -4,17 +4,27 @@
  * 挂在插件详情页的 `plugins.detail.section` 槽位上：在 DSH Web 的
  * 「插件」列表里点开 dsh-local-trim，详情页底部就是这块面板。
  *
- * 浏览器里拿不到 cordis 服务，所有读写都走宿主侧注册的 HTTP bridge：
- *   POST /api/dsh-local-trim/status   接管状态 + 裁剪收益 + provider 表（主视图）
- *   POST /api/dsh-local-trim/check    给 provider 点灯
- *   POST /api/dsh-local-trim/import   导入本地模型：探测 → 写 settings → 试跑
- *   POST /api/dsh-local-trim/test     对已注册 provider 发一次最小真实请求
- *   POST /api/dsh-local-trim/save     写回高级配置
- *   POST /api/dsh-local-trim/probe    批量探测默认端口
- *   POST /api/dsh-local-trim/log      读日志尾部
+ * 浏览器里拿不到 cordis 服务，所有读写都走宿主侧注册的 HTTP bridge（12 条，全部 POST）：
+ *   status   接管状态 + 裁剪收益 + provider 表 + 本插件起过的后端（主视图）
+ *   check    给 provider 点灯（GET /v1/models）
+ *   probe    批量探测默认端口
+ *   import   导入本地模型：探测 → 写 settings → 试跑
+ *   test     对已注册 provider 发一次最小真实请求
+ *   save     写回高级配置
+ *   describe 老宿主的兼容读取（没有 status 时降级用）
+ *   log      读日志尾部
+ *   models   扫本机 .gguf（带每个模型的资源预检）
+ *   adopt    一键配置：起服务 → 等应答 → 注册 provider → 试跑
+ *   launch   对已有 provider 拉起后端
+ *   stop     只停本插件自己 spawn 的那个 pid
  *
- * 版面顺序按「一眼看状态 → 想动手时再动手」排：状态带 / 收益条 / provider 表 /
- * 导入区，最后才是折叠起来的高级配置。
+ * 版面顺序按「一眼看状态 → 想动手时再动手」排：
+ *   状态带 → 收益条 → provider 表（点灯/试跑/拉起/停止）→ 本机模型一键配置
+ *   → 端点导入 → 折叠的高级配置。
+ *
+ * 文案只有中文。这是有意选择：插件面向中文使用者，硬塞一套英文会多出一半
+ * 需要同步的字符串，却没有第二个读者。要加语言时，把这里的字面量搬进
+ * 一个 `const TEXT = { zh: {...} }` 就行，位置都在本文件内。
  */
 
 window.__ModuleLoader__.load({
@@ -40,6 +50,7 @@ window.__ModuleLoader__.load({
     // ── 样式：全部内联，不依赖宿主的 CSS 变量（读不到时用兜底值） ──────────
     const BORDER = '1px solid var(--dsw-alias-border-l1, rgba(0,0,0,.16))'
     const MUTED = 'var(--dsw-alias-label-secondary, #666)'
+    const RED = '#c0392b'
     const TONE = {
       good: '#1e8449',
       warn: '#b9770e',
@@ -248,8 +259,10 @@ window.__ModuleLoader__.load({
     }
 
     // ── provider 表 ───────────────────────────────────────────────────────
-    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch }) {
+    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, launchedPorts }) {
       const list = Array.isArray(rows) ? rows : []
+      const mine = new Set(Array.isArray(launchedPorts) ? launchedPorts.map((item) => Number(item?.port ?? item)) : [])
+      const portOf = (row) => Number(String(row?.baseURL ?? '').replace(/^.*:(\d+).*$/, '$1')) || 0
       return h(
         'div',
         null,
@@ -288,6 +301,20 @@ window.__ModuleLoader__.load({
                       busy === 'launch:' + row.id ? '拉起中…' : '拉起',
                     )
                   : null,
+                // 只有「这个端口上确实是本插件起的」才给停止按钮：别人的 ollama serve
+                // 不该被这里点掉，服务端也会拒绝。
+                mine.has(portOf(row))
+                  ? h(
+                      'button',
+                      {
+                        style: { ...S.small, color: RED },
+                        disabled: busy !== '',
+                        title: '停掉本插件在这个端口上拉起的进程（SIGTERM，赖着不走再 SIGKILL）',
+                        onClick: () => onStop(row),
+                      },
+                      busy === 'stop:' + row.id ? '停止中…' : '停止',
+                    )
+                  : null,
                 h(
                   'button',
                   {
@@ -314,6 +341,9 @@ window.__ModuleLoader__.load({
     function AdoptBox({ scan, setScan, busy, onScan, onAdopt, form, setForm, result }) {
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
       const chosen = models.find((item) => item.path === form.modelPath)
+      const gib = (bytes) => (Number(bytes) > 0 ? (Number(bytes) / 1073741824).toFixed(1) + 'GB' : '?')
+      const fit = chosen?.fit
+      const heavy = fit?.level === 'risky'
       return h(
         'div',
         { style: { marginTop: 14 } },
@@ -338,7 +368,8 @@ window.__ModuleLoader__.load({
                 { style: S.hint },
                 models.length === 0
                   ? '没找到 .gguf。找过：' + (scan.dirs ?? []).join(' / ')
-                  : `找到 ${models.length} 个（已跳过视觉投影 mmproj）`,
+                  : `找到 ${models.length} 个（已跳过视觉投影 mmproj）` +
+                    (scan.truncated === true ? '，清单被截断' : ''),
               ),
         ),
         models.length === 0
@@ -359,10 +390,19 @@ window.__ModuleLoader__.load({
                   h(
                     'option',
                     { key: item.path, value: item.path },
-                    `${item.name} · ${(item.sizeBytes / 1e9).toFixed(1)}GB`,
+                    `${item.name} · ${gib(item.sizeBytes)}` +
+                      (item.fit?.level === 'risky' ? ' · 偏大' : ''),
                   ),
                 ),
               ),
+            ),
+        // 预检结论：只在有话说的时候显示（ok 就不打扰）
+        fit === undefined || fit.level === 'ok' || fit.level === 'unknown'
+          ? null
+          : h(
+              'div',
+              { style: { ...(heavy ? S.bad : S.hint), margin: '2px 0 6px' } },
+              fit.label + (heavy ? '（会改用 --no-mmap 分页加载，速度慢但不容易拖死）' : ''),
             ),
         models.length === 0
           ? null
@@ -398,14 +438,31 @@ window.__ModuleLoader__.load({
           : h(
               'div',
               { style: S.row },
+              // 大模型才需要勾这个：勾了服务端才肯真起，否则只回一句「会很卡」
+              heavy
+                ? h(
+                    'label',
+                    { style: { ...S.hint, display: 'inline-flex', gap: 6, alignItems: 'center' } },
+                    h('input', {
+                      type: 'checkbox',
+                      checked: form.confirmHeavy === true,
+                      onChange: (event) => setForm({ ...form, confirmHeavy: event.target.checked }),
+                    }),
+                    '我知道会很卡，还是要起',
+                  )
+                : null,
               h(
                 'button',
                 {
                   style: { ...S.button, ...S.primary },
                   onClick: onAdopt,
-                  disabled: busy !== '' || form.modelPath === '',
+                  disabled: busy !== '' || form.modelPath === '' || (heavy && form.confirmHeavy !== true),
                 },
-                busy === 'adopt' ? '起服务 + 注册 + 试跑中…（首次加载权重十几秒）' : '一键配置并试跑',
+                busy === 'adopt'
+                  ? '起服务 + 注册 + 试跑中…（首次加载权重十几秒）'
+                  : heavy && form.confirmHeavy !== true
+                    ? '模型偏大，先勾上面那行'
+                    : '一键配置并试跑',
               ),
               chosen === undefined
                 ? null
@@ -533,7 +590,13 @@ window.__ModuleLoader__.load({
       })
       const [importResult, setImportResult] = React.useState(null)
       const [scan, setScan] = React.useState(null)
-      const [adoptForm, setAdoptForm] = React.useState({ modelPath: '', port: 8090, contextWindow: 65536, thinking: false })
+      const [adoptForm, setAdoptForm] = React.useState({
+        modelPath: '',
+        port: 8090,
+        contextWindow: 65536,
+        thinking: false,
+        confirmHeavy: false,
+      })
       const [adoptResult, setAdoptResult] = React.useState(null)
       const [launchResult, setLaunchResult] = React.useState(null)
 
@@ -574,6 +637,7 @@ window.__ModuleLoader__.load({
                 flags: {},
                 providers: [],
                 counts: { total: 0, local: 0, online: 0 },
+                launched: [],
                 revision: described.revision,
                 writable: described.writable,
               },
@@ -632,6 +696,22 @@ window.__ModuleLoader__.load({
         try {
           const result = await call('launch', { baseURL: row.baseURL, model: row.modelIds?.[0] })
           setLaunchResult(result)
+          await refreshStatus()
+        } catch (error) {
+          setLaunchResult({ ok: false, error: String(error?.message ?? error) })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      // 停止：只停本插件自己 spawn 的那个 pid（服务端有白名单，别人的后端不动）
+      const stop = async (row) => {
+        setBusy('stop:' + row.id)
+        setLaunchResult(null)
+        try {
+          const port = Number(String(row.baseURL ?? '').replace(/^.*:(\d+).*$/, '$1')) || 0
+          const result = await call('stop', { port })
+          setLaunchResult(result.ok === true ? { ...result, message: result.message } : result)
           await refreshStatus()
         } catch (error) {
           setLaunchResult({ ok: false, error: String(error?.message ?? error) })
@@ -720,10 +800,19 @@ window.__ModuleLoader__.load({
             thinking: adoptForm.thinking === true,
           })
           const lines = []
+          if (result.stage === 'precheck') {
+            // 预检拦住：把体积、可用内存、建议动作一次说清
+            lines.push('预检没通过：' + (result.error ?? ''))
+            if (result.fit?.label) lines.push('· ' + result.fit.label)
+            if (result.noMmap === true) lines.push('· 确认后会改用 --no-mmap（分页读盘，慢但不吃满内存）')
+            setAdoptResult({ ok: false, text: lines.join('\n') })
+            return
+          }
           if (result.launch?.already === true) lines.push('端口 ' + result.port + ' 本来就在跑，跳过拉起')
           else if (result.launch?.ok === true) {
             lines.push('已拉起 llama-server（pid ' + result.launch.pid + '），' + result.launch.ms + 'ms 后应答')
           }
+          if (result.reaped === true) lines.push('（没起来，已经把刚拉起的进程回收了）')
           if (result.provider !== undefined) lines.push('provider：' + result.provider + ' → ' + result.model)
           if (result.registered === true) lines.push('已写入 llm-pi-ai（重启后在选择器里可见）')
           else if (result.reason) lines.push('未写入：' + result.reason)
@@ -892,6 +981,8 @@ window.__ModuleLoader__.load({
           onTest: test,
           onCheck: check,
           onLaunch: launch,
+          onStop: stop,
+          launchedPorts: status.launched ?? [],
         }),
 
         launchResult !== null

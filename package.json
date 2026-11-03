@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.3.9",
-  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a status-aware control panel (import a local model, smoke-test it, watch trim savings) inside the plugin detail page.",
+  "version": "0.4.0",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a status-aware control panel (scan local gguf, adopt with resource pre-check, smoke-test, launch/stop the backend, watch trim savings) inside the plugin detail page.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -52,6 +52,13 @@
   "homepage": "https://github.com/Leonlee114514/dsh-local-trim#readme",
   "engines": {
     "node": ">=20"
+  },
+  "scripts": {
+    "test": "npm run test:unit && npm run test:host",
+    "test:unit": "node test/launcher.mjs && node test/panel.mjs && node test/selfcheck.mjs && node test/provision.mjs && node test/autodetect.mjs",
+    "test:host": "node test/panel-host.mjs",
+    "check": "node --check lib/index.js && node --check lib/launcher.js && node --check lib/bridge.js && node --check lib/config.js && node --check lib/defaults.js && node --check lib/status.js && node --check lib/import-model.js && node --check client.js",
+    "verify": "npm run check && npm test"
   },
   "devDependencies": {
     "@deepseek-ai/schemastery": "^3.18.5"

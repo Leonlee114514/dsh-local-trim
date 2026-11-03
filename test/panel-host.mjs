@@ -130,7 +130,16 @@ const ctxStub = {
   },
 }
 
-apply(ctxStub, { enabled: true, routes: [], injectText: 'L', selfCheck: false, provision: false })
+apply(ctxStub, {
+  enabled: true,
+  routes: [],
+  injectText: 'L',
+  selfCheck: false,
+  provision: false,
+  // 用例是在几毫秒内连着打同一批重活路由的，默认 800ms 间隔会把它们全挡掉。
+  // 节流本身另有用例（最后那组）单独验。
+  bridgeThrottleMs: 0,
+})
 await new Promise((resolve) => setTimeout(resolve, 200))
 
 // ── 假 req/res：直接调 handler ──────────────────────────────────────────
@@ -313,7 +322,28 @@ console.log('\n=== 15. adopt：非 gguf 文件被挡下 ===')
   check('只认 .gguf', /只能选 .gguf/.test(body.error ?? ''), body.error ?? '')
 }
 
-console.log('\n=== 16. adopt：端口已经在跑时，跳过拉起直接注册 + 试跑 ===')
+console.log('\n=== 16. adopt：拿到真模型路径时先做资源预检 ===')
+{
+  // 这台机器上 local_model.gguf 真有 15.8GB，可用内存 14.4GB 左右 → 必然是 risky。
+  // 预检拦住时不该悄悄往下走，要带回 fit 明细 + needsConfirm。
+  const { status, body } = await callRoute('adopt', {
+    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    port: 8090,
+  })
+  if (body.fit?.level === 'risky') {
+    check('200（业务失败不抛）', status === 200, String(status))
+    check('ok=false', body.ok === false)
+    check('阶段是 precheck', body.stage === 'precheck', String(body.stage))
+    check('要求显式确认', body.needsConfirm === true)
+    check('带回 fit 明细', typeof body.fit?.ratio === 'number', String(body.fit?.ratio))
+    check('自动改用 mmap 分页', body.noMmap === true)
+    check('错误里说清代价', /变卡|拖死|占总/.test(body.error ?? ''), body.error ?? '')
+  } else {
+    check('预检没触发（这台机器内存够）', body.stage !== 'precheck', String(body.fit?.level))
+  }
+}
+
+console.log('\n=== 17. adopt：确认后继续，端口已经在跑就跳过拉起 ===')
 {
   // 8090 在假 fetch 白名单里 → launchPanel 走「本来就在应答」早退，
   // 于是这条用例覆盖的是 adopt 的后半段：探到真实模型 id → 写 provider → 试跑。
@@ -322,6 +352,7 @@ console.log('\n=== 16. adopt：端口已经在跑时，跳过拉起直接注册 
     port: 8090,
     contextWindow: 65536,
     overwrite: true,
+    confirmHeavy: true,
   })
   check('200 + ok', status === 200 && body.ok === true, JSON.stringify(body.error ?? '') + ' stage=' + (body.stage ?? ''))
   check('阶段是 ready', body.stage === 'ready', String(body.stage))
@@ -329,6 +360,34 @@ console.log('\n=== 16. adopt：端口已经在跑时，跳过拉起直接注册 
   check('模型 id 取自 /v1/models', typeof body.model === 'string' && body.model.length > 0, String(body.model))
   check('provider 注册上了', body.registered === true, String(body.registered))
   check('试跑成功', body.smoke?.ok === true, JSON.stringify(body.smoke?.error ?? ''))
+  check('带回预检结论给前端展示', typeof body.fit?.label === 'string', String(body.fit?.level))
+}
+
+console.log('\n=== 18. stop：只停自己起过的，别人的一概不动 ===')
+{
+  // 面板从没在这台机器上 spawn 过东西（用例全是假 fetch），所以表是空的。
+  const { status, body } = await callRoute('stop', { port: 11434 })
+  check('200（业务失败不抛）', status === 200, String(status))
+  check('ok=false', body.ok === false)
+  check('说明这个端口不是自己起的', /没有本插件拉起的进程/.test(body.error ?? ''), body.error ?? '')
+  check('带回自己起过哪些端口', Array.isArray(body.launched), JSON.stringify(body.launched))
+
+  const missing = await callRoute('stop', {})
+  check('没说端口就直说', missing.body.ok === false && /停哪个端口/.test(missing.body.error ?? ''), missing.body.error ?? '')
+}
+
+console.log('\n=== 19. models：扫描结果带每个模型的预检结论 ===')
+{
+  const { body } = await callRoute('models', {})
+  const list = body.models ?? []
+  check('每条都带 fit', list.every((item) => typeof item.fit?.level === 'string'), 'n=' + list.length)
+  check(
+    'fit 结论在四个合法值里',
+    list.every((item) => ['ok', 'warn', 'risky', 'unknown'].includes(item.fit.level)),
+    JSON.stringify(list.map((item) => item.fit?.level).slice(0, 5)),
+  )
+  check('带回 truncated 标记', typeof body.truncated === 'boolean', String(body.truncated))
+  check('带回扫过的条目数', Number.isFinite(body.scannedEntries), String(body.scannedEntries))
 }
 
 console.log(`\n${fail === 0 ? '=== 面板宿主侧集成全部通过 ===' : `=== ${fail} 项失败 ===`}`)

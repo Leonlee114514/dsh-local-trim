@@ -22,10 +22,13 @@ jobs:
       # 不装依赖时下面的契约检查必然以 ERR_MODULE_NOT_FOUND 失败。
       - name: Install dev dependencies
         run: npm ci --no-audit --no-fund
+      # 手写文件清单会漏：v0.3.0 加了 lib/config.js、v0.3.2 加了 lib/defaults.js，
+      # 两批都没进这份名单，语法错误要等到 import 时才炸。改成扫全目录。
       - name: Syntax check
         run: |
-          for f in lib/index.js lib/bridge.js lib/status.js lib/import-model.js lib/launcher.js lib/provision.js client.js; do
-            node --check "$f" || exit 1
+          set -e
+          for f in lib/*.js client.js test/*.mjs; do
+            node --check "$f"
           done
       - name: Module loads and exports the plugin contract
         run: |
