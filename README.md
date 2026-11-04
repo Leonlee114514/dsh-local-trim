@@ -710,6 +710,10 @@ v0.3.9 起还覆盖 `scanLocalModels`（跳过 mmproj、按大小降序、目录
 （SIGTERM → SIGKILL → 报失败，幂等）、`isProcessAlive`（EPERM 算活着），
 以及扫描的三道上限（`maxModels` / `maxEntries` / Downloads 只扫一层）与 `truncated` 标记。
 
+`adopt` 的 `sizeBytes` / `gpuBytes` / `totalMemBytes` 可以从入参覆盖（非正数或省略就回落真实探测）。
+CI 的 runner 上没有 `nvidia-smi`、内存也只有 15.6GB，不覆盖的话「能跑的机器不该被判 risky」
+这条断言在 CI 上永远测不到 —— 它会一路走 `risky` 分支。生产路径不吃这三个参数。
+
 本地不要为了验证去真起 17GB 的模型 —— `planLaunch` 已经把命令和参数摆出来了，看一眼就够；
 真要端到端跑，挑个空闲时段。**别把冷启动当成卡死**：27.2B MoE 在这里实测预热
 1000–2000 token 后稳定 76 tok/s（见上文「一键配置」下的说明）。

@@ -330,6 +330,10 @@ console.log('\n=== 16. adopt：mmap 装得下的 15.8GB 模型不再被误判 ri
     modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
     port: 8090,
     sizeBytes: 16954484384,
+    // CI 的 runner 上没有 nvidia-smi、内存也只有 15.6GB，显存和内存也显式给，
+    // 否则 gpuBytes=0 → 16.9GB 全压到 15.6GB 内存上，又变回 risky。
+    gpuBytes: 14848 * 1024 * 1024,
+    totalMemBytes: 16762 * 1024 * 1024,
   })
   check('200（业务失败不抛）', status === 200, String(status))
   check('带上体积', body.sizeBytes === 16954484384, String(body.sizeBytes))

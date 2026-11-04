@@ -28,6 +28,11 @@ v0.4.0 的资源预检建立在一个错误前提上，这一版把它连根改�
   失败返回 0 让预检退化成「不算显存」而不是报错。宿主侧 60 秒缓存（面板每条模型都要问）。
   注意 `--query-compute-apps=used_memory` 在这台机器全报 `[N/A]`，只能问总量。
 
+- **`adopt` 的 `sizeBytes` / `gpuBytes` / `totalMemBytes` 可从入参覆盖**。
+  本来只给测试用，现在也是诊断手段：CI 的 runner 没有 nvidia-smi、内存只有 15.6GB，
+  不覆盖的话「能跑的机器不该被判 risky」这条断言在 CI 上永远测不到。
+  传入非正数或省略就回落真实探测，生产路径行为不变。
+
 - **面板不再谎称「会改用 --no-mmap」**。`AdoptBox` 多一个「加载方式」下拉
   （空=引擎自己决定 / mmap / none / mlock / mmap+mlock），默认留空走 llama.cpp 的 auto ——
   默认关 mmap 才是真吃满内存。确认勾选框文案改「我知道会很慢」。
