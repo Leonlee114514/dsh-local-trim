@@ -263,9 +263,12 @@ window.__ModuleLoader__.load({
     }
 
     // ── provider 表 ───────────────────────────────────────────────────────
-    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, launchedPorts }) {
+    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, onDelete, launchedPorts }) {
       const list = Array.isArray(rows) ? rows : []
       const mine = new Set(Array.isArray(launchedPorts) ? launchedPorts.map((item) => Number(item?.port ?? item)) : [])
+      // 删配置不可撤销（虽然能重新导入），点一次只进入确认态，第二次才真删。
+      const [pending, setPending] = React.useState('')
+      const deletingId = busy.startsWith('delete:') ? busy.slice('delete:'.length) : ''
       const portOf = (row) => Number(String(row?.baseURL ?? '').replace(/^.*:(\d+).*$/, '$1')) || 0
       return h(
         'div',
@@ -329,6 +332,35 @@ window.__ModuleLoader__.load({
                   },
                   busy === 'test:' + row.id ? '试跑中…' : '试跑',
                 ),
+                // 删的是这条 provider 配置，不是磁盘上的 gguf —— title 上写明白，
+                // 免得有人以为点了会丢模型。
+                h(
+                  'button',
+                  {
+                    style: {
+                      ...S.small,
+                      ...(pending === row.id ? { color: RED, borderColor: RED } : {}),
+                    },
+                    title:
+                      pending === row.id
+                        ? "再点一次就从配置里删掉这条（磁盘上的模型文件不受影响）"
+                        : "把这条 provider 配置删掉（不删磁盘上的 gguf）",
+                    disabled: busy !== '',
+                    onClick: () => {
+                      if (pending !== row.id) {
+                        setPending(row.id)
+                        return
+                      }
+                      setPending('')
+                      onDelete(row)
+                    },
+                  },
+                  deletingId === row.id
+                    ? '删除中…'
+                    : pending === row.id
+                      ? '确认删除？'
+                      : '删除',
+                ),
               ),
             ),
       )
@@ -342,7 +374,7 @@ window.__ModuleLoader__.load({
      * gguf」—— 服务还不存在。这里把顺序倒过来：先列出磁盘上的模型文件，选一个，
      * 插件负责起服务 + 写 provider + 试跑，一步到位。
      */
-    function AdoptBox({ scan, setScan, busy, onScan, onAdopt, onDelete, form, setForm, result }) {
+    function AdoptBox({ scan, setScan, busy, onScan, onAdopt, form, setForm, result }) {
       // allModels 是磁盘上全部 gguf（含 mmproj，用来删）；models 只留能当主模型的那些。
       const allModels = Array.isArray(scan?.models) ? scan.models : []
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
@@ -356,10 +388,7 @@ window.__ModuleLoader__.load({
       }
       const fit = chosen?.fit
       const heavy = fit?.level === 'risky'
-      // 删文件不可撤销，点一次只进入「确认」态，第二次才真删。
-      const [pendingDelete, setPendingDelete] = React.useState('')
-      // busy 的形态是 delete:<绝对路径>，所以能判断具体哪一行在删。
-      const deletingPath = busy.startsWith('delete:') ? busy.slice('delete:'.length) : ''
+      // 这里不再提供删除：要删的是 provider 配置（见上面的 provider 表），不是磁盘上的 gguf。
       return h(
         'div',
         { style: { marginTop: 14 } },
@@ -386,7 +415,7 @@ window.__ModuleLoader__.load({
                   ? '没找到 .gguf。找过：' + (scan.dirs ?? []).join(' / ')
                   : `找到 ${allModels.length} 个` +
                     (allModels.length > models.length
-                      ? `（其中 ${allModels.length - models.length} 个是视觉投影 mmproj，只能删不能选）`
+                      ? `（其中 ${allModels.length - models.length} 个是视觉投影 mmproj，不能单独当主模型）`
                       : '') +
                     (scan.truncated === true ? '，清单被截断' : ''),
               ),
@@ -412,7 +441,6 @@ window.__ModuleLoader__.load({
                 },
                 ...allModels.map((item) => {
                   const picked = item.path === form.modelPath
-                  const askDelete = pendingDelete === item.path
                   return h(
                     'div',
                     {
@@ -447,13 +475,11 @@ window.__ModuleLoader__.load({
                           fontWeight: picked ? 600 : 400,
                         },
                         title: item.mmproj === true
-                          ? '视觉投影（mmproj）不能单独当主模型用，只能删'
+                          ? '视觉投影（mmproj）不能单独当主模型用'
                           : item.path,
                         disabled: busy !== '' || item.mmproj === true,
                         onClick: () => {
                           if (item.mmproj === true) return
-                          // 点别的行 = 放弃那次「确认删除？」
-                          if (pendingDelete !== '' && pendingDelete !== item.path) setPendingDelete('')
                           setForm({ ...form, modelPath: item.path })
                         },
                       },
@@ -464,34 +490,6 @@ window.__ModuleLoader__.load({
                     item.mmproj === true
                       ? h('span', { style: { ...S.hint, flexShrink: 0 } }, '视觉投影')
                       : null,
-                    // 删除：先问一次，再动手
-                    h(
-                      'button',
-                      {
-                        style: {
-                          ...S.small,
-                          flexShrink: 0,
-                          ...(askDelete ? { color: RED, borderColor: RED } : {}),
-                        },
-                        title: askDelete
-                          ? '再点一次就真删了（不进回收站）'
-                          : '把这个 .gguf 从磁盘删掉',
-                        disabled: busy !== '',
-                        onClick: () => {
-                          if (!askDelete) {
-                            setPendingDelete(item.path)
-                            return
-                          }
-                          setPendingDelete('')
-                          onDelete(item)
-                        },
-                      },
-                      deletingPath === item.path
-                        ? '删除中…'
-                        : askDelete
-                          ? '确认删除？'
-                          : '删除',
-                    ),
                   )
                 }),
               ),
@@ -911,45 +909,35 @@ window.__ModuleLoader__.load({
        * 只有连点两次才会到这里（第一次在 AdoptBox 里变成「确认删除？」）。
        * 删成功就重扫一次：让列表反映磁盘真实状态，而不是本地先抹掉一行。
        */
+      /**
+       * 删一条 provider 配置。
+       *
+       * 删的是 settings 里的那一条 llm-pi-ai.providers[<id>]，**不是磁盘上的 gguf**。
+       * 权重文件是你的，插件不动；僵尸的是配置（指向从没起过的端口、同端口注册两遍那种）。
+       * 只有连点两次才会到这里（第一次在表里变成「确认删除？」）。
+       */
       const runDelete = React.useCallback(
-        async (item) => {
-          const target = String(item?.path ?? '')
-          if (target.length === 0) return
-          setBusy('delete:' + target)
+        async (row) => {
+          const provider = String(row?.id ?? "")
+          if (provider.length === 0) return
+          setBusy("delete:" + provider)
           setMessage(null)
           try {
-            const result = await call('delete', { path: target })
+            const result = await call("delete", { provider })
             if (result.ok !== true) {
-              setMessage({ tone: 'bad', text: '没删成：' + String(result.error ?? '不知道原因') })
+              setMessage({ tone: "bad", text: "没删成：" + String(result.error ?? "不知道原因") })
+              // 继承自下层 patch 的那种删不掉，缓存和列表都没变，别重扫。
               return
             }
-            const bytes = Number(result.freedBytes)
-            const freed =
-              !Number.isFinite(bytes) || bytes <= 0
-                ? ''
-                : bytes >= 1073741824
-                  ? (bytes / 1073741824).toFixed(1) + 'GB'
-                  : bytes >= 1048576
-                    ? Math.round(bytes / 1048576) + 'MB'
-                    : Math.round(bytes / 1024) + 'KB'
-            const extra =
-              Array.isArray(result.users) && result.users.length > 0
-                ? '；还有 provider 指着它：' + result.users.join('、') + '（配置没动）'
-                : ''
-            setMessage({
-              tone: 'good',
-              text: (freed.length > 0 ? '已删除，腾出 ' + freed : '已删除') + extra,
-            })
-            if (form.modelPath === target) setAdoptForm((prev) => ({ ...prev, modelPath: '' }))
-            setAdoptResult(null)
-            await scanModels()
+            setMessage({ tone: "good", text: String(result.message ?? "已删除 provider " + provider) })
+            await refreshStatus()
           } catch (error) {
-            setMessage({ tone: 'bad', text: '删除失败：' + String(error?.message ?? error) })
+            setMessage({ tone: "bad", text: "删除失败：" + String(error?.message ?? error) })
           } finally {
-            setBusy('')
+            setBusy("")
           }
         },
-        [form.modelPath, scanModels],
+        [refreshStatus],
       )
       const runAdopt = React.useCallback(async () => {
         if (adoptForm.modelPath === '') return
@@ -1149,6 +1137,7 @@ window.__ModuleLoader__.load({
           onCheck: check,
           onLaunch: launch,
           onStop: stop,
+          onDelete: runDelete,
           launchedPorts: status.launched ?? [],
         }),
 
@@ -1182,7 +1171,6 @@ window.__ModuleLoader__.load({
           busy,
           onScan: scanModels,
           onAdopt: runAdopt,
-          onDelete: runDelete,
           form: adoptForm,
           setForm: setAdoptForm,
           result: adoptResult,

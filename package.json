@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.4.3",
-  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a cross-platform status panel (scan gguf in OS-standard locations, adopt with VRAM-aware resource pre-check, smoke-test, launch/stop the backend, watch trim savings) inside the plugin detail page.",
+  "version": "0.4.4",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a cross-platform status panel (scan gguf in OS-standard locations, adopt with VRAM-aware resource pre-check, smoke-test, launch/stop the backend, delete a provider entry, watch trim savings) inside the plugin detail page.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

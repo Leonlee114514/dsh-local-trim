@@ -4,6 +4,45 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.4.4] - 2026-11-04
+
+删除键改了对象。0.4.3 把它做成了「删磁盘上的 gguf」，这是理解错了 —— 需要的从来不是删
+15.8GB 的权重文件，而是清掉 `llm-pi-ai` 里那几条僵尸 provider：指向一个从没起来过的端口、
+同一个端口注册了两遍、或者模型文件早就没了还留着的那几条。删 gguf 是危险且不可撤销的，
+删配置随时可以重新导入 —— 两个操作的风险差了一个量级，放在同一个按钮上是设计错误。
+
+### 变更
+
+- **删除键搬到 provider 表上**，`deleteLocalModel` 整个删掉（`lib/launcher.js` 里不再有
+  `unlink` 的调用，`fsUnlinkSync` 的 import 也去掉了）。本机模型列表回到纯展示 + 选中，
+  不再有删除入口 —— 权重文件是磁盘上的既有文件，插件不动它。
+- **新增 `unregisterProvider({ settings, provider, ns })`**（`lib/provision.js`）。三条硬约束：
+  1. 只能用 `settings.mutate(ns, [{ op: 'unset', path: ['providers', id] }], revision)`。
+     `update` 走 `mergeLayers`，往 `providers[id]` 写 `null` 只会留下一个 null 的 provider 键，
+     `llm-pi-ai` 的 loader 见到会当成配置错误而不是「没有这一条」。只有 `mutate` 的 `unset`
+     内部是 `Reflect.deleteProperty`。
+  2. **删完必须回读**。`unset` 对「来自下层（profile 的 `cordis.patch.yml` 或 home patch）的
+     键」不是删除而是**恢复** —— 把下层的值原样 set 回来。表现出来就是「调用成功了但配置还在」。
+     所以回读一次，键还在就回 `{ removed: false, inherited: true }` 并把原因指到那个文件，
+     绝不谎报成功。
+  3. 老版本 DSH 的 `settings` 没有 `mutate()` 时明说做不到，而不是假装删掉了。
+- `deletePanel` 重写：入参从 `{ path }` 变成 `{ provider }`，删前先记下这条长什么样
+  （`summarizeProvider`），删成功才清 `onlineCache` / `baseUrlCache` 并 `planAll()`
+  （provider 表变了，工具面得重算），返回里带 `already` 标记与「磁盘上的 gguf 没动」。
+- 面板：删除按钮挪到 provider 行，点两次确认（第一次变「确认删除？」），删中显示
+  「删除中…」，点别的行撤回。`title` 上写明白「不删磁盘上的 gguf」，免得有人以为点了会丢模型。
+- 测试：`test/launcher.mjs` 45 项（删掉三段 `deleteLocalModel` 用例）、`test/provision.mjs`
+  新增 6b 段 8 条、`test/panel-host.mjs` 第 20 组重写成 13 条（含「没走 update 写 null」
+  「`unset` 的 path 恰好是 `[providers, <id>]`」「别的 provider 一个没动」）。合计 **763 条断言**。
+
+### 为什么记这一版
+
+因为我先把「删除」的对象搞错了，而且错得很自然 —— 面板上列着 gguf，删除键就顺手接到了 gguf
+上。真正该问的是「用户看着这一行，想让它消失的是什么」：是那条把 8090 指向一个不存在的
+服务的配置，不是那个 15.8GB 的文件。顺带发现 `settings` 的两个隐式约定（删键只能 mutate、
+继承来的键删不掉会静默恢复），这两条不写下来，下次还会用 `update` 写 `null` 然后困惑为什么
+provider 表里多了一条 `null`。
+
 ## [0.4.3] - 2026-11-04
 
 本机模型列表加删除键。上一版能扫出一堆 gguf、能一键配置，但删不掉 —— 想清磁盘只能

@@ -18,6 +18,7 @@ import {
   probeEndpoint,
   probeFirstAvailable,
   registerProvider,
+  unregisterProvider,
 } from '../lib/provision.js'
 // 测试会调 apply()，把日志写到临时文件，别污染 ~/.dsh/local-llm/local-trim.log。
 import { tmpdir } from 'node:os'
@@ -146,6 +147,63 @@ check('已存在时不覆盖', r2.registered === false && writes.length === 0, r
 
 const noSettings = await registerProvider({ settings: undefined, provider: 'x', profile })
 check('settings 缺失时返回原因而不是抛', noSettings.registered === false && typeof noSettings.reason === 'string')
+
+console.log('\n=== 6b. 删 provider 配置 ===')
+
+/** 可删的假 settings：mutate 的 unset 真的把键去掉，describe 回读也跟着变。 */
+const makeMutable = (seed) => {
+  let value = { providers: { ...seed } }
+  return {
+    _meta: { get value() { return value } },
+    describe: () => [{ ns: 'llm-pi-ai', revision: 3, value }],
+    update: async (ns, patch) => {
+      value = { ...value, ...patch, providers: { ...value.providers, ...(patch?.providers ?? {}) } }
+    },
+    mutate: async (ns, ops) => {
+      for (const op of ops) {
+        if (op.op !== 'unset') continue
+        // 模拟 dsh-settings 的语义：只在「用户层自己定义过」时才真删。
+        const [head, id] = op.path
+        if (head === 'providers' && value.providers?.[id] !== undefined) {
+          const next = { ...value.providers }
+          delete next[id]
+          value = { ...value, providers: next }
+        }
+      }
+    },
+  }
+}
+
+const delOk = makeMutable({ 'local-qwen': { baseURL: 'http://127.0.0.1:8090/v1' }, 'local-ollama': { baseURL: 'http://127.0.0.1:11434/v1' } })
+const d1 = await unregisterProvider({ settings: delOk, provider: 'local-qwen' })
+check('删掉指定的那一条', d1.removed === true && delOk._meta.value.providers['local-qwen'] === undefined)
+check('别的 provider 不动', delOk._meta.value.providers['local-ollama'] !== undefined)
+
+const d2 = await unregisterProvider({ settings: delOk, provider: 'local-qwen' })
+check('删两次是幂等的', d2.removed === true && d2.already === true)
+
+// 继承自下层 patch 的那种：mutate 把下层的值 set 回来，键还在。
+const delInherited = {
+  describe: () => [{ ns: 'llm-pi-ai', revision: 4, value: { providers: { 'local-patched': { baseURL: 'http://127.0.0.1:8091/v1' } } } }],
+  mutate: async () => {},
+}
+const d3 = await unregisterProvider({ settings: delInherited, provider: 'local-patched' })
+check('inherited 时如实说删不掉', d3.removed === false && d3.inherited === true)
+check('inherited 的原因提到下层 patch', /cordis\.patch\.yml|home patch/.test(String(d3.reason)), d3.reason)
+
+// 老版本 settings 没有 mutate：不能假装成功。
+const delNoMutate = {
+  describe: () => [{ ns: 'llm-pi-ai', revision: 5, value: { providers: { x: {} } } }],
+  update: async () => {},
+}
+const d4 = await unregisterProvider({ settings: delNoMutate, provider: 'x' })
+check('没有 mutate 就明说', d4.removed === false && /mutate/.test(String(d4.reason)))
+
+const d5 = await unregisterProvider({ settings: delOk, provider: '' })
+check('空 id 直接拒', d5.removed === false && typeof d5.reason === 'string')
+
+const d6 = await unregisterProvider({ settings: undefined, provider: 'x' })
+check('settings 缺失也不抛', d6.removed === false && typeof d6.reason === 'string')
 
 console.log('\n=== 7. apply 集成：已有可用 provider 时不写入 ===')
 const handlers = new Map()

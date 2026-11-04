@@ -83,6 +83,7 @@ const settingsState = {
   },
 }
 let updates = []
+const mutations = []
 
 const settingsStub = {
   describe: () => Object.entries(settingsState).map(([ns, row]) => ({ ns, ...row })),
@@ -90,6 +91,23 @@ const settingsStub = {
     updates.push({ ns, patch, revision })
     const row = settingsState[ns] ?? { revision: 0, value: {} }
     settingsState[ns] = { revision: row.revision + 1, value: { ...row.value, ...patch } }
+  },
+  // 真删键只能走 mutate 的 unset —— update 走 mergeLayers，写 null 只会留下一个 null。
+  // 这里照 dsh-settings 的语义实现：只在「用户层自己定义过」时真删，否则键留着。
+  mutate: async (ns, ops, revision) => {
+    mutations.push({ ns, ops, revision })
+    const row = settingsState[ns] ?? { revision: 0, value: {} }
+    let providers = { ...(row.value?.providers ?? {}) }
+    for (const op of ops) {
+      if (op.op !== 'unset') continue
+      const [head, id] = op.path ?? []
+      if (head === 'providers' && providers[id] !== undefined) {
+        const next = { ...providers }
+        delete next[id]
+        providers = next
+      }
+    }
+    settingsState[ns] = { revision: row.revision + 1, value: { ...row.value, providers } }
   },
 }
 
@@ -419,32 +437,44 @@ console.log('\n=== 19. models：扫描结果带每个模型的预检结论 ===')
   check('带回扫过的条目数', Number.isFinite(body.scannedEntries), String(body.scannedEntries))
 }
 
-console.log('\n=== 20. delete：只删扫描目录里的 .gguf ===')
+console.log('\n=== 20. delete：删的是 provider 配置，不是磁盘上的 gguf ===')
 {
-  // 越界（不在扫描目录里）→ 拒，并回列扫描过的目录
-  const outside = await callRoute('delete', { path: '/etc/passwd.gguf' })
-  check('200（业务失败不抛）', outside.status === 200, String(outside.status))
-  check('ok=false', outside.body.ok === false)
-  check('说明不在扫描目录里', /不在模型的扫描目录/.test(outside.body.error ?? ''), outside.body.error ?? '')
-  check('把扫描过的目录带回来', Array.isArray(outside.body.dirs) && outside.body.dirs.length > 0, String(outside.body.dirs?.length))
+  // 删前记下来，好确认「磁盘上的东西一个没少」—— 这里直接比 settings 之外的副作用：
+  // delete 路由不该碰文件系统，所以只要它没调 unlink 就够了（launcher 侧已无该实现）。
+  const before = Object.keys(settingsState['llm-pi-ai'].value.providers)
 
-  // 非 gguf → 拒
-  const notGguf = await callRoute('delete', { path: '/models/a.bin' })
-  check('非 .gguf 一律拒', notGguf.body.ok === false && /只肯删 .gguf/.test(notGguf.body.error ?? ''), notGguf.body.error ?? '')
-
-  // 不说路径 → 直说
+  // 越权/不存在 → 直说
   const missing = await callRoute('delete', {})
-  check('不说路径就直说', missing.body.ok === false && /删哪个文件/.test(missing.body.error ?? ''), missing.body.error ?? '')
+  check('200（业务失败不抛）', missing.status === 200, String(missing.status))
+  check('不说删哪个就直说', missing.body.ok === false && /删哪个 provider/.test(missing.body.error ?? ''), missing.body.error ?? '')
 
-  // 真删会破坏本机环境（这台机器上真有 15.8GB 的 gguf），所以走一条等价路径：
-  // 传一个「落在扫描目录里、但不存在」的路径 —— 范围校验必须放行，存在性校验必须拦住。
-  // 成功删除由 test/launcher.mjs 的 deleteLocalModel 单测用假 unlink 覆盖。
-  const listed = await callRoute('models', {})
-  const dirs = listed.body.dirs ?? []
-  const inside = String(dirs[0] ?? '') + '/__dsh_local_trim_probe__.gguf'
-  const gone = await callRoute('delete', { path: inside })
-  check('扫描目录内的路径能过范围校验', /已经不在了/.test(gone.body.error ?? ''), gone.body.error ?? '')
-  check('不谎报成功', gone.body.ok === false)
+  const ghost = await callRoute('delete', { provider: '__nope__' })
+  check('本来就不在也回 ok（幂等）', ghost.body.ok === true, JSON.stringify(ghost.body))
+  check('并说明本来就不在', ghost.body.already === true, String(ghost.body.already))
+
+  // 前面的组已经把 provider 表改过几轮（import 会往里写），所以这里自己塞一条干净的靶子，
+  // 不依赖前面留下的状态 —— 否则这个用例会随别的组顺序变化而红。
+  const doomed = 'local-zombie-8091'
+  settingsState['llm-pi-ai'].value.providers[doomed] = {
+    displayName: '僵尸本地 provider',
+    baseURL: 'http://127.0.0.1:8091/v1',
+    models: [{ id: 'never-loaded' }],
+  }
+  check('删除前它还在', settingsState['llm-pi-ai'].value.providers[doomed] !== undefined)
+  const gone = await callRoute('delete', { provider: doomed })
+  check('删除成功', gone.body.ok === true, JSON.stringify(gone.body))
+  check('回来的是被删的那条', gone.body.provider === doomed, String(gone.body.provider))
+  check('配置里真的没了', settingsState['llm-pi-ai'].value.providers[doomed] === undefined)
+  check('别的 provider 一个没动', Object.keys(settingsState['llm-pi-ai'].value.providers).every((id) => before.includes(id)))
+  check('文案说清磁盘文件没动', /磁盘上的 gguf 没动/.test(gone.body.message ?? ''), gone.body.message ?? '')
+
+  // 走的是 mutate 的 unset，不是 update。update 走 mergeLayers，写个 null 只会留下一个
+  // null 的 provider 键 —— loader 见到会当成配置错误，所以这条路必须没被走过。
+  check('删除没走 update 写 null', updates.every((u) => u.patch?.providers?.[doomed] !== null), String(updates.length))
+  check('确实调了 mutate', mutations.length > 0, String(mutations.length))
+  check('unset 的 path 是 providers.<id>'
+    , JSON.stringify(mutations.at(-1)?.ops ?? []) === JSON.stringify([{ op: 'unset', path: ['providers', doomed] }]),
+    JSON.stringify(mutations.at(-1)?.ops ?? []))
 }
 console.log(`\n${fail === 0 ? '=== 面板宿主侧集成全部通过 ===' : `=== ${fail} 项失败 ===`}`)
 process.exit(fail === 0 ? 0 : 1)

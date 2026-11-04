@@ -408,7 +408,24 @@ provider 后面有 **试跑** 按钮，发一条「只回一个字：好」的�
 拉起的进程，还会多一个 **停止** 按钮（`SIGTERM` → 赖着不走再 `SIGKILL`）。
 别人的 `ollama serve` 不会被这里点掉 —— 服务端只肯停自己 `spawn` 过、且登记在内存表里的 pid。
 
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.3 加删除键）—— 上一块要求你先有端点，可刚下完模型的
+每个 provider 后面还有一个 **删除**（v0.4.4 起）——**删的是这条 provider 配置，不是磁盘上的
+gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口、或者同一个端口注册了两遍、或者你
+早就删了模型文件的那几条。
+
+- 第一次点只进入「确认删除？」态，再点才真删；点别的行会撤回确认。
+- 走 `settings.mutate(ns, [{ op: 'unset', path: ['providers', id] }], revision)` ——
+  **不是** `update`。`update` 走的是 `mergeLayers`，往 `providers[id]` 里写 `null` 只会留下
+  一个 `null` 的 provider 键，`llm-pi-ai` 的 loader 见到会当成配置错误而不是「没有这一条」。
+  只有 `mutate` 的 `unset` 内部是 `Reflect.deleteProperty`，才是真删。
+- **继承来的删不掉**：如果这条 provider 来自下层（profile 的 `cordis.patch.yml` 或 home
+  patch），`mutate` 的 `unset` 会把下层的值原样 set 回来 —— 表现出来就是「调用成功了但配置
+  还在」。所以删完会**回读一次**确认，还在就直说「这条来自下层配置，得改那个文件」，不谎报
+  成功。
+- 老版本 DSH 的 `settings` 服务没有 `mutate()` 时也会明说，而不是假装删掉了。
+- 删成功会清掉在线缓存与 baseURL 缓存，然后重新拉一次状态；**磁盘上的模型文件一个字节都不
+  动**，随时可以重新导入。
+
+**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据）—— 上一块要求你先有端点，可刚下完模型的
 时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个 gguf → 一键配置并试跑**。
 
 点「扫描本机模型」后插件按 `modelRoots()` 的顺序找 `.gguf`（每层最多下探两级，跳过
@@ -426,22 +443,12 @@ $DSH_LOCAL_MODELS_DIR                ← 你自己指定的目录，排最前
 ~/Downloads                          ← 只扫一层
 ```
 
-**删除也只在这张表划定的范围内**——模型放在别的盘上（比如 `D:\gguf`），要先用
-`DSH_LOCAL_MODELS_DIR` 或配置项 `modelDirs` 把它加进来，否则扫描看不到、也删不了。
+扫出来的不是一个下拉框，而是一张表：每个 gguf 一行，点名字选中。加号后面是它的体积，
+超过可用预算的会标红「偏大」。**这里没有删除键** —— 权重文件是磁盘上的既有文件，插件不
+替你删（想清盘自己删，或用 `DSH_LOCAL_MODELS_DIR` 把它移出扫描范围）。
 
-扫出来的不是一个下拉框，而是一张表：每个 gguf 一行，点名字选中，右侧有 **删除**。
+> 视觉投影 `mmproj` 也列出来，但点它不会选中、也不能当主模型起服务。
 
-- **第一次点删除只是问一句**（按钮变成「确认删除？」，再点才真删）—— 删文件不进回收站，
-  没有撤销。
-- 删除范围卡死：只删 `.gguf`（含 `.mmproj.gguf`），**只删扫描目录里的**。传一个 `../`
-  或者系统路径过来会被拒，目录本身永远不会被递归删除（用的是 `unlink` 不是 `rm -rf`）。
-- 已经不在了的文件如实回「文件已经不在了」，不当成功；权限/占用/只读盘失败时把系统错误
-  原样带回面板（`EBUSY: resource busy or locked` 这种），不吞成一句「失败」。
-- 删成功会清掉在线缓存并**重扫一遍**，让列表反映磁盘真实状态，而不是本地先抹掉一行。
-- **不会动你的 provider 配置**。如果还有 provider 指着这个文件对应的模型 id，面板会顺便说
-  「还有 N 个 provider 指着它（配置没动）」—— 删配置是用户的事，插件不替他决定。
-
-> 视觉投影 `mmproj` 也列出来（否则删不掉），但点它不会选中、也不能当主模型起服务，只是可删。
 选中一个模型后填端口（默认 8090）和上下文（默认 65536），点**一键配置并试跑**，
 一条链走完三件事：
 
@@ -879,9 +886,13 @@ v0.3.9 起还覆盖 `scanLocalModels`（跳过 mmproj、按大小降序、目录
 （SIGTERM → SIGKILL → 报失败，幂等）、`isProcessAlive`（EPERM 算活着），
 以及扫描的三道上限（`maxModels` / `maxEntries` / Downloads 只扫一层）与 `truncated` 标记。
 
-v0.4.3 补上 `deleteLocalModel`：只认扫描目录内的 `.gguf`（反斜杠路径也会先归一化）、
-越界与兄弟目录（`/models-other` 不能被 `/models` 认下来）一律拒、`unlink` 抛错时把
-`EBUSY` 这类系统错误原样返回。删除的**成功路径**只用假 `unlink` 验，CI 上不会真删文件。
+v0.4.4 补上 `unregisterProvider`（`lib/provision.js`）：删 provider 配置只能用 `mutate` 的
+`unset`，所以用例分成三条 —— ① 真删（假 mutate 里 `Reflect.deleteProperty` 那套语义）、
+② 幂等（删第二次回 `already: true`）、③ **继承来的删不掉**（假 `mutate` 什么都不做，回读
+发现键还在 → 必须回 `removed: false, inherited: true`，并把原因指到下层 patch）。
+还有「没有 `mutate()` 的老版本 DSH 要明说」「空 id 直接拒」「settings 缺失不抛」三条。
+宿主侧（`test/panel-host.mjs` 第 20 组）额外断言**没走 `update` 写 null**、`unset` 的
+`path` 恰好是 `['providers', <id>]`、以及别的 provider 一个没动。
 
 `adopt` 的 `sizeBytes` / `gpuBytes` / `totalMemBytes` 可以从入参覆盖（非正数或省略就回落真实探测）。
 CI 的 runner 上没有 `nvidia-smi`、内存也只有 15.6GB，不覆盖的话「能跑的机器不该被判 risky」
