@@ -24,6 +24,7 @@ import {
   waitForEndpoint,
   whichOnPath,
   workbuddyRoot,
+  exeName,
   llamaCppAutoArgs,
   scanLocalModels,
 } from '../lib/launcher.js'
@@ -74,6 +75,15 @@ await ok('命令行切分认双引号', async () => {
   assert.deepEqual(splitCommand('  ollama   serve  '), ['ollama', 'serve'])
   assert.deepEqual(splitCommand('"C:\\Program Files\\x\\a.exe" serve'), ['C:\\Program Files\\x\\a.exe', 'serve'])
   assert.deepEqual(splitCommand(''), [])
+  // Windows 下反斜杠是路径分隔符，不能当转义符；双引号仍然是引号
+  if (process.platform === 'win32') {
+    assert.deepEqual(splitCommand('C:\\AI\\ollama.exe serve'), ['C:\\AI\\ollama.exe', 'serve'])
+    assert.deepEqual(splitCommand('"C:\\my tools\\a.exe" -m x'), ['C:\\my tools\\a.exe', '-m', 'x'])
+  } else {
+    // POSIX 上单引号与反斜杠转义都常见，不认的话带空格的路会被切碎
+    assert.deepEqual(splitCommand("'/opt/my tools/llama-server' -m x"), ['/opt/my tools/llama-server', '-m', 'x'])
+    assert.deepEqual(splitCommand('/opt/my\\ tools/llama-server -m x'), ['/opt/my tools/llama-server', '-m', 'x'])
+  }
 })
 
 await ok('whichOnPath 按扩展名补全', async () => {
@@ -241,7 +251,7 @@ await ok('waitForEndpoint 超时带上最后一次错误', async () => {
 
 await ok('认得出 WorkBuddy 里那套 llama.cpp + gguf', async () => {
   const root = workbuddyRoot()
-  const bin = root + '/bin/b11012/llama-server.exe'
+  const bin = root + '/bin/b11012/' + exeName('llama-server')
   const auto = llamaCppAutoArgs({
     listDir: (dir) => {
       if (dir === root + '/bin') return ['b11012']
@@ -262,7 +272,7 @@ await ok('认得出 WorkBuddy 里那套 llama.cpp + gguf', async () => {
 
 await ok('发现组件齐全时直接拼出可跑的命令，不要用户手抄', async () => {
   const root = workbuddyRoot()
-  const bin = root + '/bin/b11012/llama-server.exe'
+  const bin = root + '/bin/b11012/' + exeName('llama-server')
   const plan = planLaunch({
     port: 8090,
     alias: 'qwen35moe-local',
@@ -281,7 +291,7 @@ await ok('发现组件齐全时直接拼出可跑的命令，不要用户手抄'
 
 await ok('确实没有模型文件时才回「不替你猜」', async () => {
   const root = workbuddyRoot()
-  const bin = root + '/bin/b11012/llama-server.exe'
+  const bin = root + '/bin/b11012/' + exeName('llama-server')
   const plan = planLaunch({
     port: 8090,
     listDir: (dir) => (dir === root + '/bin' ? ['b11012'] : []),
@@ -334,7 +344,7 @@ await ok('自选端口 + 指定 gguf：端口按用户填的走，报回来的�
   // 这条用例要验的是端口与别名的传递，不是这台机器装没装。
   const plan = planLaunch({
     port: 8095,
-    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    modelPath: 'C:/models/local_model.gguf',
     ctx: 65536,
     existsSync: (target) => /llama-server\.exe$/.test(target) || /^[A-Za-z]:\//.test(target),
     listDir: (dir) => (/\/bin$/.test(dir) ? ['b11012'] : []),

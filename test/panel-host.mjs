@@ -327,7 +327,7 @@ console.log('\n=== 16. adopt：mmap 装得下的 15.8GB 模型不再被误判 ri
   // v0.4.1 纠正：gguf 走 mmap 落在可回收的 page cache，显存外的部分才是宿主接的量。
   // 体积显式传入，不依赖这台机器上真的有没有那个文件 —— 判定逻辑要跨平台可复现。
   const { status, body } = await callRoute('adopt', {
-    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    modelPath: 'C:/models/local_model.gguf',
     port: 8090,
     sizeBytes: 16954484384,
     // CI 的 runner 上没有 nvidia-smi、内存也只有 15.6GB，显存和内存也显式给，
@@ -345,7 +345,7 @@ console.log('\n=== 16. adopt：mmap 装得下的 15.8GB 模型不再被误判 ri
 console.log('\n=== 16a. adopt：文件不存在时退化 unknown，不抛异常 ===')
 {
   const { status, body } = await callRoute('adopt', {
-    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/not-there.gguf',
+    modelPath: 'C:/models/not-there.gguf',
     port: 8090,
   })
   check('200（业务失败不抛）', status === 200, String(status))
@@ -357,7 +357,7 @@ console.log('\n=== 16b. adopt：真装不下时才拦，要求确认，且不改
 {
   // 塞一个 40GB 的体积（这台机器 16.37GB 内存 + 14.5GB 显存也接不住）
   const { status, body } = await callRoute('adopt', {
-    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    modelPath: 'C:/models/local_model.gguf',
     port: 8090,
     sizeBytes: 40 * 1024 * 1024 * 1024,
   })
@@ -376,7 +376,7 @@ console.log('\n=== 17. adopt：确认后继续，端口已经在跑就跳过拉�
   // 8090 在假 fetch 白名单里 → launchPanel 走「本来就在应答」早退，
   // 于是这条用例覆盖的是 adopt 的后半段：探到真实模型 id → 写 provider → 试跑。
   const { status, body } = await callRoute('adopt', {
-    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    modelPath: 'C:/models/local_model.gguf',
     port: 8090,
     contextWindow: 65536,
     overwrite: true,

@@ -4,6 +4,120 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.4.2] - 2026-11-04
+
+这一版把「只在本机跑得通」的地基换掉。v0.4.1 及以前的代码里到处是
+`C:/Users/<USER>/...`、`llama-server.exe`、`nvidia-smi` 这种本机专属假设 ——
+在别人的 Linux / macOS 机器上会表现为「扫不到模型 / 找不到二进制 / 一拉起就报参数错」。
+不是因为逻辑错，而是因为规则根本不该写死。
+
+### 修复
+
+- **路径全靠 `process.env.USERPROFILE ?? 'C:/Users/' + USERNAME` 拼**。
+  Linux/macOS 上这两个变量都不存在，会拼出 `C:/Users/.workbuddy/local-models`
+  这种谁都不认识的路。新增 `homeDir()`（优先 `os.homedir()`）、`dataDir()`
+  （Windows `LOCALAPPDATA` / macOS `~/Library/Application Support` / 其它 `XDG_DATA_HOME`）、
+  `joinPath()`、`toSlash()`、`exeName()`，全部按 `process.platform` 推导。
+
+- **`joinPath` 第一版把绝对路径的开头斜杠吃掉了**：`joinPath('/home/u','models')`
+  得到 `home/u/models`，从绝对路径变成相对路径，落到 cwd 下。改成保留首段前导斜杠。
+
+- **`KNOWN_LAUNCHERS` 的候选全是 Windows 路径**（`C:/Users/<U>/AI/ollama/ollama.exe`、
+  `%LOCALAPPDATA%/LM-Studio/lms.exe`…），换机器只能靠 PATH 上的裸名字兜底。现在按平台给出
+  官方安装位置，并且四个后端各认一个覆盖环境变量：`OLLAMA_BIN` / `LLAMA_SERVER_BIN` /
+  `VLLM_BIN` / `LMSTUDIO_BIN`（指定后直接排最前）。
+
+- **模型目录把 WorkBuddy 的布局当唯一来源**。新增 `modelRoots()`：`DSH_LOCAL_MODELS_DIR`
+  优先，然后 `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`、`~/.lmstudio/models`、
+  `<dataDir>/LM-Studio/models`，`~/.workbuddy/local-models` 降级成候选之一。
+  `localModelDirs()` 全部改走它；新增配置项 `modelDirs`（数组，支持 `~`）让人补自己的目录。
+
+- **`llamaCppAutoArgs` 只在 WorkBuddy 的 `files/` 下找 gguf**，别的机器上就算装了
+  llama.cpp 也报「没有模型」。改成按 `modelRoots()` 顺序找第一个含 `.gguf`（排除 `.mmproj.`）的目录。
+
+- **`planLaunch` 只认 `input.existsSync` 这一个注入名**，调用方传 `exists` 会被静默忽略
+  （测试里就踩了：明明注入了假文件系统，还是报「没找到 llama-server」）。现在两个名都认，
+  `scanLocalModels` 同理。
+
+- **`detectGpuBytes` 只认 NVIDIA**。换 AMD 卡或 Apple Silicon 就永远拿 0，预检退化成
+  「模型全额压内存」→ 好机器也被判 `warn`/`risky`。新增 `detectGpuInfo()`：
+  NVIDIA `nvidia-smi` → AMD `rocm-smi --showmeminfo vram`（认字节数和 `GiB` 两种写法，
+  带单位的那条必须先匹配，否则 `24.0 GiB` 会被纯数字规则读成 24 字节）→
+  Apple Silicon `sysctl -n hw.memsize` 取四分之一并标 `unified: true` → 都没有返回 0。
+
+- **参数能力按「本机实测」写死**。`--load-mode` / `--fit` 是新版 llama.cpp 才有的，
+  老版本没有；反过来 `--no-mmap` 在新版本里已经非法。现在拼命令行前先跑
+  `llama-server --help`，把出现的 `--flag` 全抠出来（`parseHelpFlags` / `probeHelpCaps`，
+  按路径缓存），只拼它真认的那些；**探不出来就不裁剪**（宁可让引擎自己报错，也别因为
+  探测失败丢掉好参数）。被裁掉的参数会出现在 `planLaunch` 返回的 `dropped` 里。
+
+- **预检预留内存写死 2048 MiB**。改成配置项 `reserveMb`（0 = 不预留，Linux 服务器可调小）。
+
+- **LM Studio 被归进「必须带模型参数」那一档**。它其实自带 `lms server start --port N`，
+  模型是运行时按请求加载的，不需要启动参数。原来点拉起会直接回「需要模型文件才能起，
+  插件不替你猜」—— 对 LM Studio 是纯误报。`KNOWN_LAUNCHERS` 的 `args` 因此允许写成
+  `(port) => string[]`，交给 `resolveCommand` 之后求值（端口要传进去）。
+
+- **失败提示里的示例命令一套逻辑套所有后端**。原来回给用户的是
+  `-m 模型.gguf --host ... --port ...`，那是 llama.cpp 的写法；vLLM 认的是
+  `--model <目录或仓库 id>` 且不做 gguf，照抄必报错。改成每个后端带自己的
+  `exampleArgs` 与 `modelNoun`：vLLM 说「模型（目录或仓库 id）」，llama.cpp 说「模型文件」。
+
+- **`joinPath(process.env.LOCALAPPDATA, ...)` 在非 Windows 上会拼出 `undefined/...`**。
+  Ollama 与 LM Studio 的 Windows 候选都这么写过；虽然分支只在 WIN 下走，
+  但变量缺失（精简镜像、被清空的环境）时依然会拼出相对路径。统一改走 `dataDir()`。
+
+- **`--n-gpu-layers auto` 与 KV 量化被硬塞给老引擎**。`auto` 这个取值和 `--fit`
+  是同一代加进来的；没有 `--fit` 的 llama.cpp 只认 `--n-gpu-layers` 的数字，
+  KV 量化的类型表也窄（`q8_0` 未必在 allowed values 里）。能力探测只按 flag 名过滤，
+  拦不住「flag 在、取值不在」。现在按 `--fit` 的有无分两套组合：老引擎给 `99` 层、
+  不下发 `--cache-type-k/v`；新引擎保持 `auto` + `q8_0`。`llamaCppAutoArgs` 的返回值
+  多了 `modernEngine`，日志里能看出走的是哪一套。
+
+- **`parseHelpFlags` 只认长参数**。`-c` 是 `--ctx-size` 的短写，只抠 `--flag` 的话
+  `-c 65536` 会被判成「引擎不支持上下文长度」整条裁掉 —— 真机 b11012 上就这么丢过，
+  上下文悄悄退回引擎默认值。现在短参数（`-c` / `-m` / `-t`）也收，正则带捕获组
+  （不带括号时 `match[1]` 是 undefined，直接崩）。
+
+- **统一内存（Apple Silicon / 核显）被重复扣除显存**。`hostBytes = sizeBytes − gpuBytes`
+  对独显成立，对统一内存就错：显存和内存是同一个池子，减一遍等于凭空多出余量。
+  24GB 的 Mac 装 16GB 模型会被算成「只占 10GB」→ 判得比实际宽松。新增 `unified` 入参，
+  为真时按 `sizeBytes` 全额比内存，上限也只算 `totalMemBytes` 一次。
+
+- **`splitCommand` 不认 POSIX 的单引号与转义**。`'/opt/my tools/llama-server' -m x`
+  这类命令在 Linux/macOS 上会被切碎成三段。现在非 Windows 平台认单引号与 `\\` 转义；
+  Windows 保持原样（反斜杠是路径分隔符，不能当转义符）。
+
+- **`reserveBytes: 0` 被当成「没填」**。配置项 `reserveMb: 0` 本意是不预留，
+  但判据写的是 `> 0`，会被悄悄改回 2048 MiB。改成 `>= 0` 才算显式。
+
+### 新增
+
+- `test/portable.mjs`（35 项）：路径拼装、`modelRoots` / `DSH_LOCAL_MODELS_DIR`、
+  候选表不含 `undefined`、`detectGpuInfo` 的三个厂商分支、`--help` 能力探测与裁剪、
+  `reserveBytes` 可配、统一内存不重复扣显存、`LM Studio` 与 `ollama` 各自的固定参数。
+  全部用假 platform / 假 exec，不依赖跑测试的机器是哪台。
+- `test/platform-sim.mjs`：`Object.defineProperty(process, "platform", …)` 在 import 之前
+  覆盖平台，让 `launcher.js` 顶部的 `const WIN/MAC` 按目标平台求值，然后逐个断言候选表
+  ——别的平台不许吐出 `C:/` 或反斜杠、候选不能重复、最后一项必须是交给 PATH 的裸名。
+  三个平台各跑一遍（`npm run test:portable`）。这是「不在 Windows 上也能验证非 Windows 分支」
+  的唯一办法：`os.homedir()` 骗不到，所以家目录只断言格式不断言前缀。
+- CI 增加 `Cross-platform paths, GPU detection, --help capability probing` 与
+  `Platform simulation (linux / darwin / win32 candidate tables)` 两步；
+  另起一个 `cross-platform` job 在 **真的** `windows-latest` 与 `macos-latest` 上跑
+  （Node 22，不参与 3×3 矩阵）：平台推演再像，也不等于真机 —— `homeDir()`、PATH 分隔符、
+  可执行文件后缀这些只有真跑才知道。
+- README 新增「跨平台」整节：支持矩阵、两个模型目录入口、四个二进制变量、
+  `--help` 探测语义、三条显存探测路径、`reserveMb`。
+- `.gitattributes`（`* text=auto eol=lf`）：此前仓库里 CRLF / LF 混合，每次 commit 都是整文件 diff。
+
+### 为什么记这一版
+
+「在本机能跑」和「在哪都能跑」之间隔着一整层平台假设。这一版之前，插件对下面这些东西
+全都是默认的：家目录在哪、数据目录在哪、后端装在哪、模型放在哪、显存怎么问、参数支持哪些。
+任何一个假设不成立，表现都是同一句话：「找不到 / 起不来」，而用户看不出是哪一环。
+现在每一环都有明确的推导规则和覆盖开关，报错也能指到具体哪一环。
+
 ## [0.4.1] - 2026-11-04
 
 v0.4.0 的资源预检建立在一个错误前提上，这一版把它连根改掉。

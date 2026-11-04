@@ -183,12 +183,16 @@ window.__ModuleLoader__.load({
       ['toolDescLimit', '工具描述上限'],
       ['toolParamDescLimit', '参数描述上限'],
       ['launchTimeout', '拉起后等端口（秒）'],
+      // 预检给系统留多少：桌面默认 2048 合理，Linux 服务器该能调小，这里得让用户改得到。
+      ['reserveMb', '预检预留内存（MiB，0 = 不预留）'],
     ]
     const LIST_ROWS = [
       ['routes', '生效路由', '留空 = 自动识别本地端点；写名字（每行一个）就只认这些 provider。'],
       ['keep', '保留的工具', '每行一个全局工具名。scoped 注册的工具（如 ops_glob）不受这里影响。'],
       ['dropSections', '丢弃的提示词段', '每行一个 section 名，名字对不上会被静默忽略。'],
       ['dropContexts', '丢弃的 context', '每行一个 context 名。'],
+      // 内建的模型目录覆盖各平台常规位置；这里只补「我把 gguf 放在别处」。
+      ['modelDirs', '额外模型目录', '每行一个目录，支持 ~。内建目录（~/models、~/llama.cpp/models…）已经包含，不用重复。'],
     ]
 
     function toLines(value) {
@@ -1016,7 +1020,12 @@ window.__ModuleLoader__.load({
                   : `已拉起 ${launchResult.label}（pid ${launchResult.pid}），${launchResult.ms}ms 后端口 ${launchResult.port} 应答` +
                     (Array.isArray(launchResult.models) && launchResult.models.length > 0
                       ? '：' + launchResult.models.join(', ')
-                      : '')
+                      : '') +
+                    // 参数被裁或走了老引擎那套，要在这里说清楚 —— 否则用户以为插件漏拼了
+                    (Array.isArray(launchResult.dropped) && launchResult.dropped.length > 0
+                      ? '（你的 llama.cpp 不认 ' + launchResult.dropped.join(' / ') + '，已跳过）'
+                      : '') +
+                    (launchResult.modernEngine === false ? '（老版本引擎：分层数用 99，不下发 KV 量化）' : '')
                 : `拉起失败：${launchResult.error}` +
                   (Array.isArray(launchResult.tried) && launchResult.tried.length > 0
                     ? '（找过：' + launchResult.tried.join(' / ') + '）'
@@ -1084,7 +1093,7 @@ window.__ModuleLoader__.load({
               'div',
               { style: S.hint },
               '留空 = 按端口自动找（11434 Ollama / 8090 llama.cpp / 8000 vLLM / 1234 LM Studio）。' +
-                '填了就原样执行，例：C:\\Users\\you\\AI\\ollama\\ollama.exe serve',
+                '填了就原样执行，例：ollama serve / /opt/homebrew/bin/llama-server -m a.gguf',
             ),
             h('input', {
               style: { ...S.input, width: '100%' },

@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.4.1",
-  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a status-aware control panel (scan local gguf, adopt with resource pre-check, smoke-test, launch/stop the backend, watch trim savings) inside the plugin detail page.",
+  "version": "0.4.2",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a cross-platform status panel (scan gguf in OS-standard locations, adopt with VRAM-aware resource pre-check, smoke-test, launch/stop the backend, watch trim savings) inside the plugin detail page.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -54,11 +54,12 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "npm run test:unit && npm run test:host",
-    "test:unit": "node test/launcher.mjs && node test/panel.mjs && node test/selfcheck.mjs && node test/provision.mjs && node test/autodetect.mjs",
+    "test": "npm run test:unit && npm run test:portable && npm run test:host",
+    "test:unit": "node test/launcher.mjs && node test/portable.mjs && node test/panel.mjs && node test/selfcheck.mjs && node test/provision.mjs && node test/autodetect.mjs",
     "test:host": "node test/panel-host.mjs",
-    "check": "node --check lib/index.js && node --check lib/launcher.js && node --check lib/bridge.js && node --check lib/config.js && node --check lib/defaults.js && node --check lib/status.js && node --check lib/import-model.js && node --check client.js",
-    "verify": "npm run check && npm test"
+    "check": "node --check lib/index.js && node --check lib/launcher.js && node --check lib/bridge.js && node --check lib/config.js && node --check lib/defaults.js && node --check lib/status.js && node --check lib/import-model.js && node --check client.js && node --check test/platform-sim.mjs",
+    "verify": "npm run check && npm test",
+    "test:portable": "node test/platform-sim.mjs linux && node test/platform-sim.mjs darwin && node test/platform-sim.mjs win32"
   },
   "devDependencies": {
     "@deepseek-ai/schemastery": "^3.18.5"

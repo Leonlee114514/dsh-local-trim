@@ -55,6 +55,16 @@ jobs:
         run: node test/panel-host.mjs
       - name: One-click backend launch (plan + wait, no real spawn)
         run: node test/launcher.mjs
+      - name: Cross-platform paths, GPU detection, --help capability probing
+        run: node test/portable.mjs
+
+      # process.platform 会在 import 时求值，所以「假装自己是 Linux/macOS」是可行的：
+      # 三个平台各跑一遍，缺任何一个是漏测（本机是 Windows，最容易漏的就是另两个）。
+      - name: Platform simulation (linux / darwin / win32 candidate tables)
+        run: |
+          node test/platform-sim.mjs linux
+          node test/platform-sim.mjs darwin
+          node test/platform-sim.mjs win32
       - name: Manifest is loadable
         run: |
           node --input-type=module -e "
@@ -65,3 +75,41 @@ jobs:
             if (!patch.includes('dsh-local-trim')) { console.error('patch does not reference the plugin'); process.exit(1); }
             console.log('manifest ok:', pkg.version, pkg.dsh.bundle.patch);
           "
+
+  # v0.4.2 起插件声称跨平台。声明了就得在别的平台上真跑一遍 ——
+  # 只在一个 OS 上跑测试的「跨平台」等于没验：候选表、路径分隔符、PATH 语义都不同。
+  # 这里只跑 node 22（三代 Node 的差异已经由上面的 matrix 覆盖，没必要 3×3）。
+  cross-platform:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dev dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Syntax check
+        shell: bash
+        run: |
+          set -e
+          for f in lib/*.js client.js test/*.mjs; do
+            node --check "$f"
+          done
+      # 真机平台上的断言：这里 homeDir() 拿到的是真的家目录，
+      # 不再是「假装自己是 Linux」的推演结果。
+      - name: Cross-platform paths, GPU detection, --help capability probing
+        run: node test/portable.mjs
+      - name: Platform simulation (all three)
+        shell: bash
+        run: |
+          node test/platform-sim.mjs linux
+          node test/platform-sim.mjs darwin
+          node test/platform-sim.mjs win32
+      - name: One-click backend launch (plan + wait, no real spawn)
+        run: node test/launcher.mjs
+      - name: Control panel bridge routes
+        run: node test/panel-host.mjs

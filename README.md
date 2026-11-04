@@ -490,25 +490,34 @@ provider 后面有 **试跑** 按钮，发一条「只回一个字：好」的�
 | 端口 | 后端 | 怎么起 |
 | --- | --- | --- |
 | 11434 | Ollama | 找到 `ollama(.exe)` 后 `serve`，并带上 `OLLAMA_HOST=127.0.0.1:11434` |
-| 8090 | llama.cpp | 先找 `llama-server.exe`，再在 WorkBuddy 的模型目录里捡现成的 gguf，**参数自己拼** |
-| 8000 | vLLM | 需要模型参数，插件不猜 —— 在高级配置里填完整命令 |
-| 1234 | LM Studio | 同上（GUI 应用，通常自己开着） |
+| 8090 | llama.cpp | 先找 `llama-server`，再按 `modelRoots()` 的顺序捡现成的 gguf，**参数自己拼** |
+| 8000 | vLLM | 要 `--model`（HF 目录或仓库 id），插件不猜 —— 高级配置里填完整命令 |
+| 1234 | LM Studio | `lms server start --port 1234`（不需要先指定模型，模型是运行时按请求加载的） |
 
 llama.cpp 这一条是 v0.3.7 的重点：模型已经下好了就别让人再下一次 20GB。插件按这个顺序找
 
-1. `llama-server.exe`：`~/.workbuddy/local-models/bin/<build>/`（取最新 build）→ `LLAMA_SERVER_BIN`
-   → `~/AI/llama.cpp/` → PATH；
-2. gguf：`~/.workbuddy/local-models/files/*.gguf`，优先 `local_model.gguf`，跳过 `.mmproj.`（那是视觉投影）；
-3. 拼参数：`-m <gguf> --host 127.0.0.1 --port 8090 --alias <provider 的模型 id> --n-gpu-layers auto
-   --fit on --parallel 1 --jinja --cache-type-k q8_0 --cache-type-v q8_0 -c 65536 --n-predict 8192`。
+1. `llama-server`（Windows 补 `.exe`）：`LLAMA_SERVER_BIN` → `~/.workbuddy/local-models/bin/<build>/`
+   （WorkBuddy 的布局，取最新 build）→ `~/AI/llama.cpp/`（Windows）/ Homebrew 与 `/usr/local/bin`（macOS、Linux）
+   → PATH；
+2. gguf：按 `modelRoots()` 的顺序找（`DSH_LOCAL_MODELS_DIR` → `~/models` → `~/llama.cpp/models`
+   → `~/.cache/llama.cpp` → `~/.lmstudio/models` → `<dataDir>/LM-Studio/models` →
+   `~/.workbuddy/local-models/files` → `~/Downloads`），第一个含 `.gguf` 的目录胜出；
+   同一目录里优先 `local_model.gguf`，跳过 `.mmproj.`（那是视觉投影）；
+   要指定自己的目录用 `DSH_LOCAL_MODELS_DIR` 或配置项 `modelDirs`；
+3. 拼参数（**新版 llama.cpp**）：`-m <gguf> --host 127.0.0.1 --port 8090 --alias <provider 的模型 id>
+   --n-gpu-layers auto --fit on --parallel 1 --jinja --cache-type-k q8_0 --cache-type-v q8_0
+   -c 65536 --n-predict 8192`。老版本（没有 `--fit`）会自动换一套：`--n-gpu-layers 99`，
+   不下发 KV 量化，见「参数能力靠 `--help` 探测」一节。
 
 这套参数是按 32GB 统一内存实测出来的：权重 17GB 上卡，q8_0 KV 单 slot 才压得住 64K 上下文。
 **两个组件都找到才自动拼**；缺模型文件才回「需要模型文件才能起」，缺可执行文件才回「本机没找到」，
 错误里带着查过的路径。
 
 顺序是：**先探测**，端口本来就在应答就直接告诉你「没有重复拉起」；没应答才找可执行文件
-（`OLLAMA_BIN` 环境变量 → `~/AI/ollama/ollama.exe` → `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`
-→ `C:\Program Files\Ollama\ollama.exe` → PATH），拉起后按 `拉起后等端口（秒）` 轮询
+（`OLLAMA_BIN` 环境变量 → 平台默认安装位置：Windows `~/AI/ollama/ollama.exe`、
+`%LOCALAPPDATA%\Programs\Ollama\ollama.exe`、`C:\Program Files\Ollama\ollama.exe`；
+macOS `/Applications/Ollama.app/...`、Homebrew `/opt/homebrew/bin`；Linux `/usr/local/bin`、
+`/usr/bin`、`/snap/bin` → PATH），拉起后按 `拉起后等端口（秒）` 轮询
 `/v1/models`，成功后顺手把点灯缓存清掉。
 
 高级配置里的 **一键拉起命令** 留空就走上面的自动逻辑；填了（例如
@@ -652,6 +661,118 @@ done
 
 ---
 
+## 跨平台（v0.4.2 起）
+
+v0.4.1 及以前这个插件只在本机（Windows ARM64 + 一张 N 卡 + WorkBuddy 的 llama.cpp 布局）
+上验证过，代码里到处是 `C:/Users/<USER>/...` 这种硬编码。换台机器大概率表现为
+「扫不到模型 / 找不到二进制 / 一拉起就报参数错」。v0.4.2 把这些都换成了可推导的规则。
+
+### 支持矩阵
+
+CI 在 `ubuntu-latest`（Node 20/22/24）、`windows-latest`、`macos-latest` 上各跑一遍，
+所以这张表不是声明，是每次提交都在验的东西。
+
+| 能力 | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| 用户目录 / 数据目录 | `%USERPROFILE%` / `%LOCALAPPDATA%` | `~` / `~/Library/Application Support` | `~` / `$XDG_DATA_HOME` |
+| 找 ollama | 用户目录安装 + `Program Files` + PATH | `.app` 包内 + Homebrew + PATH | `/usr/local/bin`、`/usr/bin`、`/snap/bin` + PATH |
+| 找 llama-server | WorkBuddy build + 用户目录 + PATH（补 `.exe`） | Homebrew + `/usr/local/bin` + PATH | 同 macOS |
+| 找 vLLM / LM Studio | `LM-Studio/lms.exe`、`Program Files` + PATH | `.app` 包内 + PATH | `/usr/local/bin` + PATH |
+| 扫 gguf | `~/models`、`~/AI/models`、`~/Downloads`… | `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`… | 同 macOS，另加 LM Studio 数据目录 |
+| 显存探测 | `nvidia-smi`（在 system32，靠 PATH） | `nvidia-smi` / `rocm-smi` / `sysctl hw.memsize` | `nvidia-smi` / `rocm-smi` |
+| 拉起 / 停止进程 | 支持（`spawn` + signal 0 探测） | 支持 | 支持 |
+
+### 认自己的模型目录
+
+内建目录覆盖三平台的常规位置（完整清单用面板上的「扫描本机模型」看，接口返回的 `dirs`
+就是实际扫过的路径）。模型不在常规位置时，两条路：
+
+1. 环境变量（优先级最高，排在最前）：
+
+   ```bash
+   # bash / zsh
+   export DSH_LOCAL_MODELS_DIR=/mnt/weights/gguf
+   ```
+
+   ```powershell
+   # PowerShell（用户级，永久）
+   [Environment]::SetEnvironmentVariable('DSH_LOCAL_MODELS_DIR', 'D:\models', 'User')
+   ```
+
+2. 配置项 `modelDirs`（数组，支持 `~`），和上面那个环境变量同时存在时都会扫：
+
+   ```yaml
+   modelDirs:
+     - ~/gguf
+     - /data/weights
+   ```
+
+### 认自己的后端二进制
+
+四个后端各有一个覆盖变量，指定后直接排到候选表最前，不再猜：
+
+| 变量 | 作用 |
+| --- | --- |
+| `OLLAMA_BIN` | `ollama` 可执行文件的完整路径 |
+| `LLAMA_SERVER_BIN` | `llama-server` 的完整路径（自编译 / 非标准位置） |
+| `VLLM_BIN` | `vllm` 的完整路径（conda / venv 里的那个） |
+| `LMSTUDIO_BIN` | `lms` CLI 的完整路径 |
+
+### 参数能力靠 `--help` 探测，不靠版本号猜
+
+llama.cpp 的参数是逐版演进的：`--load-mode` 和 `--fit` 是近几版才有的，老版本没有；
+反过来 `--no-mmap` 在新版本里已经被 `--load-mode` 取代（传进去直接
+`error: invalid argument`）。所以插件在拼命令行之前会先跑一次
+`llama-server --help`，把输出里出现的 `--flag` 全抠出来，只拼它真认的那几个：
+
+- 探到了 → 只留白名单里的；被裁掉的参数名会出现在 `planLaunch` 返回的 `dropped` 数组里，
+  面板会告诉你「你的 llama.cpp 不认 `--fit`，已跳过」。
+  短参数（`-c` / `-m` / `-t`）也一并收 —— `-c` 是 `--ctx-size` 的短写，只认长参数的话
+  `-c 65536` 会被判成不支持而整条裁掉，上下文悄悄退回引擎默认值（本机就这么丢过一次）。
+- 探不出来（命令不存在、超时、输出为空）→ **不裁剪**，按旧行为全给。宁可让引擎自己报错，
+  也不要因为探测失败把好参数丢掉。
+- 结果按二进制路径缓存，同一个 `llama-server` 只跑一次 `--help`。
+
+**flag 在、取值不一定在。** `--n-gpu-layers auto` 的 `auto` 是和 `--fit` 同一代加的；
+老引擎只认数字。所以拼参数时按 `--fit` 有无分两套：
+
+| 能力 | 有 `--fit`（新引擎） | 无 `--fit`（老引擎） |
+| --- | --- | --- |
+| `--n-gpu-layers` | `auto` | `99` |
+| `--cache-type-k/v` | `q8_0` | 不下发（老版本类型表窄） |
+| `--fit on` | 下发 | 不下发 |
+
+`llamaCppAutoArgs` 的返回值里带 `modernEngine`，面板日志能看出走的是哪一套。
+
+### 显存探测的三条路
+
+`detectGpuInfo()` 依次尝试，谁先答上算谁：
+
+1. **NVIDIA** — `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`，
+   三个平台通用（Windows 上它在 `system32`，PATH 里有）。
+2. **AMD** — `rocm-smi --showmeminfo vram`，认 `VRAM Total Memory (B): 17163091968`
+   和 `VRAM Total Memory (B): 24.0 GiB` 两种写法。
+3. **Apple Silicon** — 没有独立 VRAM，统一内存。取 `sysctl -n hw.memsize` 的**四分之一**
+   作为「GPU 侧可用」的粗估，并标 `unified: true`（面板上会显示这是统一内存，不是真显存）。
+4. 都没有（Intel 核显 / 无独显 / 容器里）→ 返回 0，预检退化成「不算显存」，不报错。
+
+**统一内存要特殊处理。** Apple Silicon 的「显存」和内存是同一个池子，
+`hostBytes = 模型 − 显存` 会凭空多出余量（24GB 的 Mac 装 16GB 模型会被算成只占 10GB）。
+所以 `detectGpuInfo()` 对 Apple Silicon 返回 `unified: true`，预检见到它就按
+`sizeBytes` 全额比 `totalMemBytes`，上限也只算一次。AMD 核显走的是独立 VRAM 路径，
+不受这条影响。
+
+### 预留内存可配
+
+预检给系统留多少内存是 `reserveMb`（默认 2048 MiB）。桌面 Windows + 宿主 + 浏览器差不多
+要这么多；Linux 服务器可以调到 1024，内存紧张的机器调大，`0` 表示不预留（只跟 free 比）。
+
+```yaml
+reserveMb: 1024
+```
+
+---
+
 ## 已知边界
 
 - 只做本进程内的裁剪，不碰模型权重，不改任何第三方插件源码。
@@ -660,9 +781,9 @@ done
 - 段名来自各插件的 `systemPrompt.section({ name })`，插件升级改段名后要在 `dropSections` 里同步。
 - llama.cpp 侧的调参只到「一键拉起时给一组能跑的默认值」（`--n-gpu-layers auto --fit on --cache-type-k/v q8_0`）；要换量化、换 KV cache 精度、限并发，改高级配置里的启动命令，插件不替你优化推理性能。
 - **资源预检是估算，不是保证。** `checkModelFit` 用 `os.freemem()` / `os.totalmem()`、
-  模型文件体积、以及 `nvidia-smi --query-gpu=memory.total` 拿到的显存总量做减法：
-  `hostBytes = sizeBytes − gpuBytes`。这三个数都不精确（本机实测：32GB 机器 Windows 只报
-  16.37GB 可见，其中 GPU 拿走 14.5GB；`freemem` 还把 page cache 算成已占用）。
+  模型文件体积、以及探测到的显存总量做减法：`hostBytes = sizeBytes − gpuBytes`。
+  显存探测按厂商分三条路（见「跨平台」一节）。这几个数都不精确（本机实测：32GB 机器
+  Windows 只报 16.37GB 可见，其中 GPU 拿走 14.5GB；`freemem` 还把 page cache 算成已占用）。
   所以它只会**拦住明显起不来的**，不会替你算出真实占用。拿不到显存时退化成「不算显存」，
   不报错。判 `ok` 也不代表不会慢。
 - **面板只能停自己起的进程。** `stop` 路由走一张内存表（`launched`），表里只有本插件
@@ -673,9 +794,10 @@ done
 ## 开发
 
 ```bash
-npm run verify                  # = check + test，8 个文件语法 + 6 套测试
-npm run check                   # 只跑 node --check（lib/*.js + client.js）
-npm test                        # 只跑测试
+npm run verify                  # = check + test，8 个文件语法 + 7 套测试
+npm run check                   # 只跑 node --check（lib/*.js + client.js + test/platform-sim.mjs）
+npm test                        # 只跑测试（unit + portable + host）
+npm run test:portable           # 只跑跨平台推演（linux / darwin / win32 各一遍）
 
 node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
@@ -683,7 +805,16 @@ node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
 node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 12 条 bridge 路由全打一遍
 node test/launcher.mjs          # 一键拉起 + 扫本机 gguf + 资源预检 + 停进程（不真起进程）
+node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
+node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径
+node test/platform-sim.mjs darwin   # 同上，macOS
+node test/platform-sim.mjs win32    # 同上，Windows（本机就是，但断言的是「全 .exe」）
 ```
+
+`test/platform-sim.mjs` 靠 `Object.defineProperty(process, "platform", …)` 在 import
+之前改平台 —— `lib/launcher.js` 顶部的 `const WIN = process.platform === 'win32'` 是
+import 时求值的，改掉之后整个模块都会按目标平台展开。有两点做不到：`os.homedir()`
+查的是真实 OS（所以家目录只断言格式，不断言前缀），`process.env.PATH` 也还是本机的。
 
 `test/panel.mjs` 只测纯逻辑：`lib/status.js`（接管文案、收益计算、provider 判定与点灯计数）
 和 `lib/import-model.js`（入参校验、provider id 生成、profile 拼装、试跑请求与四类失败分支，
