@@ -342,12 +342,17 @@ window.__ModuleLoader__.load({
      * gguf」—— 服务还不存在。这里把顺序倒过来：先列出磁盘上的模型文件，选一个，
      * 插件负责起服务 + 写 provider + 试跑，一步到位。
      */
-    function AdoptBox({ scan, setScan, busy, onScan, onAdopt, form, setForm, result }) {
+    function AdoptBox({ scan, setScan, busy, onScan, onAdopt, onDelete, form, setForm, result }) {
+      // allModels 是磁盘上全部 gguf（含 mmproj，用来删）；models 只留能当主模型的那些。
+      const allModels = Array.isArray(scan?.models) ? scan.models : []
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
       const chosen = models.find((item) => item.path === form.modelPath)
       const gib = (bytes) => (Number(bytes) > 0 ? (Number(bytes) / 1073741824).toFixed(1) + 'GB' : '?')
       const fit = chosen?.fit
       const heavy = fit?.level === 'risky'
+      // 删文件不可撤销，点一次只进入「确认」态，第二次才真删。
+      const [pendingDelete, setPendingDelete] = React.useState('')
+      const deleting = busy.startsWith('delete:')
       return h(
         'div',
         { style: { marginTop: 14 } },
@@ -372,7 +377,10 @@ window.__ModuleLoader__.load({
                 { style: S.hint },
                 models.length === 0
                   ? '没找到 .gguf。找过：' + (scan.dirs ?? []).join(' / ')
-                  : `找到 ${models.length} 个（已跳过视觉投影 mmproj）` +
+                  : `找到 ${allModels.length} 个` +
+                    (allModels.length > models.length
+                      ? `（其中 ${allModels.length - models.length} 个是视觉投影 mmproj，只能删不能选）`
+                      : '') +
                     (scan.truncated === true ? '，清单被截断' : ''),
               ),
         ),
@@ -383,21 +391,100 @@ window.__ModuleLoader__.load({
               { style: S.row },
               h('span', { style: S.label }, '模型文件'),
               h(
-                'select',
+                'div',
                 {
-                  style: { ...S.select, maxWidth: 560 },
-                  value: form.modelPath,
-                  onChange: (event) => setForm({ ...form, modelPath: event.target.value }),
+                  style: {
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                    maxHeight: 260,
+                    overflowY: 'auto',
+                    flex: 1,
+                    minWidth: 0,
+                  },
                 },
-                h('option', { value: '' }, '选一个（' + models.length + ' 个）'),
-                ...models.map((item) =>
-                  h(
-                    'option',
-                    { key: item.path, value: item.path },
-                    `${item.name} · ${gib(item.sizeBytes)}` +
-                      (item.fit?.level === 'risky' ? ' · 偏大' : ''),
-                  ),
-                ),
+                ...allModels.map((item) => {
+                  const picked = item.path === form.modelPath
+                  const askDelete = pendingDelete === item.path
+                  return h(
+                    'div',
+                    {
+                      key: item.path,
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '3px 6px',
+                        borderRadius: 4,
+                        border: '1px solid ' + (picked ? '#3b82f6' : '#e5e7eb'),
+                        background: picked ? '#eff6ff' : 'transparent',
+                      },
+                    },
+                    // 点名字选中（比下拉好：能看见体积和预检结论，也能删）
+                    h(
+                      'button',
+                      {
+                        style: {
+                          flex: 1,
+                          minWidth: 0,
+                          textAlign: 'left',
+                          background: 'transparent',
+                          border: 'none',
+                          cursor: 'pointer',
+                          padding: 0,
+                          fontSize: '12px',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          color: picked ? '#1d4ed8' : 'inherit',
+                          fontWeight: picked ? 600 : 400,
+                        },
+                        title: item.mmproj === true
+                          ? '视觉投影（mmproj）不能单独当主模型用，只能删'
+                          : item.path,
+                        disabled: busy !== '' || item.mmproj === true,
+                        onClick: () => {
+                          if (item.mmproj === true) return
+                          setForm({ ...form, modelPath: item.path })
+                        },
+                      },
+                      (item.mmproj === true ? '· ' : picked ? '● ' : '○ ') + item.name,
+                    ),
+                    h('span', { style: { ...S.hint, flexShrink: 0 } }, gib(item.sizeBytes)),
+                    item.fit?.level === 'risky' ? h('span', { style: { ...S.hint, color: RED, flexShrink: 0 } }, '偏大') : null,
+                    item.mmproj === true
+                      ? h('span', { style: { ...S.hint, flexShrink: 0 } }, '视觉投影')
+                      : null,
+                    // 删除：先问一次，再动手
+                    h(
+                      'button',
+                      {
+                        style: {
+                          ...S.small,
+                          flexShrink: 0,
+                          ...(askDelete ? { color: RED, borderColor: RED } : {}),
+                        },
+                        title: askDelete
+                          ? '再点一次就真删了（不进回收站）'
+                          : '把这个 .gguf 从磁盘删掉',
+                        disabled: busy !== '',
+                        onClick: () => {
+                          if (!askDelete) {
+                            setPendingDelete(item.path)
+                            return
+                          }
+                          setPendingDelete('')
+                          onDelete(item)
+                        },
+                      },
+                      deleting && askDelete
+                        ? '删除中…'
+                        : askDelete
+                          ? '确认删除？'
+                          : '删除',
+                    ),
+                  )
+                }),
               ),
             ),
         // 预检结论：只在有话说的时候显示（ok 就不打扰）
@@ -809,6 +896,47 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      /**
+       * 删一个模型文件。
+       *
+       * 只有连点两次才会到这里（第一次在 AdoptBox 里变成「确认删除？」）。
+       * 删成功就重扫一次：让列表反映磁盘真实状态，而不是本地先抹掉一行。
+       */
+      const runDelete = React.useCallback(
+        async (item) => {
+          const target = String(item?.path ?? '')
+          if (target.length === 0) return
+          setBusy('delete:' + target)
+          setMessage(null)
+          try {
+            const result = await call('delete', { path: target })
+            if (result.ok !== true) {
+              setMessage({ tone: 'bad', text: '没删成：' + String(result.error ?? '不知道原因') })
+              return
+            }
+            const freed =
+              Number(result.freedBytes) > 0
+                ? (Number(result.freedBytes) / 1073741824).toFixed(1) + 'GB'
+                : ''
+            const extra =
+              Array.isArray(result.users) && result.users.length > 0
+                ? '；还有 provider 指着它：' + result.users.join('、') + '（配置没动）'
+                : ''
+            setMessage({
+              tone: 'good',
+              text: (freed.length > 0 ? '已删除，腾出 ' + freed : '已删除') + extra,
+            })
+            if (form.modelPath === target) setAdoptForm((prev) => ({ ...prev, modelPath: '' }))
+            setAdoptResult(null)
+            await scanModels()
+          } catch (error) {
+            setMessage({ tone: 'bad', text: '删除失败：' + String(error?.message ?? error) })
+          } finally {
+            setBusy('')
+          }
+        },
+        [form.modelPath, scanModels],
+      )
       const runAdopt = React.useCallback(async () => {
         if (adoptForm.modelPath === '') return
         setBusy('adopt')
@@ -1040,6 +1168,7 @@ window.__ModuleLoader__.load({
           busy,
           onScan: scanModels,
           onAdopt: runAdopt,
+          onDelete: runDelete,
           form: adoptForm,
           setForm: setAdoptForm,
           result: adoptResult,

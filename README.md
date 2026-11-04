@@ -408,21 +408,40 @@ provider 后面有 **试跑** 按钮，发一条「只回一个字：好」的�
 拉起的进程，还会多一个 **停止** 按钮（`SIGTERM` → 赖着不走再 `SIGKILL`）。
 别人的 `ollama serve` 不会被这里点掉 —— 服务端只肯停自己 `spawn` 过、且登记在内存表里的 pid。
 
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据）—— 上一块要求你先有端点，可刚下完模型的
+**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.3 加删除键）—— 上一块要求你先有端点，可刚下完模型的
 时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个 gguf → 一键配置并试跑**。
 
-点「扫描本机模型」后插件会去这几个地方找 `.gguf`（每层最多下探两级，跳过
+点「扫描本机模型」后插件按 `modelRoots()` 的顺序找 `.gguf`（每层最多下探两级，跳过
 `.mmproj.` 视觉投影，按文件大小降序，大的排前面）：
 
 ```
-~/.workbuddy/local-models/files      ← WorkBuddy 下载目录，命中率最高
-~/AI/models
-~/models
+$DSH_LOCAL_MODELS_DIR                ← 你自己指定的目录，排最前
+~/models/files
+~/llama.cpp/models
+~/.cache/llama.cpp
 ~/.lmstudio/models
-%LOCALAPPDATA%/LM-Studio/models
-~/Downloads
+<dataDir>/LM-Studio/models           ← Win: %LOCALAPPDATA% / mac: ~/Library/Application Support
+~/.workbuddy/local-models/files      ← WorkBuddy 下载目录（兼容保留）
+~/AI/models
+~/Downloads                          ← 只扫一层
 ```
 
+**删除也只在这张表划定的范围内**——模型放在别的盘上（比如 `D:\gguf`），要先用
+`DSH_LOCAL_MODELS_DIR` 或配置项 `modelDirs` 把它加进来，否则扫描看不到、也删不了。
+
+扫出来的不是一个下拉框，而是一张表：每个 gguf 一行，点名字选中，右侧有 **删除**。
+
+- **第一次点删除只是问一句**（按钮变成「确认删除？」，再点才真删）—— 删文件不进回收站，
+  没有撤销。
+- 删除范围卡死：只删 `.gguf`（含 `.mmproj.gguf`），**只删扫描目录里的**。传一个 `../`
+  或者系统路径过来会被拒，目录本身永远不会被递归删除（用的是 `unlink` 不是 `rm -rf`）。
+- 已经不在了的文件如实回「文件已经不在了」，不当成功；权限/占用/只读盘失败时把系统错误
+  原样带回面板（`EBUSY: resource busy or locked` 这种），不吞成一句「失败」。
+- 删成功会清掉在线缓存并**重扫一遍**，让列表反映磁盘真实状态，而不是本地先抹掉一行。
+- **不会动你的 provider 配置**。如果还有 provider 指着这个文件对应的模型 id，面板会顺便说
+  「还有 N 个 provider 指着它（配置没动）」—— 删配置是用户的事，插件不替他决定。
+
+> 视觉投影 `mmproj` 也列出来（否则删不掉），但点它不会选中、也不能当主模型起服务，只是可删。
 选中一个模型后填端口（默认 8090）和上下文（默认 65536），点**一键配置并试跑**，
 一条链走完三件事：
 
@@ -543,9 +562,9 @@ macOS `/Applications/Ollama.app/...`、Homebrew `/opt/homebrew/bin`；Linux `/us
 面板不会整块报错：它自动退回 `describe` 视图，并在顶部提示「重启一次 DSH 就能看到点灯、
 收益条和模型导入」。插件是 JS 模块，装在宿主进程里，改完源码要让宿主重新 apply 一次。
 
-面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，十二个端点
+面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，十三个端点
 `describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test` / `launch` /
-`stop` / `models` / `adopt`，全部只接受 POST，且只放行本机来源
+`stop` / `models` / `adopt` / `delete`，全部只接受 POST，且只放行本机来源
 （`sec-fetch-site: cross-site` 直接 403，`Origin` 必须与 Host 同源）。
 
 重活路由（除 `describe` / `save` / `log` 之外）带两层节流：同一个路由上一次还没跑完时
@@ -804,7 +823,7 @@ node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
-node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 12 条 bridge 路由全打一遍
+node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 13 条 bridge 路由全打一遍
 node test/launcher.mjs          # 一键拉起 + 扫本机 gguf + 资源预检 + 停进程（不真起进程）
 node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
 node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径
@@ -841,7 +860,7 @@ import 时求值的，改掉之后整个模块都会按目标平台展开。
 
 `test/panel-host.mjs` 是宿主侧集成：用一份内存 settings、一个假 `webServer`、一个假
 llama.cpp（`/v1/models` + `/v1/chat/completions`）跑真的 `apply(ctx)`，让插件自己注册路由，
-然后逐条断言 status / check / import / test / launch / stop / models / adopt 的返回 ——
+然后逐条断言 status / check / import / test / launch / stop / models / adopt / delete 的返回 ——
 包括同源守卫 403、同名不覆盖、端点连不上、模型不在列表里、provider 不存在、
 资源预检拦截、以及「只肯停自己起的进程」这几种路径。它不需要真起 DSH。
 
@@ -859,6 +878,10 @@ v0.3.9 起还覆盖 `scanLocalModels`（跳过 mmproj、按大小降序、目录
 （五档结论 + 显存外的 hostBytes + 拿不到体积时的 unknown）、`--load-mode` 白名单（`normalizeLoadMode` / `LOAD_MODES`）、`detectGpuBytes`、`stopProcess`
 （SIGTERM → SIGKILL → 报失败，幂等）、`isProcessAlive`（EPERM 算活着），
 以及扫描的三道上限（`maxModels` / `maxEntries` / Downloads 只扫一层）与 `truncated` 标记。
+
+v0.4.3 补上 `deleteLocalModel`：只认扫描目录内的 `.gguf`（反斜杠路径也会先归一化）、
+越界与兄弟目录（`/models-other` 不能被 `/models` 认下来）一律拒、`unlink` 抛错时把
+`EBUSY` 这类系统错误原样返回。删除的**成功路径**只用假 `unlink` 验，CI 上不会真删文件。
 
 `adopt` 的 `sizeBytes` / `gpuBytes` / `totalMemBytes` 可以从入参覆盖（非正数或省略就回落真实探测）。
 CI 的 runner 上没有 `nvidia-smi`、内存也只有 15.6GB，不覆盖的话「能跑的机器不该被判 risky」

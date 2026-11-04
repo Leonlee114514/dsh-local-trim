@@ -173,8 +173,8 @@ const callRoute = async (name, body) => {
   return { status, body: text.length > 0 ? JSON.parse(text) : undefined }
 }
 
-console.log('\n=== 1. 十一条路由都注册上了 ===')
-for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch', 'models', 'adopt']) {
+console.log('\n=== 1. 十三条路由都注册上了 ===')
+for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch', 'stop', 'models', 'adopt', 'delete']) {
   check(name, routes.has('/api/dsh-local-trim/' + name))
 }
 
@@ -419,5 +419,32 @@ console.log('\n=== 19. models：扫描结果带每个模型的预检结论 ===')
   check('带回扫过的条目数', Number.isFinite(body.scannedEntries), String(body.scannedEntries))
 }
 
+console.log('\n=== 20. delete：只删扫描目录里的 .gguf ===')
+{
+  // 越界（不在扫描目录里）→ 拒，并回列扫描过的目录
+  const outside = await callRoute('delete', { path: '/etc/passwd.gguf' })
+  check('200（业务失败不抛）', outside.status === 200, String(outside.status))
+  check('ok=false', outside.body.ok === false)
+  check('说明不在扫描目录里', /不在模型的扫描目录/.test(outside.body.error ?? ''), outside.body.error ?? '')
+  check('把扫描过的目录带回来', Array.isArray(outside.body.dirs) && outside.body.dirs.length > 0, String(outside.body.dirs?.length))
+
+  // 非 gguf → 拒
+  const notGguf = await callRoute('delete', { path: '/models/a.bin' })
+  check('非 .gguf 一律拒', notGguf.body.ok === false && /只肯删 .gguf/.test(notGguf.body.error ?? ''), notGguf.body.error ?? '')
+
+  // 不说路径 → 直说
+  const missing = await callRoute('delete', {})
+  check('不说路径就直说', missing.body.ok === false && /删哪个文件/.test(missing.body.error ?? ''), missing.body.error ?? '')
+
+  // 真删会破坏本机环境（这台机器上真有 15.8GB 的 gguf），所以走一条等价路径：
+  // 传一个「落在扫描目录里、但不存在」的路径 —— 范围校验必须放行，存在性校验必须拦住。
+  // 成功删除由 test/launcher.mjs 的 deleteLocalModel 单测用假 unlink 覆盖。
+  const listed = await callRoute('models', {})
+  const dirs = listed.body.dirs ?? []
+  const inside = String(dirs[0] ?? '') + '/__dsh_local_trim_probe__.gguf'
+  const gone = await callRoute('delete', { path: inside })
+  check('扫描目录内的路径能过范围校验', /已经不在了/.test(gone.body.error ?? ''), gone.body.error ?? '')
+  check('不谎报成功', gone.body.ok === false)
+}
 console.log(`\n${fail === 0 ? '=== 面板宿主侧集成全部通过 ===' : `=== ${fail} 项失败 ===`}`)
 process.exit(fail === 0 ? 0 : 1)

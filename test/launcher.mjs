@@ -27,6 +27,7 @@ import {
   exeName,
   llamaCppAutoArgs,
   scanLocalModels,
+  deleteLocalModel,
 } from '../lib/launcher.js'
 
 // PATH 在不同 shell 下键名不同（bash: PATH / PowerShell: Path），断言不能写死。
@@ -658,4 +659,68 @@ await ok('envPathValue：PATH / Path 两种键都能读到', async () => {
   assert.notEqual(envPathValue(), '')
 })
 
+
+await ok('deleteLocalModel：只删扫描目录里的 .gguf', async () => {
+  const removed = []
+  const base = {
+    dirs: ['/models', '/models/files'],
+    exists: () => true,
+    statSize: () => 4096,
+    unlink: (p) => removed.push(p),
+  }
+  const good = deleteLocalModel({ ...base, path: '/models/files/a.gguf' })
+  assert.equal(good.ok, true)
+  assert.equal(good.name, 'a.gguf')
+  assert.equal(good.freedBytes, 4096)
+  assert.deepEqual(removed, ['/models/files/a.gguf'])
+
+  // 目录根下直接放的文件也算在目录里（target === dir 的情形不会命中 gguf，但前缀要认）
+  const nested = deleteLocalModel({ ...base, path: '/models/sub/b.gguf' })
+  assert.equal(nested.ok, true)
+
+  // 反斜杠路径也会被归一化后判定
+  const win = deleteLocalModel({ ...base, path: ['', 'models', 'files', 'c.gguf'].join('\\') })
+  assert.equal(win.ok, true)
+  assert.equal(removed.length, 3)
+})
+
+await ok('deleteLocalModel：拒绝越界、非 gguf、已消失', async () => {
+  const base = { dirs: ['/models'], exists: () => true, statSize: () => 1, unlink: () => {} }
+
+  const outside = deleteLocalModel({ ...base, path: '/etc/passwd.gguf' })
+  assert.equal(outside.ok, false)
+  assert.match(outside.error, /不在模型的扫描目录/)
+  assert.deepEqual(outside.dirs, ['/models'])
+
+  // 前缀像但其实是兄弟目录（/models-other 不能被 /models 认下来）
+  const sibling = deleteLocalModel({ ...base, path: '/models-other/a.gguf' })
+  assert.equal(sibling.ok, false)
+
+  const notGguf = deleteLocalModel({ ...base, path: '/models/a.bin' })
+  assert.equal(notGguf.ok, false)
+  assert.match(notGguf.error, /只肯删 .gguf/)
+
+  const gone = deleteLocalModel({ ...base, path: '/models/a.gguf', exists: () => false })
+  assert.equal(gone.ok, false)
+  assert.match(gone.error, /已经不在了/)
+
+  const empty = deleteLocalModel({ ...base, path: '' })
+  assert.equal(empty.ok, false)
+  assert.match(empty.error, /删哪个文件/)
+})
+
+await ok('deleteLocalModel：unlink 抛错时把系统错误带回来', async () => {
+  const boom = deleteLocalModel({
+    dirs: ['/models'],
+    path: '/models/a.gguf',
+    exists: () => true,
+    statSize: () => 2048,
+    unlink: () => {
+      throw new Error('EBUSY: resource busy or locked')
+    },
+  })
+  assert.equal(boom.ok, false)
+  assert.match(boom.error, /EBUSY/)
+  assert.equal(boom.sizeBytes, 2048)
+})
 console.log(`${passed} 项通过`)
