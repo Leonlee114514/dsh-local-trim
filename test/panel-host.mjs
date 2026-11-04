@@ -325,17 +325,28 @@ console.log('\n=== 15. adopt：非 gguf 文件被挡下 ===')
 console.log('\n=== 16. adopt：mmap 装得下的 15.8GB 模型不再被误判 risky ===')
 {
   // v0.4.1 纠正：gguf 走 mmap 落在可回收的 page cache，显存外的部分才是宿主接的量。
-  // 这台机器 15.8GB gguf + 14.5GB 显存 → 显存外 ~1.3GB，不该拦。
+  // 体积显式传入，不依赖这台机器上真的有没有那个文件 —— 判定逻辑要跨平台可复现。
   const { status, body } = await callRoute('adopt', {
     modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
     port: 8090,
+    sizeBytes: 16954484384,
   })
   check('200（业务失败不抛）', status === 200, String(status))
-  check('带上体积', typeof body.sizeBytes === 'number' && body.sizeBytes > 0, String(body.sizeBytes))
-  check('带上 fit 明细', typeof body.fit?.ratio === 'number', String(body.fit?.ratio))
+  check('带上体积', body.sizeBytes === 16954484384, String(body.sizeBytes))
   check('带回显存外的字节数', typeof body.fit?.hostBytes === 'number', String(body.fit?.hostBytes))
   check('没被误判成 risky', body.fit?.level !== 'risky', String(body.fit?.level))
   check('不再塞 noMmap 字段', body.noMmap === undefined, String(body.noMmap))
+}
+
+console.log('\n=== 16a. adopt：文件不存在时退化 unknown，不抛异常 ===')
+{
+  const { status, body } = await callRoute('adopt', {
+    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/not-there.gguf',
+    port: 8090,
+  })
+  check('200（业务失败不抛）', status === 200, String(status))
+  check('体积读到 0', body.sizeBytes === 0, String(body.sizeBytes))
+  check('fit 是 unknown', body.fit?.level === 'unknown', String(body.fit?.level))
 }
 
 console.log('\n=== 16b. adopt：真装不下时才拦，要求确认，且不改 --load-mode ===')
@@ -366,6 +377,7 @@ console.log('\n=== 17. adopt：确认后继续，端口已经在跑就跳过拉�
     contextWindow: 65536,
     overwrite: true,
     confirmHeavy: true,
+    sizeBytes: 16954484384,
   })
   check('200 + ok', status === 200 && body.ok === true, JSON.stringify(body.error ?? '') + ' stage=' + (body.stage ?? ''))
   check('阶段是 ready', body.stage === 'ready', String(body.stage))
