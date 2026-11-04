@@ -13,7 +13,7 @@
  *   save     写回高级配置
  *   describe 老宿主的兼容读取（没有 status 时降级用）
  *   log      读日志尾部
- *   models   扫本机 .gguf（带每个模型的资源预检）
+ *   models   扫本机模型：.gguf + Ollama 存储里的权重（带每个模型的资源预检）
  *   adopt    一键配置：起服务 → 等应答 → 注册 provider → 试跑
  *   launch   对已有 provider 拉起后端
  *   stop     只停本插件自己 spawn 的那个 pid
@@ -69,6 +69,16 @@ window.__ModuleLoader__.load({
       title: { fontSize: 14, fontWeight: 600, margin: '14px 0 6px' },
       row: { display: 'flex', alignItems: 'center', gap: 8, margin: '6px 0' },
       label: { flex: '0 0 140px', color: MUTED },
+      // 小徽标：标出这一行来自哪个引擎（Ollama / llama.cpp），一眼能分辨。
+      tag: {
+        flexShrink: 0,
+        fontSize: 11,
+        lineHeight: 1.4,
+        padding: '0 6px',
+        borderRadius: 999,
+        border: BORDER,
+        color: MUTED,
+      },
       grow: { flex: 1, minWidth: 0 },
       input: {
         width: '100%',
@@ -379,6 +389,14 @@ window.__ModuleLoader__.load({
       const allModels = Array.isArray(scan?.models) ? scan.models : []
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
       const chosen = models.find((item) => item.path === form.modelPath)
+      // Ollama 的权重文件叫 sha256-…，没有扩展名也没有可读名：面板一律显示 tags[0]，
+      // 显示名字回落到元数据里的 general.name，最后才是文件名。
+      const labelOf = (item) =>
+        (Array.isArray(item.tags) && item.tags.length > 0 ? item.tags[0] : null) ??
+        item.modelName ??
+        item.readableName ??
+        item.name
+      const isOllama = (item) => item.source === 'ollama'
       const gib = (bytes) => {
         const value = Number(bytes)
         if (!Number.isFinite(value) || value <= 0) return '?'
@@ -396,7 +414,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { style: S.hint },
-          '列出这台机器上已经下好的 .gguf，选一个，插件替你起 llama-server、写进 provider、再试跑一次。不用先有端点。',
+          '列出这台机器上已经下好的模型（.gguf 文件，以及 Ollama 存储里那些叫 sha256-… 的权重），选一个，插件替你起服务、写进 provider、再试跑一次。不用先有端点。',
         ),
         h(
           'div',
@@ -412,10 +430,13 @@ window.__ModuleLoader__.load({
                 'span',
                 { style: S.hint },
                 models.length === 0
-                  ? '没找到 .gguf。找过：' + (scan.dirs ?? []).join(' / ')
+                  ? '没找到模型文件。找过：' + (scan.dirs ?? []).join(' / ')
                   : `找到 ${allModels.length} 个` +
                     (allModels.length > models.length
                       ? `（其中 ${allModels.length - models.length} 个是视觉投影 mmproj，不能单独当主模型）`
+                      : '') +
+                    (models.filter(isOllama).length > 0
+                      ? `（含 ${models.filter(isOllama).length} 个来自 Ollama）`
                       : '') +
                     (scan.truncated === true ? '，清单被截断' : ''),
               ),
@@ -480,11 +501,23 @@ window.__ModuleLoader__.load({
                         disabled: busy !== '' || item.mmproj === true,
                         onClick: () => {
                           if (item.mmproj === true) return
-                          setForm({ ...form, modelPath: item.path })
+                          // 选中 Ollama 的模型时把端口一起跟过去：那个端口上跑的是 ollama，
+                          // 填成 8090 会让插件去起一份 llama-server，白吃一遍内存。
+                          setForm({
+                            ...form,
+                            modelPath: item.path,
+                            port: isOllama(item) && item.port ? String(item.port) : form.port,
+                          })
                         },
                       },
-                      (item.mmproj === true ? '· ' : picked ? '● ' : '○ ') + item.name,
+                      (item.mmproj === true ? '· ' : picked ? '● ' : '○ ') + labelOf(item),
                     ),
+                    isOllama(item)
+                      ? h('span', { style: { ...S.tag, flexShrink: 0 } }, 'Ollama')
+                      : null,
+                    item.quantization
+                      ? h('span', { style: { ...S.hint, flexShrink: 0 } }, item.quantization)
+                      : null,
                     h('span', { style: { ...S.hint, flexShrink: 0 } }, gib(item.sizeBytes)),
                     item.fit?.level === 'risky' ? h('span', { style: { ...S.hint, color: RED, flexShrink: 0 } }, '偏大') : null,
                     item.mmproj === true
@@ -580,7 +613,13 @@ window.__ModuleLoader__.load({
               ),
               chosen === undefined
                 ? null
-                : h('span', { style: S.hint }, '别名取文件名：' + chosen.name.replace(/\.gguf$/i, '')),
+                : h(
+                    'span',
+                    { style: S.hint },
+                    isOllama(chosen)
+                      ? '模型名取 tag：' + labelOf(chosen) + '（走 Ollama 的 11434，不再起一份 llama-server）'
+                      : '别名取文件名：' + chosen.name.replace(/\.gguf$/i, ''),
+                  ),
             ),
         result === null
           ? null
@@ -894,7 +933,14 @@ window.__ModuleLoader__.load({
           setAdoptForm((prev) => {
             if (prev.modelPath !== '') return prev
             const first = (result.models ?? []).find((item) => item.mmproj !== true)
-            return first === undefined ? prev : { ...prev, modelPath: first.path }
+            if (first === undefined) return prev
+            // 自动选中时端口跟着走：Ollama 的模型默认落到 11434，别让第一次点击
+            // 拿默认 8090 去再起一份 llama-server。
+            return {
+              ...prev,
+              modelPath: first.path,
+              port: first.source === 'ollama' && first.port ? String(first.port) : prev.port,
+            }
           })
         } catch (error) {
           setMessage({ tone: 'bad', text: '扫描失败：' + String(error?.message ?? error) })

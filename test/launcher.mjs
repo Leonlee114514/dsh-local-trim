@@ -27,6 +27,9 @@ import {
   exeName,
   llamaCppAutoArgs,
   scanLocalModels,
+  scanOllamaModels,
+  ollamaModelFor,
+  ollamaModelRoots,
 } from '../lib/launcher.js'
 
 // PATH 在不同 shell 下键名不同（bash: PATH / PowerShell: Path），断言不能写死。
@@ -643,6 +646,181 @@ await ok('扫本机 gguf：没超限时不谎报 truncated', async () => {
   assert.equal(list.length, 2)
   assert.equal(list.truncated, false)
   assert.equal(list.scannedEntries, 2)
+})
+
+// ── Ollama 存储 ───────────────────────────────────────────────────────
+
+// ollama 的权重文件叫 sha256-<摘要>，没有扩展名；名字在 manifests 的**路径**里。
+// 这两条用例全部走注入的假 fs，不依赖这台机器装没装 ollama。
+const ollamaStub = (root = '/store') => {
+  const blob = 'sha256-' + 'a'.repeat(64)
+  const manifest = JSON.stringify({
+    schemaVersion: 2,
+    layers: [
+      { mediaType: 'application/vnd.ollama.image.model', digest: 'sha256:' + 'a'.repeat(64), size: 500 },
+      { mediaType: 'application/vnd.ollama.image.template', digest: 'sha256:' + 'b'.repeat(64), size: 1723 },
+    ],
+  })
+  const meta = JSON.stringify({
+    kv: {
+      'general.architecture': 'qwen3',
+      'general.name': 'Qwen3 8B',
+      'general.file_type': 15,
+      'qwen3.context_length': 40960,
+    },
+  })
+  const tree = {
+    [root]: ['manifests', 'blobs', 'metadata'],
+    [root + '/manifests']: ['registry.ollama.ai'],
+    [root + '/manifests/registry.ollama.ai']: ['library'],
+    [root + '/manifests/registry.ollama.ai/library']: ['qwen3'],
+    [root + '/manifests/registry.ollama.ai/library/qwen3']: ['8b'],
+    [root + '/blobs']: [blob],
+    [root + '/metadata']: [],
+  }
+  return {
+    blob,
+    roots: [root],
+    exists: (p) => tree[p] !== undefined || p === `${root}/blobs/${blob}` || p === `${root}/manifests/registry.ollama.ai/library/qwen3/8b`,
+    listDir: (dir) => tree[dir] ?? [],
+    statSize: (p) => (p === `${root}/blobs/${blob}` ? 500 : 400),
+    readText: (p) => {
+      if (p.endsWith('/8b')) return manifest
+      if (p.includes('/metadata/')) return meta
+      return ''
+    },
+  }
+}
+
+await ok('ollama：从 manifests 路径还原出 tag，并指回 blobs 里的权重', async () => {
+  const stub = ollamaStub()
+  const list = scanOllamaModels(stub)
+  assert.equal(list.length, 1)
+  assert.equal(list[0].name, 'qwen3:8b')
+  assert.equal(list[0].path, '/store/blobs/' + stub.blob)
+  assert.deepEqual(list[0].tags, ['qwen3:8b'])
+  assert.equal(list[0].source, 'ollama')
+  assert.equal(list[0].engine, 'ollama')
+  assert.equal(list[0].port, 11434)
+  assert.equal(list[0].mmproj, false)
+})
+
+await ok('ollama：metadata 的 GGUF kv 翻成可读名与量化（file_type 15 = Q4_K_M）', async () => {
+  const stub = ollamaStub()
+  const hit = scanOllamaModels(stub)[0]
+  assert.equal(hit.modelName, 'Qwen3 8B')
+  assert.equal(hit.architecture, 'qwen3')
+  assert.equal(hit.quantization, 'Q4_K_M')
+  assert.equal(hit.contextLength, 40960)
+})
+
+await ok('ollama：latest 这种 tag 不加冒号，其它 tag 拼成 name:tag', async () => {
+  const stub = ollamaStub()
+  const dir = '/store/manifests/registry.ollama.ai/library/qwen3'
+  const base = stub.listDir
+  const list = scanOllamaModels({
+    ...stub,
+    exists: (p) => p === dir + '/latest' || stub.exists(p),
+    listDir: (d) => (d === dir ? ['8b', 'latest'] : base(d)),
+    readText: (p) => (p === dir + '/latest' ? stub.readText(dir + '/8b') : stub.readText(p)),
+  })
+  assert.equal(list.length, 1, '同一个 blob 被两个 tag 引用时合并成一条')
+  assert.deepEqual([...list[0].tags].sort(), ['qwen3', 'qwen3:8b'])
+})
+
+await ok('ollama：blob 不在磁盘上时不列（清单里不能出现起不来的模型）', async () => {
+  const stub = ollamaStub()
+  const list = scanOllamaModels({ ...stub, exists: () => false })
+  assert.equal(list.length, 0)
+})
+
+await ok('ollama：只有 adapter/mmproj 层时不算主模型', async () => {
+  const stub = ollamaStub()
+  const manifest = JSON.stringify({
+    layers: [{ mediaType: 'application/vnd.ollama.image.adapter', digest: 'sha256:' + 'a'.repeat(64), size: 10 }],
+  })
+  const list = scanOllamaModels({ ...stub, readText: (p) => (p.endsWith('/8b') ? manifest : '') })
+  assert.equal(list.length, 0)
+})
+
+await ok('ollama：路径带尾斜杠时不当目录递归（Windows 的 exists 语义）', async () => {
+  // 真机踩过：existsSync('文件/') 在 Windows 上也是 true，用尾斜杠判目录会
+  // 把每个 manifest 当成目录继续下钻，结果一个模型都读不到。
+  const stub = ollamaStub()
+  const list = scanOllamaModels({ ...stub, exists: () => true })
+  assert.equal(list.length, 1, '全部存在（模拟 Windows 的尾斜杠语义）时仍要读到 manifest')
+})
+
+await ok('主扫描：把 ollama 的模型并进同一张表，且不重复列', async () => {
+  const stub = ollamaStub()
+  const list = scanLocalModels({
+    dirs: ['/models'],
+    depth: 1,
+    exists: (p) => p === '/models' || p === '/models/other.gguf' || stub.exists(p),
+    listDir: (dir) => (dir === '/models' ? ['other.gguf'] : stub.listDir(dir)),
+    statSize: (p) => (p === '/models/other.gguf' ? 900 : stub.statSize(p)),
+    readText: stub.readText,
+    ollamaRoots: stub.roots,
+  })
+  const names = list.map((item) => item.name)
+  assert.deepEqual(names.sort(), ['other.gguf', 'qwen3:8b'])
+  assert.equal(list.find((item) => item.name === 'qwen3:8b').source, 'ollama')
+})
+
+await ok('主扫描：假 fs 没给 ollamaRoots 时不去真实目录（不谎报 truncated）', async () => {
+  // 单测普遍写 exists: () => true，若真去探标准位置会把假树当 ollama 存储钻到底。
+  const list = scanLocalModels({
+    dirs: ['/models'],
+    exists: () => true,
+    listDir: () => ['a.gguf'],
+    statSize: () => 1024,
+  })
+  assert.equal(list.length, 1)
+  assert.equal(list.truncated, false)
+})
+
+await ok('魔数判定：无扩展名的 GGUF 也收，带后缀的杂项不开文件', async () => {
+  const list = scanLocalModels({
+    dirs: ['/models'],
+    depth: 1,
+    exists: (p) => p === '/models' || p.startsWith('/models/'),
+    listDir: () => ['blob-no-ext', 'notes.md', 'weights'],
+    statSize: () => 10 * 1024 * 1024,
+    readHead: (p) => (p.endsWith('blob-no-ext') || p.endsWith('weights') ? 'GGUF' : 'PK\x03\x04'),
+  })
+  const names = list.map((item) => item.name).sort()
+  assert.deepEqual(names, ['blob-no-ext', 'weights'])
+  assert.equal(list.truncated, false)
+})
+
+await ok('反查：adopt 拿一个 blob 路径能问出它的 tag（正反斜杠都认）', async () => {
+  const stub = ollamaStub()
+  const hit = ollamaModelFor('/store/blobs/' + stub.blob, stub)
+  assert.deepEqual(hit?.tags, ['qwen3:8b'])
+  assert.deepEqual(ollamaModelFor('\\store\\blobs\\' + stub.blob, stub)?.tags, ['qwen3:8b'])
+  assert.equal(ollamaModelFor('/models/other.gguf', stub), undefined)
+  assert.equal(ollamaModelFor('', stub), undefined)
+  assert.equal(ollamaModelFor('/store/blobs/' + stub.blob, { ...stub, models: [] }), undefined, '给了现成清单就不该再扫盘')
+})
+
+await ok('roots：标准位置都探得到，但“像 ollama 存储”才算数', async () => {
+  const all = ollamaModelRoots({ exists: () => true, listDir: () => ['manifests'], env: {} })
+  assert.ok(all.length >= 2, 'Win/mac/Linux 至少各给了候选：' + JSON.stringify(all))
+  assert.ok(all.every((p) => typeof p === 'string' && !p.includes('undefined'), JSON.stringify(all)))
+  // 同一个位置存在但没有 manifests/blobs 子目录 → 只是个同名普通目录，不能当库
+  const plain = ollamaModelRoots({ exists: (p) => p === all[0], listDir: () => [], env: {} })
+  assert.deepEqual(plain, [])
+})
+
+await ok('roots：OLLAMA_MODELS 指哪就扫哪（自定义存储位置）', async () => {
+  const marker = 'custom-' + 'store'
+  const roots = ollamaModelRoots({
+    exists: (p) => p.includes(marker) && (p === '/data/' + marker || p.endsWith('/manifests')),
+    listDir: () => [],
+    env: { OLLAMA_MODELS: '/data/' + marker },
+  })
+  assert.equal(roots.length, 1)
+  assert.equal(roots[0], '/data/' + marker, 'env 给的位置必须排最前，且原样用（不拼到 home 底下）')
 })
 
 // ── PATH 读取（大小写）────────────────────────────────────────────────

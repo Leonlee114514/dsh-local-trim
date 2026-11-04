@@ -425,11 +425,13 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
 - 删成功会清掉在线缓存与 baseURL 缓存，然后重新拉一次状态；**磁盘上的模型文件一个字节都不
   动**，随时可以重新导入。
 
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据）—— 上一块要求你先有端点，可刚下完模型的
-时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个 gguf → 一键配置并试跑**。
+**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama）—— 上一块要求你先有端点，可刚下完模型的
+时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个模型 → 一键配置并试跑**。
 
-点「扫描本机模型」后插件按 `modelRoots()` 的顺序找 `.gguf`（每层最多下探两级，跳过
-`.mmproj.` 视觉投影，按文件大小降序，大的排前面）：
+点「扫描本机模型」后插件按 `modelRoots()` 的顺序找权重（每层最多下探两级，跳过
+`.mmproj.` 视觉投影，按文件大小降序，大的排前面）。**认权重不只看后缀**：`.gguf` 直接算，
+没有后缀的较大文件（默认 ≥8MB，最多读 600 个）再读前 4 个字节验 `GGUF` 魔数 —— Ollama
+把权重存成 `blobs/sha256-<64 位哈希>`，只看后缀永远扫不到它：
 
 ```
 $DSH_LOCAL_MODELS_DIR                ← 你自己指定的目录，排最前
@@ -443,13 +445,25 @@ $DSH_LOCAL_MODELS_DIR                ← 你自己指定的目录，排最前
 ~/Downloads                          ← 只扫一层
 ```
 
-扫出来的不是一个下拉框，而是一张表：每个 gguf 一行，点名字选中。加号后面是它的体积，
-超过可用预算的会标红「偏大」。**这里没有删除键** —— 权重文件是磁盘上的既有文件，插件不
+**另外单独走一趟 Ollama 存储**（`scanOllamaModels`）：`OLLAMA_MODELS` 环境变量排最前，
+然后是 Windows `~/AI/models/ollama`、`%LOCALAPPDATA%\ollama\models`、`~/.ollama/models`，
+macOS `~/.ollama/models`、`/usr/share/ollama/.ollama/models`，Linux 再加
+`/usr/lib/ollama/models`、`/opt/ollama/models`。不是去 `blobs` 里猜哪些文件是权重 ——
+**读 `manifests/` 与 `manifests-v2/`，只取 `mediaType` 为 `application/vnd.ollama.image.model`
+的那一层**，再拿它的 digest 指回 `blobs/sha256-…`。这样得到的名字是人话：
+路径 `<host>/<ns>/<name>/<tag>` 还原成 `qwen3:14b`（`latest` 不加冒号），一个 blob 被多个
+tag 引用时合并成一条、`tags` 列出全部；`<root>/metadata/sha256-….json` 的 kv 再补上
+`general.name`、`general.file_type`（→ 量化标签，按 ggml 枚举原值，15 = `Q4_K_M`）和
+`context_length`。同一份文件被硬链接/同一个 inode 命中两次时按 inode 去重，谁有名字留谁。
+
+扫出来的不是一个下拉框，而是一张表：每个模型一行，点名字选中。Ollama 的模型显示 tag
+并带一个 `Ollama` 徽标和量化标签，后面是它的体积，超过可用预算的会标红「偏大」。
+**这里没有删除键** —— 权重文件是磁盘上的既有文件，插件不
 替你删（想清盘自己删，或用 `DSH_LOCAL_MODELS_DIR` 把它移出扫描范围）。
 
 > 视觉投影 `mmproj` 也列出来，但点它不会选中、也不能当主模型起服务。
 
-选中一个模型后填端口（默认 8090）和上下文（默认 65536），点**一键配置并试跑**，
+选中一个模型后填端口（默认 8090；**选中 Ollama 的模型时自动跟到 11434**）和上下文（默认 65536），点**一键配置并试跑**，
 一条链走完三件事：
 
 1. **先做资源预检**：算的是 **显存装不下的那部分**（`sizeBytes − gpuBytes`）比内存预算
@@ -463,11 +477,18 @@ $DSH_LOCAL_MODELS_DIR                ← 你自己指定的目录，排最前
    - 同样装不下但用了 `--load-mode none` / `mlock`（不走 mmap，要真驻留 RAM）→ `risky`，
      这时候才可能换页卡死；
    - 拿不到体积 → `unknown`，不假装通过也不假装危险。
-2. 用这个 gguf 起 `llama-server`（自动找 `~/.workbuddy/local-models/bin/` 下最新的 build，
-   参数带 `--n-gpu-layers auto --fit on --jinja --cache-type-k/v q8_0`）；端口上已经有服务
-   在应答就跳过拉起，不重复起；
-3. 等 `GET /v1/models` 真应答，**以它报的模型 id 为准**（不是文件名）；
-4. 复用「导入」的注册逻辑写进 `llm-pi-ai`，然后发一条真实请求试跑。
+2. **分两条路**：
+   - 选中的是 **Ollama 的模型**（在 manifest 里认出了 tag）→ **不去起 `llama-server`**。
+     那个 blob 虽然本身是合法 GGUF，但把它硬喂给 llama.cpp 等于绕过 Ollama 再吃一遍内存，
+     而且丢掉 `ollama run` 的全部上下文。插件只做一件事：确认 `11434` 有 ollama 在应答
+     （没有就按已知后端起 `ollama serve`），然后把 **tag 当模型 id** 交给下一步；
+   - 选中的是普通 `.gguf` → 用这个文件起 `llama-server`（自动找 `~/.workbuddy/local-models/bin/`
+     下最新的 build，参数带 `--n-gpu-layers auto --fit on --jinja --cache-type-k/v q8_0`）；
+     端口上已经有服务在应答就跳过拉起，不重复起；
+3. 等 `GET /v1/models` 真应答，**以它报的模型 id 为准**（不是文件名 —— 端口 11434 上报的是
+   `qwen3:14b` 这种 tag，拿 blob 的 `sha256-…` 去匹配永远匹配不上）；
+4. 复用「导入」的注册逻辑写进 `llm-pi-ai`（Ollama 那条会注册成 `local-ollama-<slug>`），
+   然后发一条真实请求试跑。
 
 选完模型后「保留思考模式」旁边还有一个 **加载方式** 下拉（`--load-mode`），默认留空：
 
@@ -525,11 +546,14 @@ llama.cpp 这一条是 v0.3.7 的重点：模型已经下好了就别让人再�
 1. `llama-server`（Windows 补 `.exe`）：`LLAMA_SERVER_BIN` → `~/.workbuddy/local-models/bin/<build>/`
    （WorkBuddy 的布局，取最新 build）→ `~/AI/llama.cpp/`（Windows）/ Homebrew 与 `/usr/local/bin`（macOS、Linux）
    → PATH；
-2. gguf：按 `modelRoots()` 的顺序找（`DSH_LOCAL_MODELS_DIR` → `~/models` → `~/llama.cpp/models`
+2. 权重：按 `modelRoots()` 的顺序找（`DSH_LOCAL_MODELS_DIR` → `~/models` → `~/llama.cpp/models`
    → `~/.cache/llama.cpp` → `~/.lmstudio/models` → `<dataDir>/LM-Studio/models` →
-   `~/.workbuddy/local-models/files` → `~/Downloads`），第一个含 `.gguf` 的目录胜出；
+   `~/.workbuddy/local-models/files` → `~/Downloads`），第一个含权重的目录胜出；
+   认权重同样看后缀**或**文件头魔数（Ollama 的 `sha256-…` blob 就是靠魔数认的）；
    同一目录里优先 `local_model.gguf`，跳过 `.mmproj.`（那是视觉投影）；
    要指定自己的目录用 `DSH_LOCAL_MODELS_DIR` 或配置项 `modelDirs`；
+   **注意这条只给「llama.cpp 自己捡模型」用。Ollama 的权重不走这里** —— 端口 11434 上
+   该跑的是 `ollama serve`，模型名由 ollama 自己按 tag 提供（见④那条链的第 2 步）。
 3. 拼参数（**新版 llama.cpp**）：`-m <gguf> --host 127.0.0.1 --port 8090 --alias <provider 的模型 id>
    --n-gpu-layers auto --fit on --parallel 1 --jinja --cache-type-k q8_0 --cache-type-v q8_0
    -c 65536 --n-predict 8192`。老版本（没有 `--fit`）会自动换一套：`--n-gpu-layers 99`，
@@ -704,7 +728,7 @@ CI 在 `ubuntu-latest`（Node 20/22/24）、`windows-latest`、`macos-latest` �
 | 找 ollama | 用户目录安装 + `Program Files` + PATH | `.app` 包内 + Homebrew + PATH | `/usr/local/bin`、`/usr/bin`、`/snap/bin` + PATH |
 | 找 llama-server | WorkBuddy build + 用户目录 + PATH（补 `.exe`） | Homebrew + `/usr/local/bin` + PATH | 同 macOS |
 | 找 vLLM / LM Studio | `LM-Studio/lms.exe`、`Program Files` + PATH | `.app` 包内 + PATH | `/usr/local/bin` + PATH |
-| 扫 gguf | `~/models`、`~/AI/models`、`~/Downloads`… | `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`… | 同 macOS，另加 LM Studio 数据目录 |
+| 扫权重 | `~/models`、`~/AI/models`、`~/Downloads`… + Ollama 存储（含 `%LOCALAPPDATA%\ollama\models`） | `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`… + `~/.ollama/models`、`/usr/share/ollama/.ollama/models` | 同 macOS，另加 LM Studio 数据目录、`/usr/lib/ollama/models`、`/opt/ollama/models` |
 | 显存探测 | `nvidia-smi`（在 system32，靠 PATH） | `nvidia-smi` / `rocm-smi` / `sysctl hw.memsize` | `nvidia-smi` / `rocm-smi` |
 | 拉起 / 停止进程 | 支持（`spawn` + signal 0 探测） | 支持 | 支持 |
 
@@ -732,6 +756,11 @@ CI 在 `ubuntu-latest`（Node 20/22/24）、`windows-latest`、`macos-latest` �
      - ~/gguf
      - /data/weights
    ```
+
+3. Ollama 的存储单独一条环境变量：`OLLAMA_MODELS`。装了 ollama 的人经常把它指到大盘
+   （`D:\ollama-models` 这类），插件读它并**排到 Ollama 候选最前**，指哪儿扫哪儿；没设就
+   按上表那些标准位置挨个试。判定标准是「这个目录长得像 ollama 库吗」—— 底下必须有
+   `manifests` / `manifests-v2` / `blobs`，只是一个普通同名目录不会被当成库。
 
 ### 认自己的后端二进制
 
@@ -830,8 +859,8 @@ node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
-node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 13 条 bridge 路由全打一遍
-node test/launcher.mjs          # 一键拉起 + 扫本机 gguf + 资源预检 + 停进程（不真起进程）
+node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 13 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
+node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析）+ 资源预检 + 停进程（不真起进程）
 node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
 node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径
 node test/platform-sim.mjs darwin   # 同上，macOS

@@ -4,7 +4,93 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
-## [0.4.4] - 2026-11-04
+## [0.4.5] - 2026-11-04
+
+装了 Ollama 的机器上，「扫描本机模型」只列得出一个模型。不是扫描范围没覆盖到 ——
+`~/AI/models` 本来就在 `modelRoots()` 里，Ollama 的权重就在它下面的 `ollama/blobs/` 里 ——
+是**文件名根本不含后缀**：`sha256-a3de86cd1c13…`。而老代码判权重只认 `/\.gguf$/i`，
+于是那 5.2GB 和 9.3GB 的模型在清单里彻底不存在，面板上还表现为「这台机器只有一个模型」。
+更麻烦的是就算把它列出来也点不动：`adoptPanel` 硬挡 `只能选 .gguf 文件`。
+
+### 新增
+
+- **认权重加第二条判据：文件头魔数**。`readGgufMagic(path)` 读前 4 个字节，等于 `GGUF` 就算。
+  不是「所有文件都开一下」—— 只有**没有点号的、且体积 ≥8MB** 的名字才去开（`minGgufBytes`，
+  可用 io 覆盖），并且整趟扫描最多读 600 次（`maxMagic`）；明确不是权重的后缀
+  （`.bin/.json/.md/.safetensors/…`）直接跳过，一次文件都不开。为什么不干脆全部读魔数：
+  blobs 目录里那 7 个 manifest/vconfig 也是无后缀的 `sha256-*`，全读等于白烧 IO，
+  而且靠大小猜「这个 120 字节的 sha256 是模型」会造出一堆打不开的假条目。
+- **单独一趟 Ollama 清单解析**（`ollamaModelRoots` + `scanOllamaModels`）。不去 blobs 里猜，
+  而是读 `manifests/` 与 `manifests-v2/`，只取 `mediaType === application/vnd.ollama.image.model`
+  的层（明确排除 adapter/mmproj/projector 层），拿它的 digest 指回 `blobs/sha256-<digest>`。
+  这样三件事同时解决了：**名字**（路径 `<host>/<ns>/<name>/<tag>` 还原成 `qwen3:14b`，
+  `latest` 不加冒号）、**一个 blob 多 tag**（合并成一条，`tags` 列全）、**体积**
+  （manifest 声明的 size 兜底，stat 拿不到也不至于 0）。根目录顺序：`OLLAMA_MODELS`
+  环境变量排最前（很多人把 ollama 库指到大盘），然后 Windows
+  `~/AI/models/ollama`・`%LOCALAPPDATA%\ollama\models`・`~/.ollama/models`，macOS
+  `~/.ollama/models`・`/usr/share/ollama/.ollama/models`，Linux 再加
+  `/usr/lib/ollama/models`・`/opt/ollama/models`。**判定「是不是 ollama 库」看有没有
+  `manifests`/`manifests-v2`/`blobs`** —— 一个恰好叫 ollama 的普通目录不会被误认。
+- **按 inode 去重**。同一份权重被硬链接到多处（ollama 与 workbuddy 共用盘时很常见）只列一次，
+  赢家按「有没有名字」定：有 tag 的胜过 `sha256-…` 的；同名同 inode 时 ollama 的元数据会
+  **合并进已有条目**（`mergeDuplicate`：补 tags、把 `sha256-*` 的名字换成可读名、补体积），
+  而不是丢掉 ollama 那份信息。拿不到 `dev/ino`（假 fs、老内核）就退化成不去重，绝不瞎合并。
+- **读 `<root>/metadata/sha256-<digest>.json` 的 kv**，带出 `general.name`、
+  `general.architecture`、`<arch>.context_length`、量化标签。前端一行现在长这样：
+  `qwen3:14b  [Ollama]  Q4_K_M  8.64G`。
+- `models` 路由的每条结果新增 `source / origin / tags / readableName / engine / port /
+  quantization / architecture / modelName / contextLength`（后五个没读到就不带，不给前端
+  造一堆空字段）。
+
+### 变更
+
+- **`adoptPanel` 不再要求 `.gguf` 后缀**，改成三条判据：扩展名 → Ollama 清单里的名字 →
+  文件头魔数，任一命中就放行；都不中才拒，且错误文案把三条都列出来（老文案只提 `.gguf`，
+  用户看着自己硬盘上明明白白的模型却说「不是 gguf」，等于把 bug 报给用户）。
+- **选中 Ollama 的模型时走 ollama，不再另起一份 llama-server**。这是这一版真正的取舍：
+  blob 本身是合法 GGUF，硬喂 llama.cpp 也能起 —— 但那意味着同一个模型在显存里存在两份，
+  还绕过 ollama 的加载与调度。所以插件只做「确认 11434 有 ollama 在应答（没有就按已知
+  后端起 `ollama serve`）→ 用 **tag** 当模型 id → 注册成 `local-ollama-<slug>` → 试跑」。
+  **用户显式填了别的端口就不抢**：那是要拿这份文件再起一个服务，照旧传路径走 llama.cpp。
+  前端选行时端口自动跟到 `item.port`，别名提示也从「别名取文件名」变成分叉的
+  「模型名取 tag：qwen3:14b（走 Ollama 的 11434，不再起一份 llama-server）」。
+
+### 修复
+
+- **`FILE_TYPE_LABELS` 量化表整体错位**：照搬了旧的 llama FILE_TYPE 序号，15 标成 `Q5_K_S`。
+  真机 `ollama show qwen3:8b` 报 **Q4_K_M**，metadata 里 `general.file_type` 是 **15** ——
+  那个数字就是 **ggml_type 枚举的原值**。按真实序号整表重写（`4/5` 是已移除的 Q4_2/Q4_3、
+  `19` 空号，都不给标签；不认识的编号也不显示，宁可少说一个标签，别说错）。
+- **Windows 上目录判定不可信**：原来用 `exists(dir + '/')` 区分文件与目录，实测
+  `existsSync('<一个文件>/')` 在 Windows 返回 **true** —— 结果每个 manifest 都被当成目录递归，
+  `scanOllamaModels` 一个模型都读不出来（`len 0`，还不报错）。改成**按内容分岔**：
+  先 `readManifest` 试读（体积 >2MB 直接跳过），JSON 里有非空 `layers` 数组就是 manifest，
+  否则才递归。顺带也不再依赖任何平台的尾斜杠语义。
+- **假 fs 不再被拉去扫真实 Ollama 目录**：单测里 `exists: () => true` 会让三个标准位置全部
+  「存在」，然后沿假树钻到 maxEntries 上限，**谎报 `truncated: true`**（打挂「没超限时不
+  谎报截断」那条断言）。现在要求显式 `ollamaRoots` 或 `ollama: true` 才跑这一趟 ——
+  传了自定义 fs 又没给 roots，就不去碰真实盘。
+
+### 测试
+
+- `test/launcher.mjs` 45 → **57 项**：tag 还原并指回 blob、量化 `Q4_K_M`、`latest` 不加冒号、
+  同 blob 多 tag 合并、blob 不在盘上就不列、只有 adapter 层不算主模型、`exists:()=>true`
+  （模拟 Windows 尾斜杠）仍能读到、主扫描与 ollama 合并后不重复、不给 roots 时不碰真实目录、
+  魔数只收无后缀大文件且 `notes.md` 一次文件都不开、`ollamaModelFor` 正反斜杠都命中 /
+  miss 与空串回 undefined / 给了 `io.models` 就不再扫盘、`ollamaModelRoots` 候选全是有效
+  字符串 + 普通同名目录不算库 + `OLLAMA_MODELS` 排最前且原样用。
+- `test/panel-host.mjs` 新增 **17b/17c/17d** 三组（adopt 一个真 blob → 端口跟到 11434、
+  `already` 复用、`model` 是 tag、provider 是 ollama 后端；三种判据都不中才挡并带回路径；
+  `models` 清单带出 tag/量化/引擎/端口/source），并在 `tmpdir` 里**现造一份真的 Ollama 存储**
+  再把 `OLLAMA_MODELS` 指过去 —— 之前这类用例的结果取决于跑测试的机器装没装 ollama，
+  现在跨机器一致。假 fetch 也按端口分叉（8090 报 `qwen3-4b`、11434 报 `qwen3:4b`），
+  否则 `pickModel` 会靠「取第一个」兜底命中，测不到 tag 精确匹配这条真实路径。
+- 真机验收（这台机器）：`scanLocalModels({depth:2, dirs:localModelDirs()})` 从 1 条变
+  **4 条 / 4ms / truncated=false** —— `local_model.gguf 15.79G(workbuddy)`、
+  `qwen3:14b 8.64G Q4_K_M(ollama)`、`qwen3:8b 4.87G Q4_K_M(ollama)`、
+  `local_model.mmproj.gguf 0.84G(视觉投影)`；`ollamaModelRoots()` 命中
+  `C:/Users/Lyonl/AI/models/ollama`（`OLLAMA_MODELS` 那条路）。
+
 
 删除键改了对象。0.4.3 把它做成了「删磁盘上的 gguf」，这是理解错了 —— 需要的从来不是删
 15.8GB 的权重文件，而是清掉 `llm-pi-ai` 里那几条僵尸 provider：指向一个从没起来过的端口、

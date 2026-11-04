@@ -13,8 +13,53 @@
 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 
 process.env.DSH_LOCAL_TRIM_LOG = join(tmpdir(), 'dsh-local-trim.panel-host.log')
+
+// ── Ollama 存储 fixture ────────────────────────────────────────────────
+// 第 17b/17d 组要验证「adopt 一个 blob 路径 → 认出 tag → 走 11434」，而 lib/index.js
+// 调 ollamaModelFor 时不带 io（读真实 fs）。所以这里在临时目录里现造一份真的
+// ollama 存储（manifests 树 + blobs 里的 GGUF 头 + metadata kv），再把
+// OLLAMA_MODELS 指过去 —— 结果只取决于这份 fixture，不取决于跑测试的机器
+// 装没装 ollama，跨 CI 稳定。目录名带 ollama：walk 的下钻词才认它。
+const OLLAMA_FIXTURE_ROOT = join(tmpdir(), 'ollama-fixture')
+const OLLAMA_BLOB_HEX = 'f'.repeat(64)
+const OLLAMA_BLOB_PATH = join(OLLAMA_FIXTURE_ROOT, 'blobs', 'sha256-' + OLLAMA_BLOB_HEX)
+// manifests 的路径语义是 `<host>/<ns>/<name>/<tag>`：文件叫 4b，插件才还原成 qwen3:4b。
+const OLLAMA_TAG_FILE = '4b'
+const OLLAMA_TAG = 'qwen3:4b'
+{
+  const manifestDir = join(OLLAMA_FIXTURE_ROOT, 'manifests', 'registry.ollama.ai', 'library', 'qwen3')
+  mkdirSync(manifestDir, { recursive: true })
+  mkdirSync(join(OLLAMA_FIXTURE_ROOT, 'blobs'), { recursive: true })
+  mkdirSync(join(OLLAMA_FIXTURE_ROOT, 'metadata'), { recursive: true })
+  const digest = 'sha256:' + OLLAMA_BLOB_HEX
+  writeFileSync(
+    join(manifestDir, OLLAMA_TAG_FILE),
+    JSON.stringify({
+      schemaVersion: 2,
+      layers: [
+        { mediaType: 'application/vnd.ollama.image.model', digest, size: 4096 },
+        { mediaType: 'application/vnd.ollama.image.template', digest: 'sha256:' + 'b'.repeat(64), size: 1723 },
+      ],
+    }),
+  )
+  // blob 真文件：前 4 字节给魔数兜底用，后面全是零（这条路径不该被喂给 llama-server）。
+  writeFileSync(OLLAMA_BLOB_PATH, Buffer.concat([Buffer.from('GGUF'), Buffer.alloc(4092)]))
+  writeFileSync(
+    join(OLLAMA_FIXTURE_ROOT, 'metadata', 'sha256-' + OLLAMA_BLOB_HEX + '.json'),
+    JSON.stringify({
+      kv: {
+        'general.architecture': 'qwen3',
+        'general.name': 'Qwen3 4B',
+        'general.file_type': 15,
+        'qwen3.context_length': 40960,
+      },
+    }),
+  )
+  process.env.OLLAMA_MODELS = OLLAMA_FIXTURE_ROOT.replaceAll('\\', '/')
+}
 
 const { apply } = await import('../lib/index.js')
 
@@ -27,6 +72,10 @@ const check = (label, ok, extra = '') => {
 // ── 假后端 ──────────────────────────────────────────────────────────────
 
 const MODELS = { object: 'list', data: [{ id: 'qwen3-4b', meta: { n_ctx: 32768, n_predict: 4096 } }] }
+// 11434 上的是 Ollama：它按 tag 报模型 id（带冒号），和 8090 上 llama-server 报的
+// 文件名不一样。两个端口给不同的 id，`pickModel` 才真的是「精确命中 tag」，
+// 而不是靠兜底取第一个混过去。
+const OLLAMA_MODELS = { object: 'list', data: [{ id: OLLAMA_TAG, meta: { name: OLLAMA_TAG } }] }
 const CHAT = {
   choices: [{ message: { content: '好' }, finish_reason: 'stop' }],
   usage: { prompt_tokens: 12, completion_tokens: 1 },
@@ -50,7 +99,11 @@ const fakeFetch = async (url, init) => {
     throw error
   }
   if (target.endsWith('/v1/models')) {
-    return { ok: true, status: 200, text: async () => JSON.stringify(MODELS) }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify(port === '11434' ? OLLAMA_MODELS : MODELS),
+    }
   }
   if (target.endsWith('/v1/chat/completions')) {
     return { ok: true, status: 200, text: async () => JSON.stringify(CHAT) }
@@ -333,11 +386,14 @@ console.log('\n=== 14. adopt：没选模型文件时直接说清楚 ===')
   check('要求先选 .gguf', /先选一个本机模型文件/.test(body.error ?? ''), body.error ?? '')
 }
 
-console.log('\n=== 15. adopt：非 gguf 文件被挡下 ===')
+console.log('\n=== 15. adopt：既不是 .gguf 也不是 GGUF 文件头的，挡下 ===')
 {
+  // v0.4.5：校验不再看扩展名，改看文件头，所以一个真的 .bin 权重是能用的；
+  // 这里用的是一个不存在的文件，两边都不中，必须被拒。
   const { body } = await callRoute('adopt', { modelPath: 'C:/tmp/model.bin' })
   check('ok=false', body.ok === false)
-  check('只认 .gguf', /只能选 .gguf/.test(body.error ?? ''), body.error ?? '')
+  check('说清两种判定都没过', /不是 GGUF/.test(body.error ?? ''), body.error ?? '')
+  check('把路径带回报错', /model\.bin/.test(body.error ?? ''), body.error ?? '')
 }
 
 console.log('\n=== 16. adopt：mmap 装得下的 15.8GB 模型不再被误判 risky ===')
@@ -408,6 +464,46 @@ console.log('\n=== 17. adopt：确认后继续，端口已经在跑就跳过拉�
   check('provider 注册上了', body.registered === true, String(body.registered))
   check('试跑成功', body.smoke?.ok === true, JSON.stringify(body.smoke?.error ?? ''))
   check('带回预检结论给前端展示', typeof body.fit?.label === 'string', String(body.fit?.level))
+}
+
+console.log('\n=== 17b. adopt：Ollama 的 blob 走 11434，不再起一份 llama-server ===')
+{
+  // 这条覆盖 v0.4.5 的主线：blob 没有 .gguf 后缀，但它在 ollama manifest 里有名字。
+  const { status, body } = await callRoute('adopt', {
+    modelPath: OLLAMA_BLOB_PATH,
+    port: 11434,
+    contextWindow: 32768,
+    overwrite: true,
+  })
+  check('200 + ok', status === 200 && body.ok === true, JSON.stringify(body.error ?? '') + ' stage=' + (body.stage ?? ''))
+  check('端口跟着 Ollama 走', body.port === 11434, String(body.port))
+  check('复用了已在应答的 11434，没另起进程', body.launch?.already === true, String(body.launch?.already))
+  check('模型 id 用的是 tag，不是 sha256 文件名', body.model === OLLAMA_TAG, String(body.model))
+  check('注册成 ollama 后端', /ollama/.test(String(body.provider)), String(body.provider))
+  check('试跑了', body.smoke?.ok === true, JSON.stringify(body.smoke ?? {}))
+}
+
+console.log('\n=== 17c. adopt：三种判据都不中时才挡，并把路径带回 ===')
+{
+  const { body } = await callRoute('adopt', { modelPath: join(tmpdir(), 'definitely-not-a-model.bin') })
+  check('ok=false', body.ok === false)
+  check('说清扩展名/清单/文件头都不中', /不是 GGUF/.test(body.error ?? '') && /Ollama/.test(body.error ?? ''), body.error ?? '')
+  check('把路径带回报错', /definitely-not-a-model\.bin/.test(body.error ?? ''), body.error ?? '')
+}
+
+console.log('\n=== 17d. models：清单里带出 Ollama 的可读名、量化与来源 ===')
+{
+  const { body } = await callRoute('models', {})
+  const list = body.models ?? []
+  const hit = list.find((item) => item.name === OLLAMA_TAG)
+  check('扫到了 Ollama 的模型', hit !== undefined, list.map((item) => item.name).join(','))
+  check('名字是 tag 而不是 sha256', hit !== undefined && !/^sha256-/.test(hit.name), String(hit?.name))
+  check('带 tags 数组', Array.isArray(hit?.tags) && hit.tags.includes(OLLAMA_TAG), JSON.stringify(hit?.tags ?? []))
+  check('带量化标签（file_type 15 → Q4_K_M）', hit?.quantization === 'Q4_K_M', String(hit?.quantization))
+  check('带引擎与端口', hit?.engine === 'ollama' && hit?.port === 11434, String(hit?.engine) + ':' + String(hit?.port))
+  check('带可读名', typeof hit?.readableName === 'string' && hit.readableName.length > 0, String(hit?.readableName))
+  check('每条都有 source（前端靠它分辨来源）', list.every((item) => typeof item.source === 'string'))
+  check('每条都带 fit', list.every((item) => typeof item.fit?.level === 'string'))
 }
 
 console.log('\n=== 18. stop：只停自己起过的，别人的一概不动 ===')
