@@ -347,12 +347,19 @@ window.__ModuleLoader__.load({
       const allModels = Array.isArray(scan?.models) ? scan.models : []
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
       const chosen = models.find((item) => item.path === form.modelPath)
-      const gib = (bytes) => (Number(bytes) > 0 ? (Number(bytes) / 1073741824).toFixed(1) + 'GB' : '?')
+      const gib = (bytes) => {
+        const value = Number(bytes)
+        if (!Number.isFinite(value) || value <= 0) return '?'
+        if (value >= 1073741824) return (value / 1073741824).toFixed(1) + 'GB'
+        if (value >= 1048576) return Math.round(value / 1048576) + 'MB'
+        return Math.round(value / 1024) + 'KB'
+      }
       const fit = chosen?.fit
       const heavy = fit?.level === 'risky'
       // 删文件不可撤销，点一次只进入「确认」态，第二次才真删。
       const [pendingDelete, setPendingDelete] = React.useState('')
-      const deleting = busy.startsWith('delete:')
+      // busy 的形态是 delete:<绝对路径>，所以能判断具体哪一行在删。
+      const deletingPath = busy.startsWith('delete:') ? busy.slice('delete:'.length) : ''
       return h(
         'div',
         { style: { marginTop: 14 } },
@@ -445,6 +452,8 @@ window.__ModuleLoader__.load({
                         disabled: busy !== '' || item.mmproj === true,
                         onClick: () => {
                           if (item.mmproj === true) return
+                          // 点别的行 = 放弃那次「确认删除？」
+                          if (pendingDelete !== '' && pendingDelete !== item.path) setPendingDelete('')
                           setForm({ ...form, modelPath: item.path })
                         },
                       },
@@ -477,7 +486,7 @@ window.__ModuleLoader__.load({
                           onDelete(item)
                         },
                       },
-                      deleting && askDelete
+                      deletingPath === item.path
                         ? '删除中…'
                         : askDelete
                           ? '确认删除？'
@@ -914,10 +923,15 @@ window.__ModuleLoader__.load({
               setMessage({ tone: 'bad', text: '没删成：' + String(result.error ?? '不知道原因') })
               return
             }
+            const bytes = Number(result.freedBytes)
             const freed =
-              Number(result.freedBytes) > 0
-                ? (Number(result.freedBytes) / 1073741824).toFixed(1) + 'GB'
-                : ''
+              !Number.isFinite(bytes) || bytes <= 0
+                ? ''
+                : bytes >= 1073741824
+                  ? (bytes / 1073741824).toFixed(1) + 'GB'
+                  : bytes >= 1048576
+                    ? Math.round(bytes / 1048576) + 'MB'
+                    : Math.round(bytes / 1024) + 'KB'
             const extra =
               Array.isArray(result.users) && result.users.length > 0
                 ? '；还有 provider 指着它：' + result.users.join('、') + '（配置没动）'

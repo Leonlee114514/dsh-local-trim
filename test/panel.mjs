@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 
 import {
   buildPanelStatus,
+  formatBytes,
   formatCount,
   isLocalProvider,
   summarizeTakeover,
@@ -118,6 +119,17 @@ await ok('云端 provider 不算本地', () => {
 await ok('千分位格式化', () => {
   assert.equal(formatCount(43247), '43,247')
   assert.equal(formatCount(undefined), '—')
+})
+
+await ok('体积按量级换单位，不把 2MB 显示成 0.0GB', () => {
+  assert.equal(formatBytes(16954484384), '15.8GB')
+  assert.equal(formatBytes(2 * 1024 * 1024), '2MB')
+  assert.equal(formatBytes(512 * 1024), '512KB')
+  assert.equal(formatBytes(1073741824), '1.0GB')
+  // 拿不到体积时是问号，不是 0GB —— 别让「不知道」看起来像「零字节」
+  assert.equal(formatBytes(0), '?')
+  assert.equal(formatBytes(undefined), '?')
+  assert.equal(formatBytes(-1), '?')
 })
 
 await ok('面板主视图把三件事拼齐', () => {
