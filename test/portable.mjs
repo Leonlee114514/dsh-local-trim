@@ -324,7 +324,8 @@ await ok('LM Studio 用 lms server start，不需要先给模型', async () => {
   // 它自带 `lms server start`，模型是运行时按请求加载的。
   const plan = planLaunch({
     port: 1234,
-    existsSync: (p) => String(p).endsWith('lms.exe'),
+    // macOS 上 exeName('lms') 不带后缀，写死 .exe 只会在 Windows 上过。
+    existsSync: (p) => String(p).endsWith(exeName('lms')),
   })
   assert.equal(plan.ok, true)
   assert.equal(plan.id, 'lmstudio')
@@ -334,7 +335,7 @@ await ok('LM Studio 用 lms server start，不需要先给模型', async () => {
 await ok('ollama 的固定参数不受 args 函数化影响', async () => {
   const plan = planLaunch({
     port: 11434,
-    existsSync: (p) => String(p).endsWith('ollama.exe'),
+    existsSync: (p) => String(p).endsWith(exeName('ollama')),
   })
   assert.equal(plan.ok, true)
   assert.deepEqual(plan.args, ['serve'])

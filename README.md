@@ -797,7 +797,8 @@ reserveMb: 1024
 npm run verify                  # = check + test，8 个文件语法 + 7 套测试
 npm run check                   # 只跑 node --check（lib/*.js + client.js + test/platform-sim.mjs）
 npm test                        # 只跑测试（unit + portable + host）
-npm run test:portable           # 只跑跨平台推演（linux / darwin / win32 各一遍）
+npm run test:portable           # 只跑跨平台候选表推演（linux / darwin / win32 各一遍）
+npm run test:sim                # 假装自己是 linux / darwin，把整套测试再跑一遍
 
 node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
@@ -809,7 +810,14 @@ node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探
 node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径
 node test/platform-sim.mjs darwin   # 同上，macOS
 node test/platform-sim.mjs win32    # 同上，Windows（本机就是，但断言的是「全 .exe」）
+node test/run-sim.mjs           # 上面那三套 + launcher / panel-host，按 linux + darwin 各一遍
 ```
+
+`test/run-sim.mjs` 把同一招用到**整套**测试上：它用 `child_process` 起子进程并显式传
+`DSH_SIM_PLATFORM`，而不是写 `DSH_SIM_PLATFORM=linux node …` —— 那种前缀语法只在
+POSIX shell 成立，Windows 的 npm script 会直接报「不是内部或外部命令」。这一步存在的理由
+很具体：`test/portable.mjs` 里曾断言 `endsWith("lms.exe")`，macOS runner 上
+`exeName()` 不加后缀就红，而本机是 Windows，永远踩不到。
 
 `test/platform-sim.mjs` 靠 `Object.defineProperty(process, "platform", …)` 在 import
 之前改平台 —— `lib/launcher.js` 顶部的 `const WIN = process.platform === 'win32'` 是

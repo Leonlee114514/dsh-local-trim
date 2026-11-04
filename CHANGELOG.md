@@ -104,6 +104,12 @@
   的唯一办法：`os.homedir()` 骗不到，所以家目录只断言格式不断言前缀。
 - CI 增加 `Cross-platform paths, GPU detection, --help capability probing` 与
   `Platform simulation (linux / darwin / win32 candidate tables)` 两步；
+- `test/fake-platform.mjs` + `test/run-sim.mjs`：用 `--import` 预加载改掉
+  `process.platform`，把**整套测试**（不只候选表）按 linux / darwin 再跑一遍。
+  这一层是被真机 CI 逼出来的：`test/portable.mjs` 里断言写 `endsWith("lms.exe")`，
+  在 macOS runner 上 `exeName()` 不加后缀，直接红 —— 而本机是 Windows，永远发现不了。
+  入口用 `node test/run-sim.mjs`，不是 `DSH_SIM_PLATFORM=… node …`：后者的前缀语法
+  只在 POSIX shell 成立，Windows 的 npm script 会报「不是内部或外部命令」。
   另起一个 `cross-platform` job 在 **真的** `windows-latest` 与 `macos-latest` 上跑
   （Node 22，不参与 3×3 矩阵）：平台推演再像，也不等于真机 —— `homeDir()`、PATH 分隔符、
   可执行文件后缀这些只有真跑才知道。

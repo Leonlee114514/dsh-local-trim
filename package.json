@@ -54,12 +54,13 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "npm run test:unit && npm run test:portable && npm run test:host",
+    "test": "npm run test:unit && npm run test:portable && npm run test:sim && npm run test:host",
     "test:unit": "node test/launcher.mjs && node test/portable.mjs && node test/panel.mjs && node test/selfcheck.mjs && node test/provision.mjs && node test/autodetect.mjs",
     "test:host": "node test/panel-host.mjs",
-    "check": "node --check lib/index.js && node --check lib/launcher.js && node --check lib/bridge.js && node --check lib/config.js && node --check lib/defaults.js && node --check lib/status.js && node --check lib/import-model.js && node --check client.js && node --check test/platform-sim.mjs",
+    "check": "node --check lib/index.js && node --check lib/launcher.js && node --check lib/bridge.js && node --check lib/config.js && node --check lib/defaults.js && node --check lib/status.js && node --check lib/import-model.js && node --check client.js && node --check test/platform-sim.mjs && node --check test/fake-platform.mjs && node --check test/run-sim.mjs",
     "verify": "npm run check && npm test",
-    "test:portable": "node test/platform-sim.mjs linux && node test/platform-sim.mjs darwin && node test/platform-sim.mjs win32"
+    "test:portable": "node test/platform-sim.mjs linux && node test/platform-sim.mjs darwin && node test/platform-sim.mjs win32",
+    "test:sim": "node test/run-sim.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/schemastery": "^3.18.5"

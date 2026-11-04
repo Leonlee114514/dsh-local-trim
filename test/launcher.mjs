@@ -346,7 +346,9 @@ await ok('自选端口 + 指定 gguf：端口按用户填的走，报回来的�
     port: 8095,
     modelPath: 'C:/models/local_model.gguf',
     ctx: 65536,
-    existsSync: (target) => /llama-server\.exe$/.test(target) || /^[A-Za-z]:\//.test(target),
+    // 断言的是端口/别名传递，不是这台机器装没装；可执行文件名要按平台生成，
+    // 否则非 Windows 上 exeName() 不带 .exe，注入的假文件系统一个都匹配不上。
+    existsSync: (target) => String(target).endsWith(exeName('llama-server')) || /^[A-Za-z]:\//.test(target),
     listDir: (dir) => (/\/bin$/.test(dir) ? ['b11012'] : []),
   })
   assert.equal(plan.ok, true, plan.error)
@@ -456,7 +458,9 @@ await ok('planLaunch 把 loadMode 透传到参数里', async () => {
     port: 8095,
     modelPath: 'C:/m/big.gguf',
     loadMode: 'none',
-    existsSync: (target) => /llama-server\.exe$/.test(target) || /^[A-Za-z]:\//.test(target),
+    // 断言的是端口/别名传递，不是这台机器装没装；可执行文件名要按平台生成，
+    // 否则非 Windows 上 exeName() 不带 .exe，注入的假文件系统一个都匹配不上。
+    existsSync: (target) => String(target).endsWith(exeName('llama-server')) || /^[A-Za-z]:\//.test(target),
     listDir: (dir) => (/\/bin$/.test(dir) ? ['b11012'] : []),
   })
   assert.equal(plan.ok, true, plan.error)
@@ -469,7 +473,9 @@ await ok('noMmap 作为兼容入口，转成 --load-mode none', async () => {
     port: 8095,
     modelPath: 'C:/m/big.gguf',
     noMmap: true,
-    existsSync: (target) => /llama-server\.exe$/.test(target) || /^[A-Za-z]:\//.test(target),
+    // 断言的是端口/别名传递，不是这台机器装没装；可执行文件名要按平台生成，
+    // 否则非 Windows 上 exeName() 不带 .exe，注入的假文件系统一个都匹配不上。
+    existsSync: (target) => String(target).endsWith(exeName('llama-server')) || /^[A-Za-z]:\//.test(target),
     listDir: (dir) => (/\/bin$/.test(dir) ? ['b11012'] : []),
   })
   assert.equal(plan.ok, true, plan.error)

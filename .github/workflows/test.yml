@@ -65,6 +65,12 @@ jobs:
           node test/platform-sim.mjs linux
           node test/platform-sim.mjs darwin
           node test/platform-sim.mjs win32
+
+      # platform-sim 只验候选表。这一步验的是「用例自己有没有写死 Windows 假设」——
+      # 真机 macOS CI 上就踩过：断言写 lms.exe，darwin 上 exeName() 不加后缀，必红。
+      # fake-platform.mjs 必须用 --import 预加载，process.platform 在模块求值时就读掉了。
+      - name: Whole suite under a simulated platform (linux / darwin)
+        run: npm run test:sim
       - name: Manifest is loadable
         run: |
           node --input-type=module -e "
