@@ -826,8 +826,14 @@ POSIX shell 成立，Windows 的 npm script 会直接报「不是内部或外部
 
 `test/platform-sim.mjs` 靠 `Object.defineProperty(process, "platform", …)` 在 import
 之前改平台 —— `lib/launcher.js` 顶部的 `const WIN = process.platform === 'win32'` 是
-import 时求值的，改掉之后整个模块都会按目标平台展开。有两点做不到：`os.homedir()`
-查的是真实 OS（所以家目录只断言格式，不断言前缀），`process.env.PATH` 也还是本机的。
+import 时求值的，改掉之后整个模块都会按目标平台展开。
+
+`os.homedir()` 也能骗，但有坑：真实 Windows 上它只读 `USERPROFILE`（删掉反而退回
+真实家目录，`HOME` 根本不看），Linux/macOS 才读 `HOME`。一开始只改 `HOME`，模拟 darwin
+时家目录仍是 `C:/Users/<你>`，候选表里混进一堆 `C:/...` —— 而那正是要抓的东西，等于
+这套测试白跑。现在 `test/fake-platform.mjs` 把两个变量都指到 `/sim/nobody`，并且有三条
+用例专门断言「家目录里没有本机真实路径」。剩下骗不到的只有 `process.env.PATH`、真实文件
+系统和 `nvidia-smi`；把这三样也删掉的是 `test/stranger.mjs`。
 
 `test/panel.mjs` 只测纯逻辑：`lib/status.js`（接管文案、收益计算、provider 判定与点灯计数）
 和 `lib/import-model.js`（入参校验、provider id 生成、profile 拼装、试跑请求与四类失败分支，

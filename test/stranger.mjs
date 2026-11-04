@@ -29,13 +29,14 @@ for (const platform of platforms) {
 
   // 隔离进程：只保留能跑 node 的最小环境
   Object.defineProperty(process, 'platform', { value: platform, configurable: true })
-  if (platform === 'win32') {
-    process.env.USERPROFILE = 'C:' + BACKSLASH + 'nobody'
-    delete process.env.HOME
-  } else {
-    process.env.HOME = '/home/nobody'
-    delete process.env.USERPROFILE
-  }
+  // os.homedir() 的行为跟「真实 OS」绑定，不跟 process.platform 绑定：
+  // 在本机（真 Windows）上它只认 USERPROFILE，HOME 完全不看，删掉 USERPROFILE
+  // 还会退回真实的 C:/Users/<你>。所以两个变量都指到假目录，三平台才能一致。
+  const fakeHome = platform === 'win32' ? 'C:' + BACKSLASH + 'nobody' : '/home/nobody'
+  process.env.USERPROFILE = fakeHome
+  process.env.HOME = fakeHome
+  process.env.HOMEDRIVE = platform === "win32" ? "C:" : ""
+  process.env.HOMEPATH = platform === "win32" ? BACKSLASH + "nobody" : ""
   delete process.env.LOCALAPPDATA
   delete process.env.APPDATA
   delete process.env.XDG_DATA_HOME
@@ -55,7 +56,15 @@ for (const platform of platforms) {
 
   console.log(LF + '=== 陌生机器（' + platform + '）：删掉本机所有有利条件 ===')
 
-  const paths = { homeDir: m.homeDir(), dataDir: m.dataDir() }
+  const home = m.homeDir()
+  record(
+    home.length > 0 && !home.includes('Lyonl') && !home.includes('Users/')
+      ? true
+      : false,
+    "家目录已经被换成假的（没有泄漏本机真实家目录）",
+    home,
+  )
+  const paths = { homeDir: home, dataDir: m.dataDir() }
   for (const [name, value] of Object.entries(paths)) {
     const clean =
       typeof value === 'string' &&

@@ -106,6 +106,10 @@
   `Platform simulation (linux / darwin / win32 candidate tables)` 两步；
 - `test/fake-platform.mjs` + `test/run-sim.mjs`：用 `--import` 预加载改掉
   `process.platform`，把**整套测试**（不只候选表）按 linux / darwin 再跑一遍。
+  `os.homedir()` 也是可以骗的，但必须改对变量：真实的 Windows 上它只认
+  `USERPROFILE`（删掉反而退回真实家目录，`HOME` 完全不看），Linux/macOS 认 `HOME`。
+  一开始只改 `HOME`，模拟 darwin 时家目录仍是 `C:/Users/<你>`，候选表里混进一堆
+  `C:/...` —— 而这正是要抓的东西，等于这套测试白跑。现在两个都指到 `/sim/nobody`。
   这一层是被真机 CI 逼出来的：`test/portable.mjs` 里断言写 `endsWith("lms.exe")`，
   在 macOS runner 上 `exeName()` 不加后缀，直接红 —— 而本机是 Windows，永远发现不了。
   入口用 `node test/run-sim.mjs`，不是 `DSH_SIM_PLATFORM=… node …`：后者的前缀语法
