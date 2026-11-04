@@ -9,10 +9,13 @@ import assert from 'node:assert/strict'
 
 import {
   KNOWN_LAUNCHERS,
+  LOAD_MODES,
   checkModelFit,
+  detectGpuBytes,
   envPathValue,
   isProcessAlive,
   mergeEnv,
+  normalizeLoadMode,
   planLaunch,
   portOfBaseURL,
   runDetached,
@@ -351,29 +354,46 @@ await ok('launcher 表里端口不重复', async () => {
 
 const GIB = 1024 * 1024 * 1024
 
-await ok('模型比整机内存还大 → risky，且说人话', async () => {
-  const fit = checkModelFit({ sizeBytes: 17 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 8 * GIB })
+await ok('显存 + 内存都装不下 → risky（唯一的硬拦）', async () => {
+  // 30GB 模型、16GB 内存、8GB 显存：哪边都接不住
+  const fit = checkModelFit({ sizeBytes: 30 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 8 * GIB, gpuBytes: 8 * GIB })
   assert.equal(fit.level, 'risky')
-  assert.match(fit.label, /比整机内存/)
-  assert.match(fit.label, /17GB|16GB/)
+  assert.match(fit.label, /都装不下/)
 })
 
-await ok('模型吃掉可用预算八成 → risky', async () => {
-  // 16GB 整机、系统留 2GB → 预算 14GB；模型 12GB 占 86%
-  const fit = checkModelFit({ sizeBytes: 12 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 8 * GIB })
-  assert.equal(fit.level, 'risky')
-  assert.equal(fit.ratio, 0.86)
+await ok('显存挑大梁、内存只接零头 → ok（v0.4.0 在这里误判成 risky）', async () => {
+  // 这台机器的真实数：16.9GB gguf、16.37GB 可见内存、14.5GB 显存
+  // 显存外只剩 2.4GB，预算 14.37GB → ratio 0.17
+  const fit = checkModelFit({
+    sizeBytes: 16954484384,
+    totalMemBytes: Math.round(16.37 * GIB),
+    freeMemBytes: Math.round(1.2 * GIB),
+    gpuBytes: Math.round(14.5 * GIB),
+  })
+  assert.equal(fit.level, 'ok', fit.label)
+  assert.ok(fit.ratio < 0.5, 'ratio=' + fit.ratio)
+  assert.ok(fit.hostBytes < 4 * GIB, 'hostBytes=' + fit.hostBytes)
 })
 
-await ok('模型占一半到八成 → warn，不拦', async () => {
-  // 预算 14GB，模型 9GB 占 64%
-  const fit = checkModelFit({ sizeBytes: 9 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 8 * GIB })
-  assert.equal(fit.level, 'warn')
-  assert.match(fit.label, /加载时会卡一下/)
+await ok('显存外的部分超过内存预算 → warn（mmap 能跑，只是开头慢）', async () => {
+  // 22GB 模型、8GB 显存 → 显存外 14GB，预算 14GB → ratio 1.0；总量 22 < 16+8=24 还能塞下
+  const fit = checkModelFit({ sizeBytes: 22 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 8 * GIB, gpuBytes: 8 * GIB })
+  assert.equal(fit.level, 'warn', fit.label)
+  assert.match(fit.label, /mmap|慢/)
+})
+
+await ok('同样装不下，但用了 load-mode=none → risky（真吃 RAM）', async () => {
+  // 17GB 模型、2GB 显存 → 显存外 15GB，预算 14GB → ratio 1.07；总量 17 < 16+2=18 能塞下
+  const shared = { sizeBytes: 17 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 8 * GIB, gpuBytes: 2 * GIB }
+  const mmap = checkModelFit({ ...shared, loadMode: 'mmap' })
+  const anon = checkModelFit({ ...shared, loadMode: 'none' })
+  assert.equal(mmap.level, 'warn', 'mmap 只是慢：' + mmap.label)
+  assert.equal(anon.level, 'risky', '匿名内存会换页：' + anon.label)
+  assert.match(anon.label, /none|mmap/)
 })
 
 await ok('小模型 → ok', async () => {
-  const fit = checkModelFit({ sizeBytes: 2 * GIB, totalMemBytes: 32 * GIB, freeMemBytes: 20 * GIB })
+  const fit = checkModelFit({ sizeBytes: 2 * GIB, totalMemBytes: 32 * GIB, freeMemBytes: 20 * GIB, gpuBytes: 16 * GIB })
   assert.equal(fit.level, 'ok')
 })
 
@@ -385,15 +405,56 @@ await ok('拿不到体积 → unknown，不假装通过也不假装危险', asyn
   }
 })
 
-await ok('--no-mmap 只在显式要求时拼进参数', async () => {
+await ok('--load-mode 只在显式指定时拼进参数（b11012 不认 --no-mmap）', async () => {
   const plain = llamaCppAutoArgs({ modelPath: 'D:/m/a.gguf', listDir: () => [], port: 8090 })
-  assert.equal(plain.args.includes('--no-mmap'), false)
-  const paged = llamaCppAutoArgs({ modelPath: 'D:/m/a.gguf', listDir: () => [], port: 8090, noMmap: true })
-  assert.equal(paged.args.includes('--no-mmap'), true)
-  assert.equal(paged.noMmap, true)
+  assert.equal(plain.args.includes('--load-mode'), false, '默认交给引擎自己决定（auto）')
+  assert.equal(plain.args.includes('--no-mmap'), false, 'b11012 会报 invalid argument，绝不能出现')
+  const paged = llamaCppAutoArgs({ modelPath: 'D:/m/a.gguf', listDir: () => [], port: 8090, loadMode: 'none' })
+  assert.equal(paged.args.includes('--no-mmap'), false, '--no-mmap 不是合法参数')
+  assert.equal(paged.args[paged.args.indexOf('--load-mode') + 1], 'none')
+  assert.equal(paged.loadMode, 'none')
 })
 
-await ok('planLaunch 把 noMmap 透传到参数里', async () => {
+await ok('normalizeLoadMode 只认白名单里的五个值', async () => {
+  assert.equal(normalizeLoadMode('MMAP'), 'mmap')
+  assert.equal(normalizeLoadMode('  Mmap+Mlock '), 'mmap+mlock')
+  assert.equal(normalizeLoadMode('auto'), 'auto')
+  assert.equal(normalizeLoadMode('nope'), '')
+  assert.equal(normalizeLoadMode(undefined), '')
+  assert.equal(normalizeLoadMode(null), '')
+  for (const mode of LOAD_MODES) assert.equal(normalizeLoadMode(mode), mode, mode)
+})
+
+await ok('detectGpuBytes：从 nvidia-smi 读总量，拿不到就退化成 0', async () => {
+  const calls = []
+  const fakeExec = (command, args) => {
+    calls.push([command, ...args].join(' '))
+    return '14848\n'
+  }
+  assert.equal(detectGpuBytes(fakeExec), 14848 * 1024 * 1024)
+  assert.match(calls[0] ?? '', /memory.total/)
+
+  // 没装 nvidia-smi、或者驱动不报 —— 不能抛，只能返回 0 让预检退化成「不算显存」
+  assert.equal(detectGpuBytes(() => { throw new Error('ENOENT') }), 0)
+  assert.equal(detectGpuBytes(() => ''), 0)
+  assert.equal(detectGpuBytes(() => '[N/A]\n'), 0)
+  assert.equal(detectGpuBytes(() => '   \n'), 0)
+})
+
+await ok('planLaunch 把 loadMode 透传到参数里', async () => {
+  const plan = planLaunch({
+    port: 8095,
+    modelPath: 'C:/m/big.gguf',
+    loadMode: 'none',
+    existsSync: (target) => /llama-server\.exe$/.test(target) || /^[A-Za-z]:\//.test(target),
+    listDir: (dir) => (/\/bin$/.test(dir) ? ['b11012'] : []),
+  })
+  assert.equal(plan.ok, true, plan.error)
+  assert.equal(plan.args.includes('--no-mmap'), false, '任何情况下都不能拼 --no-mmap')
+  assert.equal(plan.args[plan.args.indexOf('--load-mode') + 1], 'none')
+})
+
+await ok('noMmap 作为兼容入口，转成 --load-mode none', async () => {
   const plan = planLaunch({
     port: 8095,
     modelPath: 'C:/m/big.gguf',
@@ -402,7 +463,8 @@ await ok('planLaunch 把 noMmap 透传到参数里', async () => {
     listDir: (dir) => (/\/bin$/.test(dir) ? ['b11012'] : []),
   })
   assert.equal(plan.ok, true, plan.error)
-  assert.equal(plan.args.includes('--no-mmap'), true)
+  assert.equal(plan.args.includes('--no-mmap'), false, 'v0.4.1：--no-mmap 是非法参数，转成 --load-mode none')
+  assert.equal(plan.args[plan.args.indexOf('--load-mode') + 1], 'none')
 })
 
 // ── 停进程（只能起不能停的补丁） ────────────────────────────────────────

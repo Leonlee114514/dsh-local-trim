@@ -402,7 +402,7 @@ window.__ModuleLoader__.load({
           : h(
               'div',
               { style: { ...(heavy ? S.bad : S.hint), margin: '2px 0 6px' } },
-              fit.label + (heavy ? '（会改用 --no-mmap 分页加载，速度慢但不容易拖死）' : ''),
+              fit.label + (heavy ? '（真要起就得确认一次；走 mmap 的话只是开头慢，内存可回收）' : ''),
             ),
         models.length === 0
           ? null
@@ -432,6 +432,22 @@ window.__ModuleLoader__.load({
                 }),
                 '保留思考模式',
               ),
+              // 加载方式：空 = 交给 llama.cpp 自己决定（auto）。别默认关 mmap——
+              // gguf 走 mmap 落在可回收的 page cache，关掉才是真吃满内存。
+              h(
+                'select',
+                {
+                  style: { ...S.select, maxWidth: 190 },
+                  value: String(form.loadMode ?? ''),
+                  title: '--load-mode：auto=引擎自己决定，mmap=分页读盘（默认最稳），none=全量进内存',
+                  onChange: (event) => setForm({ ...form, loadMode: event.target.value }),
+                },
+                h('option', { value: '' }, '加载方式：自动'),
+                h('option', { value: 'mmap' }, 'mmap（推荐）'),
+                h('option', { value: 'none' }, 'none（全量进内存）'),
+                h('option', { value: 'mlock' }, 'mlock（锁页）'),
+                h('option', { value: 'mmap+mlock' }, 'mmap+mlock'),
+              ),
             ),
         models.length === 0
           ? null
@@ -448,7 +464,7 @@ window.__ModuleLoader__.load({
                       checked: form.confirmHeavy === true,
                       onChange: (event) => setForm({ ...form, confirmHeavy: event.target.checked }),
                     }),
-                    '我知道会很卡，还是要起',
+                    '我知道会很慢，还是要起',
                   )
                 : null,
               h(
@@ -461,7 +477,7 @@ window.__ModuleLoader__.load({
                 busy === 'adopt'
                   ? '起服务 + 注册 + 试跑中…（首次加载权重十几秒）'
                   : heavy && form.confirmHeavy !== true
-                    ? '模型偏大，先勾上面那行'
+                    ? '装不下，先勾上面那行'
                     : '一键配置并试跑',
               ),
               chosen === undefined
@@ -591,6 +607,8 @@ window.__ModuleLoader__.load({
       const [importResult, setImportResult] = React.useState(null)
       const [scan, setScan] = React.useState(null)
       const [adoptForm, setAdoptForm] = React.useState({
+        // 空 = 交给引擎自己决定（llama.cpp 默认 auto）；填值才会拼 --load-mode
+        loadMode: '',
         modelPath: '',
         port: 8090,
         contextWindow: 65536,
@@ -798,13 +816,16 @@ window.__ModuleLoader__.load({
             port: Number(adoptForm.port) || 8090,
             contextWindow: Number(adoptForm.contextWindow) || 65536,
             thinking: adoptForm.thinking === true,
+            confirmHeavy: adoptForm.confirmHeavy === true,
+            ...(String(adoptForm.loadMode ?? '') === '' ? {} : { loadMode: adoptForm.loadMode }),
           })
           const lines = []
           if (result.stage === 'precheck') {
             // 预检拦住：把体积、可用内存、建议动作一次说清
             lines.push('预检没通过：' + (result.error ?? ''))
             if (result.fit?.label) lines.push('· ' + result.fit.label)
-            if (result.noMmap === true) lines.push('· 确认后会改用 --no-mmap（分页读盘，慢但不吃满内存）')
+            if (typeof result.loadMode === 'string' && result.loadMode !== '')
+              lines.push('· 会用 --load-mode ' + result.loadMode + ' 起')
             setAdoptResult({ ok: false, text: lines.join('\n') })
             return
           }

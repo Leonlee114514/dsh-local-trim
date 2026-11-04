@@ -4,6 +4,48 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.4.1] - 2026-11-04
+
+v0.4.0 的资源预检建立在一个错误前提上，这一版把它连根改掉。
+
+### 修复
+
+- **`--no-mmap` 是非法参数，插件一点「一键配置」就必然起不来**（P0）。
+  实测 b11012：`llama-server.exe --no-mmap` → `error: invalid argument: --no-mmap`。
+  正确写法是 `--load-mode auto|none|mmap|mlock|mmap+mlock`（四个值用 `--version` 逐一验证均可解析）。
+  新增 `LOAD_MODES` / `normalizeLoadMode()`，`--no-mmap` 只作为旧入口被转成 `--load-mode none`，
+  再也不出现在拼出来的参数里。
+
+- **`checkModelFit` 拿 gguf 全长比内存，把能跑的机器判成 `risky`**。
+  实测这台机器：16.9GB gguf 正在跑 27.2B MoE，进程 WorkingSet 只有 285–691MB、
+  Private 19GB 全是 file-backed 可回收页，系统 Available 还有 2.2GB，不爆不换页 ——
+  因为热权重在显存里（VRAM 14289/14848MiB，util 87–93%，SM 时钟 2444/3003MHz）。
+  新的口径是**显存装不下的那部分**：`hostBytes = sizeBytes − gpuBytes`，
+  比 `max(totalmem − 2GB, freemem)`。硬拦只剩「显存 + 内存都装不下」；
+  mmap 模式下装不下判 `warn`（照跑，只是开头慢）；`none` / `mlock` 判 `risky`（真吃 RAM）。
+
+- **`detectGpuBytes()`**：`nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`，
+  失败返回 0 让预检退化成「不算显存」而不是报错。宿主侧 60 秒缓存（面板每条模型都要问）。
+  注意 `--query-compute-apps=used_memory` 在这台机器全报 `[N/A]`，只能问总量。
+
+- **面板不再谎称「会改用 --no-mmap」**。`AdoptBox` 多一个「加载方式」下拉
+  （空=引擎自己决定 / mmap / none / mlock / mmap+mlock），默认留空走 llama.cpp 的 auto ——
+  默认关 mmap 才是真吃满内存。确认勾选框文案改「我知道会很慢」。
+
+### 为什么要记这一版
+
+v0.4.0 的 `risky` 判据和 `--no-mmap` 是同一个误解的两面：把「MoE 冷启动慢」当成
+「权重太大装不下」。实测吞吐说明白了 —— 前 1000–2000 token 是预热（20 → 28 → 36 tok/s），
+之后恒定 76 tok/s（prose 75.5 / 计数 76.2 / 代码 71.9），prefill 3215 token 674 tok/s，
+预热完 IO Read 归零。判断依据是显存装不装得下，不是文件大小。
+
+### 测试
+
+- `test/launcher.mjs` 41 → 45 项：`--load-mode` 白名单与透传、`normalizeLoadMode` 六个边界、
+  `noMmap` 兼容入口、`checkModelFit` 五档全部重写（含「这台机器真实数字 → ok」那条回归）。
+- `test/panel-host.mjs` 19 → 20 组：第 16 组从「15.8GB 必然 risky」改成
+  「15.8GB + 14.5GB 显存不再被误判」+ 新增 16b「塞 40GB 体积才拦，且不改 load-mode」。
+
 ## [0.4.0] - 2026-11-04
 
 一次全量复盘之后的集中修复。触发点是一次真实的静态审计：13 项问题里有 3 个是**静默失效**
@@ -44,6 +86,7 @@
   比整机内存还大、或占 `max(freemem, totalmem − 2GB)` 的 80% 以上 → `risky`，
   **不替你起**，要勾「我知道会很卡」才继续；50%–80% → `warn`；拿不到体积 → `unknown`。
   `risky` 时自动加 `--no-mmap`（分页读盘，慢但不吃满内存）。`models` 路由每条模型也带这个结论。
+  > 这一版的口径和 `--no-mmap` 都在 0.4.1 被推翻，见上。
 
 - **`bridgeThrottleMs` 配置项**（默认 800）。重活路由两层节流：同一路由上一次没跑完直接拒，
   跑完 800ms 内再来也拒。前端连点不会在宿主机上堆叠起一堆 `llama-server`。设 0 关掉间隔限制。
@@ -79,7 +122,7 @@
 ### 测试
 
 - `test/launcher.mjs` 21 → 41 项：`mergeEnv` 大小写覆盖 / `undefined` 不覆盖、
-  `checkModelFit` 四档 + 拿不到体积、`--no-mmap` 只在显式要求时拼、`planLaunch` 透传、
+  `checkModelFit` 四档 + 拿不到体积、`--no-mmap` 只在显式要求时拼（0.4.1 起改 `--load-mode`）、`planLaunch` 透传、
   `stopProcess` 五种路径（SIGTERM 干净收尾 / 补 SIGKILL / 幂等 / 没 pid / 杀不死）、
   `isProcessAlive`（EPERM 算活着）、扫描三道上限、`envPathValue`。
 - `test/panel-host.mjs` 16 → 19 组：`adopt` 预检拦截（真实读到这台机器上的 15.8GB 文件，

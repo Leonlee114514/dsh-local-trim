@@ -408,7 +408,7 @@ provider 后面有 **试跑** 按钮，发一条「只回一个字：好」的�
 拉起的进程，还会多一个 **停止** 按钮（`SIGTERM` → 赖着不走再 `SIGKILL`）。
 别人的 `ollama serve` 不会被这里点掉 —— 服务端只肯停自己 `spawn` 过、且登记在内存表里的 pid。
 
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加了资源预检）—— 上一块要求你先有端点，可刚下完模型的
+**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据）—— 上一块要求你先有端点，可刚下完模型的
 时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个 gguf → 一键配置并试跑**。
 
 点「扫描本机模型」后插件会去这几个地方找 `.gguf`（每层最多下探两级，跳过
@@ -426,27 +426,48 @@ provider 后面有 **试跑** 按钮，发一条「只回一个字：好」的�
 选中一个模型后填端口（默认 8090）和上下文（默认 65536），点**一键配置并试跑**，
 一条链走完三件事：
 
-1. **先做资源预检**：拿模型文件体积比可用内存（`max(freemem, totalmem − 2GB)`）。
-   - 比整机内存还大，或占了可用预算 80% 以上 → 判 `risky`，**不替你起**，直接回一句
-     「模型 15.8GB 占了可用预算的 110%，首次加载会让机器明显变卡（可用 14.4GB）」，
-     要你在面板上勾「我知道会很卡，还是要起」才继续；
-   - 占 50%–80% → 判 `warn`，照起但提示；
+1. **先做资源预检**：算的是 **显存装不下的那部分**（`sizeBytes − gpuBytes`）比内存预算
+   （`max(totalmem − 2GB, freemem)`）。为什么不拿 gguf 全长去比内存 —— gguf 走 mmap 读，
+   落在**可回收的 file-backed page cache** 里，不是常驻匿名内存。这台机器实测就说明了这点：
+   16.9GB 的 gguf 跑着，进程 WorkingSet 才 285–691MB，显存 14289/14848MiB 打满，
+   系统还剩 2.2GB 可用，任务管理器不爆、不换页。
+   - **显存 + 内存都装不下** → `risky`，唯一的硬拦。那不是慢，是必然加载失败；
+   - 显存外的部分超过内存预算但走 mmap → `warn`，照起。只是开头一段明显慢
+     （专家按需从盘里换进来）；
+   - 同样装不下但用了 `--load-mode none` / `mlock`（不走 mmap，要真驻留 RAM）→ `risky`，
+     这时候才可能换页卡死；
    - 拿不到体积 → `unknown`，不假装通过也不假装危险。
-   判 `risky` 时自动改用 `--no-mmap`（分页读盘，慢但不吃满内存）。
 2. 用这个 gguf 起 `llama-server`（自动找 `~/.workbuddy/local-models/bin/` 下最新的 build，
    参数带 `--n-gpu-layers auto --fit on --jinja --cache-type-k/v q8_0`）；端口上已经有服务
    在应答就跳过拉起，不重复起；
 3. 等 `GET /v1/models` 真应答，**以它报的模型 id 为准**（不是文件名）；
 4. 复用「导入」的注册逻辑写进 `llm-pi-ai`，然后发一条真实请求试跑。
 
+选完模型后「保留思考模式」旁边还有一个 **加载方式** 下拉（`--load-mode`），默认留空：
+
+| 值 | 含义 | 什么时候选 |
+| --- | --- | --- |
+| 留空 | 交给 llama.cpp 自己决定（auto） | 默认。它会挑最合适的方式 |
+| `mmap` | 分页读盘，权重落在可回收的 page cache | 内存不宽裕时最稳 |
+| `none` | 全量读进匿名内存 | 内存富余、不想让盘参与 |
+| `mlock` | 锁页，不许换出 | 要求时序稳定、且内存确定够 |
+| `mmap+mlock` | 分页读 + 锁页 | 少数场景，一般不用 |
+
+注意 `--no-mmap` 这个参数 b11012 **不认**（`error: invalid argument`），所以插件从不拼它。
+
 失败时面板会说卡在哪一步：`precheck`（资源预检拦住）/ `launch`（起不来，带查过的路径）/
 `probe`（起来了但没报模型）/ `register`（写 settings 被拒）。拉起后端口超时不应答的话，
 插件会**把刚起的进程回收掉**，不留孤儿。别自己猜。
 
-> 首次加载 17GB 权重需要十几秒到几十秒，这期间机器会明显变卡 —— 那是权重在往显存里搬，
-> 不是插件在空转。显存不够时 llama.cpp 会回落到 CPU，速度会掉一个数量级。
-> 这台机器上真发生过一次：17GB / 27.2B MoE 把桌面直接拖到卡死，只能强制重启。
-> 所以 `risky` 那道确认不是形式主义。
+> **别把 MoE 的冷启动当成卡死。** 27.2B MoE（8/192 专家激活）在这台机器上实测：
+> 前 1000–2000 token 是预热期（20 → 28 → 36 tok/s），之后**恒定 76 tok/s**
+> （prose 75.5 / 计数 76.2 / 代码 71.9），prefill 3215 token 跑到 674 tok/s，
+> 预热完 IO Read 归零。所以「17GB 就该卡」是错的判断 —— 判断依据是显存装不装得下，
+> 不是文件大小。
+>
+> v0.4.0 曾拿 gguf 全长比内存，把这台机器判成 `risky` 并自动加 `--no-mmap`；
+> 而 b11012 根本不认这个参数（`error: invalid argument: --no-mmap`），
+> 等于一点「一键配置」必然起不来。v0.4.1 全部改成 `--load-mode auto|none|mmap|mlock|mmap+mlock`。
 
 **⑤ 导入本地模型** —— 填端点（例如 `http://127.0.0.1:8090`，`/v1` 可省）→ **探测** →
 下拉里选一个模型 → **导入并试跑**。导入做四件事：
@@ -463,7 +484,7 @@ provider 后面有 **试跑** 按钮，发一条「只回一个字：好」的�
 原来那些字段（开关、阈值、三个名单、注入正文、一步到位）都在最下面折叠的
 **高级配置** 里，位置变了，能力没变。
 
-**⑥ 一键拉起（v0.3.4 起，v0.3.7 会自己捡模型，v0.4.0 能停）** —— provider 表里每个**本地 provider**
+**⑥ 一键拉起（v0.3.4 起，v0.3.7 会自己捡模型，v0.4.0 能停，v0.4.1 认 --load-mode）** —— provider 表里每个**本地 provider**
 后面都多一个 **拉起** 按钮。点它就按这个 provider 的端口去找后端并起起来，然后轮询等它应答：
 
 | 端口 | 后端 | 怎么起 |
@@ -638,11 +659,12 @@ done
   保留逻辑（没有那层兜底就不需要）。
 - 段名来自各插件的 `systemPrompt.section({ name })`，插件升级改段名后要在 `dropSections` 里同步。
 - llama.cpp 侧的调参只到「一键拉起时给一组能跑的默认值」（`--n-gpu-layers auto --fit on --cache-type-k/v q8_0`）；要换量化、换 KV cache 精度、限并发，改高级配置里的启动命令，插件不替你优化推理性能。
-- **资源预检是估算，不是保证。** `checkModelFit` 拿 `os.freemem()` / `os.totalmem()` 和模型文件体积比，
-  三者都不含 GPU 侧显存、也不含 Windows 与驱动占掉的那部分（本机实测：32GB 机器
-  Windows 只报 16.37GB 可见，其中 GPU 拿走 14.5GB）。所以它只会**拦住明显起不来的**，
-  不会替你算出真实可用显存。预检判 `risky` 时插件会改用 `--no-mmap` 并要你手点确认；
-  判 `ok` 也不代表不会卡。
+- **资源预检是估算，不是保证。** `checkModelFit` 用 `os.freemem()` / `os.totalmem()`、
+  模型文件体积、以及 `nvidia-smi --query-gpu=memory.total` 拿到的显存总量做减法：
+  `hostBytes = sizeBytes − gpuBytes`。这三个数都不精确（本机实测：32GB 机器 Windows 只报
+  16.37GB 可见，其中 GPU 拿走 14.5GB；`freemem` 还把 page cache 算成已占用）。
+  所以它只会**拦住明显起不来的**，不会替你算出真实占用。拿不到显存时退化成「不算显存」，
+  不报错。判 `ok` 也不代表不会慢。
 - **面板只能停自己起的进程。** `stop` 路由走一张内存表（`launched`），表里只有本插件
   `spawn` 过的 pid。宿重重启后这张表就空了，此时手动起的后端要自己关。
 
@@ -684,13 +706,13 @@ llama.cpp（`/v1/models` + `/v1/chat/completions`）跑真的 `apply(ctx)`，让
 v0.3.9 起还覆盖 `scanLocalModels`（跳过 mmproj、按大小降序、目录下探）与「自选端口 +
 指定 gguf」的拼装（端口和 alias 都得按用户填的走）。v0.4.0 补上了
 `mergeEnv`（Windows 上 PATH / Path 大小写去重）、`envPathValue`、`checkModelFit`
-（四档结论 + 拿不到体积时的 unknown）、`--no-mmap` 透传、`stopProcess`
+（五档结论 + 显存外的 hostBytes + 拿不到体积时的 unknown）、`--load-mode` 白名单（`normalizeLoadMode` / `LOAD_MODES`）、`detectGpuBytes`、`stopProcess`
 （SIGTERM → SIGKILL → 报失败，幂等）、`isProcessAlive`（EPERM 算活着），
 以及扫描的三道上限（`maxModels` / `maxEntries` / Downloads 只扫一层）与 `truncated` 标记。
 
 本地不要为了验证去真起 17GB 的模型 —— `planLaunch` 已经把命令和参数摆出来了，看一眼就够；
-真要端到端跑，挑个空闲时段。**首次加载 17GB 权重会让整台机器明显变卡**（这台机器上实测过，
-直接把桌面拖到卡死）。
+真要端到端跑，挑个空闲时段。**别把冷启动当成卡死**：27.2B MoE 在这里实测预热
+1000–2000 token 后稳定 76 tok/s（见上文「一键配置」下的说明）。
 
 `lib/config.js` 顶层 `import z from '@deepseek-ai/schemastery'` —— 运行时由 DSH 宿主提供
 （`peerDependencies`，optional，不会再给装插件的人拉第二份副本），跑测试前需要

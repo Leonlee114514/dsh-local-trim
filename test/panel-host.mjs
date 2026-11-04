@@ -322,25 +322,38 @@ console.log('\n=== 15. adopt：非 gguf 文件被挡下 ===')
   check('只认 .gguf', /只能选 .gguf/.test(body.error ?? ''), body.error ?? '')
 }
 
-console.log('\n=== 16. adopt：拿到真模型路径时先做资源预检 ===')
+console.log('\n=== 16. adopt：mmap 装得下的 15.8GB 模型不再被误判 risky ===')
 {
-  // 这台机器上 local_model.gguf 真有 15.8GB，可用内存 14.4GB 左右 → 必然是 risky。
-  // 预检拦住时不该悄悄往下走，要带回 fit 明细 + needsConfirm。
+  // v0.4.1 纠正：gguf 走 mmap 落在可回收的 page cache，显存外的部分才是宿主接的量。
+  // 这台机器 15.8GB gguf + 14.5GB 显存 → 显存外 ~1.3GB，不该拦。
   const { status, body } = await callRoute('adopt', {
     modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
     port: 8090,
   })
-  if (body.fit?.level === 'risky') {
-    check('200（业务失败不抛）', status === 200, String(status))
-    check('ok=false', body.ok === false)
-    check('阶段是 precheck', body.stage === 'precheck', String(body.stage))
-    check('要求显式确认', body.needsConfirm === true)
-    check('带回 fit 明细', typeof body.fit?.ratio === 'number', String(body.fit?.ratio))
-    check('自动改用 mmap 分页', body.noMmap === true)
-    check('错误里说清代价', /变卡|拖死|占总/.test(body.error ?? ''), body.error ?? '')
-  } else {
-    check('预检没触发（这台机器内存够）', body.stage !== 'precheck', String(body.fit?.level))
-  }
+  check('200（业务失败不抛）', status === 200, String(status))
+  check('带上体积', typeof body.sizeBytes === 'number' && body.sizeBytes > 0, String(body.sizeBytes))
+  check('带上 fit 明细', typeof body.fit?.ratio === 'number', String(body.fit?.ratio))
+  check('带回显存外的字节数', typeof body.fit?.hostBytes === 'number', String(body.fit?.hostBytes))
+  check('没被误判成 risky', body.fit?.level !== 'risky', String(body.fit?.level))
+  check('不再塞 noMmap 字段', body.noMmap === undefined, String(body.noMmap))
+}
+
+console.log('\n=== 16b. adopt：真装不下时才拦，要求确认，且不改 --load-mode ===')
+{
+  // 塞一个 40GB 的体积（这台机器 16.37GB 内存 + 14.5GB 显存也接不住）
+  const { status, body } = await callRoute('adopt', {
+    modelPath: 'C:/Users/Lyonl/.workbuddy/local-models/files/local_model.gguf',
+    port: 8090,
+    sizeBytes: 40 * 1024 * 1024 * 1024,
+  })
+  check('200（业务失败不抛）', status === 200, String(status))
+  check('ok=false', body.ok === false)
+  check('阶段是 precheck', body.stage === 'precheck', String(body.stage))
+  check('要求显式确认', body.needsConfirm === true)
+  check('fit 是 risky', body.fit?.level === 'risky', String(body.fit?.level))
+  check('错误里说清装不下', /装不下|拖死|换页/.test(body.error ?? ''), body.error ?? '')
+  check('不再自动加 --no-mmap', body.noMmap === undefined, String(body.noMmap))
+  check('loadMode 保持空（交给引擎 auto）', body.loadMode === '', JSON.stringify(body.loadMode))
 }
 
 console.log('\n=== 17. adopt：确认后继续，端口已经在跑就跳过拉起 ===')
