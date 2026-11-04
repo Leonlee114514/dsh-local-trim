@@ -811,7 +811,12 @@ node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会
 node test/platform-sim.mjs darwin   # 同上，macOS
 node test/platform-sim.mjs win32    # 同上，Windows（本机就是，但断言的是「全 .exe」）
 node test/run-sim.mjs           # 上面那三套 + launcher / panel-host，按 linux + darwin 各一遍
+node test/stranger.mjs          # 抹掉本机所有有利条件（无 GPU / 无模型 / 空 PATH）
 ```
+
+`test/stranger.mjs` 是「别人第一次装」的等价物：清空 `PATH`、抹掉显卡、家目录里不放模型，
+然后要求每一步都优雅退化 —— 显存读不到就是 0（不是 NaN），`--help` 探不到就不裁剪（不是全丢），
+没有 gguf 就回 `no-model` 并列目录。本机什么都有，这些分支永远走不到。
 
 `test/run-sim.mjs` 把同一招用到**整套**测试上：它用 `child_process` 起子进程并显式传
 `DSH_SIM_PLATFORM`，而不是写 `DSH_SIM_PLATFORM=linux node …` —— 那种前缀语法只在

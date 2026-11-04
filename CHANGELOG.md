@@ -110,6 +110,12 @@
   在 macOS runner 上 `exeName()` 不加后缀，直接红 —— 而本机是 Windows，永远发现不了。
   入口用 `node test/run-sim.mjs`，不是 `DSH_SIM_PLATFORM=… node …`：后者的前缀语法
   只在 POSIX shell 成立，Windows 的 npm script 会报「不是内部或外部命令」。
+- `test/stranger.mjs`：把本机的所有有利条件全抹掉再跑一遍 —— 没有
+  `nvidia-smi`/`rocm-smi`/`sysctl`、家目录里没有模型、`PATH` 是空的、三个平台各来一次。
+  判据是「优雅退化」而不是「能跑」：显存探测失败要退化成 0 而不是 NaN，`--help` 探不到要
+  返回 null（不裁剪任何参数）而不是全部丢掉，一个 gguf 都没有时要回 `no-model` 并列出
+  找过的目录，`planLaunch` 失败要说清搜过哪些路径。别人的机器上第一眼看到的就是这些分支，
+  而本机因为什么都有，永远走不到。
   另起一个 `cross-platform` job 在 **真的** `windows-latest` 与 `macos-latest` 上跑
   （Node 22，不参与 3×3 矩阵）：平台推演再像，也不等于真机 —— `homeDir()`、PATH 分隔符、
   可执行文件后缀这些只有真跑才知道。

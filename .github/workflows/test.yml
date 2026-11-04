@@ -57,6 +57,10 @@ jobs:
         run: node test/launcher.mjs
       - name: Cross-platform paths, GPU detection, --help capability probing
         run: node test/portable.mjs
+      # 把本机的所有有利条件（显卡、模型、PATH、家目录里的东西）全抹掉，
+      # 看它优雅退化还是崩。三平台各来一遍。
+      - name: Stranger machine (no GPU, no models, empty PATH)
+        run: node test/stranger.mjs
 
       # process.platform 会在 import 时求值，所以「假装自己是 Linux/macOS」是可行的：
       # 三个平台各跑一遍，缺任何一个是漏测（本机是 Windows，最容易漏的就是另两个）。
