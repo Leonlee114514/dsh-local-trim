@@ -193,6 +193,8 @@ window.__ModuleLoader__.load({
       ['toolDescLimit', '工具描述上限'],
       ['toolParamDescLimit', '参数描述上限'],
       ['launchTimeout', '拉起后等端口（秒）'],
+      // 端口通了不等于能出字：第一次请求常常还在把权重读进内存，这里给个够宽的时间。
+      ['smokeTimeout', '试跑超时（秒）'],
       // 预检给系统留多少：桌面默认 2048 合理，Linux 服务器该能调小，这里得让用户改得到。
       ['reserveMb', '预检预留内存（MiB，0 = 不预留）'],
     ]
@@ -390,7 +392,8 @@ window.__ModuleLoader__.load({
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
       const chosen = models.find((item) => item.path === form.modelPath)
       // 显示名优先级（v0.4.6）：ollama 的 tag（那是要发给 11434 的模型 id，也是用户认知里的
-      // 名字）→ GGUF 元数据里的紧凑名（`Qwen36_35B A3B`）→ general.name 整串 → 文件名。
+      // 名字）→ GGUF 元数据里的紧凑名（basename + size_label 拼出来的那个）→ general.name
+      // 整串 → 文件名。
       // 紧凑名排在整串前面：整串常常是「…_REAP_0.25_V2_Agentic_…_Iter191_Fixed」这种内部
       // 编号，一行塞不下也不影响认模型；整串放进 title 里给人悬停看。
       const labelOf = (item) =>
@@ -417,7 +420,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { style: S.hint },
-          '列出这台机器上已经下好的模型（.gguf 文件，以及 Ollama 存储里那些叫 sha256-… 的权重）。名字读的是文件里的真名，所以 `local_model.gguf` 这种也会显示成 `Qwen36_35B A3B`。选一个，插件替你起服务、写进 provider、再试跑一次。不用先有端点。',
+          '列出这台机器上已经下好的模型（.gguf 文件，以及 Ollama 存储里那些叫 sha256-… 的权重）。名字读的是文件里的真名，文件名被改成别的也不要紧。选一个，插件替你起服务、写进 provider、再试跑一次。不用先有端点。',
         ),
         h(
           'div',

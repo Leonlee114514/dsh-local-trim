@@ -396,6 +396,82 @@ await ok('两种写法都空正文时给可执行错误，不算通过', async (
   assert.match(result.error, /思考/)
 })
 
+// 冷加载：第一次请求超时几乎总是「权重还在读盘」，模型进程并没有死。
+// 面板上点一次就该等于点两次，用户不该为了这个去理解 llama-server 的内存加载曲线。
+await ok('第一次超时后自动重试一次，第二次出字就算通过', async () => {
+  let calls = 0
+  const fetchImpl = async () => {
+    calls += 1
+    if (calls === 1) {
+      const error = new Error('This operation was aborted')
+      error.name = 'AbortError'
+      throw error
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ choices: [{ message: { content: '好' }, finish_reason: 'stop' }] }),
+    }
+  }
+  const result = await smokeTest({ fetchImpl, baseURL: 'http://127.0.0.1:8090', model: 'qwen3:8b' })
+  assert.equal(result.ok, true)
+  assert.equal(result.text, '好')
+  assert.equal(calls, 2)
+  assert.equal(result.retries, 0)
+})
+
+await ok('两次都超时：报超时并说清下一步，不冒充网络错误', async () => {
+  let calls = 0
+  const fetchImpl = async () => {
+    calls += 1
+    const error = new Error('This operation was aborted')
+    error.name = 'AbortError'
+    throw error
+  }
+  const result = await smokeTest({ fetchImpl, baseURL: 'http://127.0.0.1:8090', model: 'qwen3:8b', timeoutMs: 60000 })
+  assert.equal(result.ok, false)
+  assert.equal(calls, 2)
+  assert.equal(result.timedOut, true)
+  assert.match(result.error, /试跑超时/)
+  assert.match(result.error, /已自动重试一次/)
+  assert.match(result.error, /试跑超时（秒）/)
+  // 不能再把 undici 的原始文案丢给用户 —— 「This operation was aborted」看不出该做什么
+  assert.doesNotMatch(result.error, /This operation was aborted/)
+})
+
+await ok('非超时错误不重试：连不上就是连不上', async () => {
+  let calls = 0
+  const fetchImpl = async () => {
+    calls += 1
+    throw new Error('ECONNREFUSED')
+  }
+  const result = await smokeTest({ fetchImpl, baseURL: 'http://127.0.0.1:8090', model: 'm' })
+  assert.equal(result.ok, false)
+  assert.equal(calls, 1)
+  assert.match(result.error, /ECONNREFUSED/)
+})
+
+await ok('retryOnTimeout=false 时只试一次', async () => {
+  let calls = 0
+  const fetchImpl = async () => {
+    calls += 1
+    const error = new Error('aborted')
+    error.name = 'TimeoutError'
+    throw error
+  }
+  const result = await smokeTest({
+    fetchImpl,
+    baseURL: 'http://127.0.0.1:8090',
+    model: 'm',
+    retryOnTimeout: false,
+    timeoutMs: 60000,
+  })
+  assert.equal(result.ok, false)
+  assert.equal(calls, 1)
+  assert.match(result.error, /试跑超时/)
+  assert.doesNotMatch(result.error, /已自动重试一次/)
+})
+
 await ok('缺 baseURL / 模型时提前返回', async () => {  assert.equal((await smokeTest({ fetchImpl: async () => {}, baseURL: '', model: 'm' })).ok, false)
   assert.equal((await smokeTest({ fetchImpl: async () => {}, baseURL: 'http://127.0.0.1:8090', model: '' })).ok, false)
 })
