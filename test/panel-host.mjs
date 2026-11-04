@@ -506,6 +506,24 @@ console.log('\n=== 17d. models：清单里带出 Ollama 的可读名、量化与
   check('每条都带 fit', list.every((item) => typeof item.fit?.level === 'string'))
 }
 
+console.log('\n=== 17e. models：普通 .gguf 也带出 GGUF 里的真名（v0.4.6）===')
+{
+  // workbuddy 把任何权重都改名成 local_model.gguf，真名只在 GGUF 的 KV 里。
+  // 面板只管透传：真名从哪来（普通 gguf 读 KV / ollama 读 metadata）是 launcher 单测的事。
+  const { body } = await callRoute('models', {})
+  const list = body.models ?? []
+  check('readableName 一律是非空字符串（前端直接当显示名用）',
+    list.every((item) => typeof item.readableName === 'string' && item.readableName.length > 0),
+    JSON.stringify(list.map((item) => item.readableName)))
+  check('fullName/sizeLabel 有类型才带（没有就不塞 undefined）',
+    list.every((item) => item.fullName === undefined || typeof item.fullName === 'string') &&
+      list.every((item) => item.sizeLabel === undefined || typeof item.sizeLabel === 'string'))
+  check('ollama 那条的 readableName 是 tag（tag 优先于元数据名）',
+    (list.find((item) => item.name === OLLAMA_TAG) ?? {}).readableName === OLLAMA_TAG,
+    String((list.find((item) => item.name === OLLAMA_TAG) ?? {}).readableName))
+  check('带回 metaReads（读了几个文件的元数据）', Number.isFinite(body.metaReads), String(body.metaReads))
+}
+
 console.log('\n=== 18. stop：只停自己起过的，别人的一概不动 ===')
 {
   // 面板从没在这台机器上 spawn 过东西（用例全是假 fetch），所以表是空的。

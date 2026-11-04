@@ -425,7 +425,7 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
 - 删成功会清掉在线缓存与 baseURL 缓存，然后重新拉一次状态；**磁盘上的模型文件一个字节都不
   动**，随时可以重新导入。
 
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama）—— 上一块要求你先有端点，可刚下完模型的
+**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama，v0.4.6 读 GGUF 真名）—— 上一块要求你先有端点，可刚下完模型的
 时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个模型 → 一键配置并试跑**。
 
 点「扫描本机模型」后插件按 `modelRoots()` 的顺序找权重（每层最多下探两级，跳过
@@ -456,8 +456,24 @@ tag 引用时合并成一条、`tags` 列出全部；`<root>/metadata/sha256-…
 `general.name`、`general.file_type`（→ 量化标签，按 ggml 枚举原值，15 = `Q4_K_M`）和
 `context_length`。同一份文件被硬链接/同一个 inode 命中两次时按 inode 去重，谁有名字留谁。
 
-扫出来的不是一个下拉框，而是一张表：每个模型一行，点名字选中。Ollama 的模型显示 tag
-并带一个 `Ollama` 徽标和量化标签，后面是它的体积，超过可用预算的会标红「偏大」。
+扫出来的不是一个下拉框，而是一张表：每个模型一行，点名字选中。
+
+**名字来自文件本身，不是文件名**（v0.4.6）：WorkBuddy 之类的工具会把任何权重都存成
+`local_model.gguf`，同一台机器换个模型还是这个名字，光看文件分不出是哪个、也看不出量化。
+所以扫描时还会**读一遍 GGUF 头部的 KV 区**（按体积降序取前 40 个文件，跳过视觉投影），
+从中取出真名，面板上的显示名优先级是：Ollama 的 tag → `general.basename` + `general.size_label`
+（`Qwen36_35B A3B` 这种紧凑名）→ `general.name` 整串 → 文件名；整串（常常是
+`…_REAP_0.25_V2_Agentic_…_Iter191_Fixed` 这类内部编号）放进悬停详情。同时带出量化标签
+（`general.file_type`，按 ggml 枚举原值算）和 `context_length`。
+
+读这块 KV 区不能整块读头部：`tokenizer.ggml.tokens`（24.8 万条字符串）和
+`tokenizer.chat_template` 会把窗口占满，把后面的 `general.file_type` 截掉。做法是
+**读与跳分账** —— 键名与类型必读，超过 256KB 的字符串值、字符串数组只走位（不复制 token
+文本），游标越界立刻停（越界说明游标已经错了），半途超预算就返回已经拿到的键。注意 GGUF 的
+字符串数组是**交错存储**（每条 `u64 长度 + 载荷`），按「长度表」连续跳会把载荷首字节当成
+下一条长度，算出天文数字 —— 那不是文件太大，是游标错了。
+
+Ollama 的模型显示 tag 并带一个 `Ollama` 徽标和量化标签，后面是它的体积，超过可用预算的会标红「偏大」。
 **这里没有删除键** —— 权重文件是磁盘上的既有文件，插件不
 替你删（想清盘自己删，或用 `DSH_LOCAL_MODELS_DIR` 把它移出扫描范围）。
 
@@ -551,6 +567,7 @@ llama.cpp 这一条是 v0.3.7 的重点：模型已经下好了就别让人再�
    `~/.workbuddy/local-models/files` → `~/Downloads`），第一个含权重的目录胜出；
    认权重同样看后缀**或**文件头魔数（Ollama 的 `sha256-…` blob 就是靠魔数认的）；
    同一目录里优先 `local_model.gguf`，跳过 `.mmproj.`（那是视觉投影）；
+   这里**只按文件名挑**，不读 GGUF 里的真名（面板那条④才会读，见上文）；
    要指定自己的目录用 `DSH_LOCAL_MODELS_DIR` 或配置项 `modelDirs`；
    **注意这条只给「llama.cpp 自己捡模型」用。Ollama 的权重不走这里** —— 端口 11434 上
    该跑的是 `ollama serve`，模型名由 ollama 自己按 tag 提供（见④那条链的第 2 步）。
@@ -860,7 +877,7 @@ node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
 node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 13 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
-node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析）+ 资源预检 + 停进程（不真起进程）
+node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析与 GGUF KV 真名）+ 资源预检 + 停进程（不真起进程）
 node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
 node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径
 node test/platform-sim.mjs darwin   # 同上，macOS

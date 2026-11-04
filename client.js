@@ -389,13 +389,16 @@ window.__ModuleLoader__.load({
       const allModels = Array.isArray(scan?.models) ? scan.models : []
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
       const chosen = models.find((item) => item.path === form.modelPath)
-      // Ollama 的权重文件叫 sha256-…，没有扩展名也没有可读名：面板一律显示 tags[0]，
-      // 显示名字回落到元数据里的 general.name，最后才是文件名。
+      // 显示名优先级（v0.4.6）：ollama 的 tag（那是要发给 11434 的模型 id，也是用户认知里的
+      // 名字）→ GGUF 元数据里的紧凑名（`Qwen36_35B A3B`）→ general.name 整串 → 文件名。
+      // 紧凑名排在整串前面：整串常常是「…_REAP_0.25_V2_Agentic_…_Iter191_Fixed」这种内部
+      // 编号，一行塞不下也不影响认模型；整串放进 title 里给人悬停看。
       const labelOf = (item) =>
         (Array.isArray(item.tags) && item.tags.length > 0 ? item.tags[0] : null) ??
-        item.modelName ??
         item.readableName ??
+        item.modelName ??
         item.name
+      const titleOf = (item) => (item.fullName ? item.fullName + '\n' : '') + item.path
       const isOllama = (item) => item.source === 'ollama'
       const gib = (bytes) => {
         const value = Number(bytes)
@@ -414,7 +417,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { style: S.hint },
-          '列出这台机器上已经下好的模型（.gguf 文件，以及 Ollama 存储里那些叫 sha256-… 的权重），选一个，插件替你起服务、写进 provider、再试跑一次。不用先有端点。',
+          '列出这台机器上已经下好的模型（.gguf 文件，以及 Ollama 存储里那些叫 sha256-… 的权重）。名字读的是文件里的真名，所以 `local_model.gguf` 这种也会显示成 `Qwen36_35B A3B`。选一个，插件替你起服务、写进 provider、再试跑一次。不用先有端点。',
         ),
         h(
           'div',
@@ -497,7 +500,7 @@ window.__ModuleLoader__.load({
                         },
                         title: item.mmproj === true
                           ? '视觉投影（mmproj）不能单独当主模型用'
-                          : item.path,
+                          : titleOf(item),
                         disabled: busy !== '' || item.mmproj === true,
                         onClick: () => {
                           if (item.mmproj === true) return
@@ -618,7 +621,9 @@ window.__ModuleLoader__.load({
                     { style: S.hint },
                     isOllama(chosen)
                       ? '模型名取 tag：' + labelOf(chosen) + '（走 Ollama 的 11434，不再起一份 llama-server）'
-                      : '别名取文件名：' + chosen.name.replace(/\.gguf$/i, ''),
+                      : chosen.readableName !== undefined && chosen.readableName !== chosen.name
+                        ? '别名：' + labelOf(chosen) + '（文件里的真名；端口上报的模型 id 以实际应答为准）'
+                        : '别名取文件名：' + chosen.name.replace(/\.gguf$/i, ''),
                   ),
             ),
         result === null

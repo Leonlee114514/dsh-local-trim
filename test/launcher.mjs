@@ -30,6 +30,9 @@ import {
   scanOllamaModels,
   ollamaModelFor,
   ollamaModelRoots,
+  readGgufMeta,
+  decorateWithGgufMeta,
+  readGgufMagic,
 } from '../lib/launcher.js'
 
 // PATH 在不同 shell 下键名不同（bash: PATH / PowerShell: Path），断言不能写死。
@@ -834,6 +837,174 @@ await ok('envPathValue：PATH / Path 两种键都能读到', async () => {
   // 不给参数时读宿主自己的 PATH（默认参数），并且读得到非空值
   assert.equal(envPathValue(), envPathValue(process.env))
   assert.notEqual(envPathValue(), '')
+})
+
+
+// ── GGUF 元数据（v0.4.6：普通 .gguf 也显示真名）──────────────────────
+
+/** 造一个真的 GGUF 头部：magic + version + n_tensors + n_kv + KV*（键按写入顺序） */
+const ggufBytes = (entries, { version = 3, nTensors = 1 } = {}) => {
+  const u32 = (v) => {
+    const b = Buffer.alloc(4)
+    b.writeUInt32LE(v >>> 0)
+    return b
+  }
+  const u64 = (v) => {
+    const b = Buffer.alloc(8)
+    b.writeBigUInt64LE(BigInt(v))
+    return b
+  }
+  const str = (s) => {
+    const raw = Buffer.from(s, 'utf8')
+    return Buffer.concat([u64(raw.length), raw])
+  }
+  const parts = [Buffer.from('GGUF', 'latin1'), u32(version), u64(nTensors), u64(entries.length)]
+  for (const [name, kind, value] of entries) {
+    parts.push(str(name), u32(kind === 'str' ? 8 : kind === 'array' ? 9 : kind === 'u32' ? 4 : kind === 'u64' ? 10 : 2))
+    if (kind === 'str') parts.push(str(value))
+    else if (kind === 'array') parts.push(value)
+    else parts.push(kind === 'u32' ? u32(value) : kind === 'u64' ? u64(value) : (() => {
+      const b = Buffer.alloc(2)
+      b.writeUInt16LE(value)
+      return b
+    })())
+  }
+  return Buffer.concat(parts)
+}
+/** 字符串数组的载荷：elemType=8 + count + 交错存储的 (u64 len + 载荷) */
+const strArray = (items) => {
+  const head = Buffer.alloc(12)
+  head.writeUInt32LE(8, 0)
+  head.writeBigUInt64LE(BigInt(items.length), 4)
+  const body = items.map((s) => {
+    const raw = Buffer.from(s, 'utf8')
+    const lb = Buffer.alloc(8)
+    lb.writeBigUInt64LE(BigInt(raw.length))
+    return Buffer.concat([lb, raw])
+  })
+  return Buffer.concat([head, ...body])
+}
+/** 只给 readRange + fileSize 的假文件（走 readGgufMeta 的虚拟分支，不碰磁盘） */
+const fakeFile = (bytes) => ({
+  readRange: (p, pos, n) => (pos >= bytes.length ? Buffer.alloc(0) : bytes.subarray(pos, Math.min(bytes.length, pos + n))),
+  fileSize: () => bytes.length,
+})
+
+await ok('GGUF 元数据：读出真名/架构/量化/上下文（35B 那台机的形状）', async () => {
+  const bytes = ggufBytes([
+    ['general.architecture', 'str', 'qwen35moe'],
+    ['general.name', 'str', 'Qwen36_35B A3B REAP 0.25 V2 Fixed'],
+    ['general.basename', 'str', 'Qwen36_35B'],
+    ['general.size_label', 'str', 'A3B'],
+    ['general.file_type', 'u32', 15],
+    ['general.type', 'str', 'model'],
+    ['qwen35moe.context_length', 'u32', 262144],
+  ])
+  const meta = readGgufMeta('/models/m.gguf', fakeFile(bytes))
+  assert.equal(meta['general.name'], 'Qwen36_35B A3B REAP 0.25 V2 Fixed')
+  assert.equal(meta['general.file_type'], 15)
+  assert.equal(meta['qwen35moe.context_length'], 262144)
+  assert.equal(meta['general.size_label'], 'A3B')
+})
+
+await ok('GGUF 元数据：整块读头部会漏键——长 chat_template 之后的值照样读得到', async () => {
+  // 老探针的败因：tokenizer 表和 chat_template 把窗口撑满，general.file_type 被截断。
+  const bytes = ggufBytes([
+    ['tokenizer.ggml.tokens', 'array', strArray(['a', 'bb', 'ccc'])],
+    ['tokenizer.chat_template', 'str', 'x'.repeat(300 * 1024)],
+    ['general.file_type', 'u32', 15],
+    ['general.architecture', 'str', 'qwen3'],
+  ])
+  const meta = readGgufMeta('/models/m.gguf', fakeFile(bytes))
+  assert.equal(meta['general.file_type'], 15, '被大字符串挡住的最关键那个键必须还在')
+  assert.equal(meta['general.architecture'], 'qwen3')
+  assert.equal(meta['tokenizer.chat_template'], undefined, '超大字符串只走位，不占内存')
+  assert.equal(meta['tokenizer.ggml.tokens'], undefined, '字符串数组同样只走位')
+})
+
+await ok('GGUF 元数据：字符串数组第一条就跨块时不把载荷当长度', async () => {
+  // 交错存储：读成“长度表”会算出 2.7e22 这种天文数字，那是游标错位的信号。
+  const bytes = ggufBytes([
+    ['tokenizer.ggml.tokens', 'array', strArray(['z'.repeat(300 * 1024), 'tail'])],
+    ['general.name', 'str', 'after-big-array'],
+  ])
+  const meta = readGgufMeta('/models/m.gguf', fakeFile(bytes))
+  assert.equal(meta['general.name'], 'after-big-array')
+})
+
+await ok('GGUF 元数据：不是 GGUF / 版本太老 / n_kv 离谱 → 空对象，不抛', async () => {
+  assert.deepEqual(readGgufMeta('/x', fakeFile(Buffer.from('PK\u0003\u0004not-a-gguf-at-all............'))), {})
+  const old = ggufBytes([['general.name', 'str', 'x']], { version: 1 })
+  assert.deepEqual(readGgufMeta('/x', fakeFile(old)), {})
+  const many = Buffer.alloc(24)
+  many.write('GGUF', 0, 'latin1')
+  many.writeUInt32LE(3, 4)
+  many.writeBigUInt64LE(999999n, 16)
+  assert.deepEqual(readGgufMeta('/x', fakeFile(many)), {})
+  // 半截文件（第二个键只剩几个字节）也只要返回已拿到的键，不能把半截当值
+  const full = ggufBytes([['general.name', 'str', 'half'], ['general.file_type', 'u32', 15]])
+  assert.equal(readGgufMeta('/x', fakeFile(full.subarray(0, 62)))['general.name'], 'half')
+  assert.equal(readGgufMeta('/x', fakeFile(full.subarray(0, 62)))['general.file_type'], undefined)
+})
+
+await ok('GGUF 元数据：折进条目时给紧凑名，mmproj 按 general.type 认', async () => {
+  const model = decorateWithGgufMeta({ name: 'local_model.gguf' }, {
+    'general.architecture': 'qwen35moe',
+    'general.name': 'Qwen36_35B A3B REAP 0.25 V2 Fixed',
+    'general.basename': 'Qwen36_35B',
+    'general.size_label': 'A3B',
+    'general.file_type': 15,
+    'general.type': 'model',
+    'qwen35moe.context_length': 262144,
+  })
+  assert.equal(model.readableName, 'Qwen36_35B A3B')
+  assert.equal(model.modelName, 'Qwen36_35B A3B REAP 0.25 V2 Fixed')
+  assert.equal(model.quantization, 'Q4_K_M')
+  assert.equal(model.contextLength, 262144)
+  assert.equal(model.mmproj, undefined)
+  // 投影被改名成 local_model.gguf 时，文件名里没有 .mmproj.，只能靠元数据认
+  const proj = decorateWithGgufMeta({ name: 'local_model.gguf' }, {
+    'general.architecture': 'clip',
+    'general.type': 'mmproj',
+    'general.file_type': 32,
+  })
+  assert.equal(proj.mmproj, true)
+  assert.equal(proj.quantization, undefined, '量化表里没有的编号不显示')
+  // 没有 general.name 的裸文件：不瞎编名字
+  const bare = decorateWithGgufMeta({ name: 'a.gguf' }, { 'general.file_type': 15 })
+  assert.equal(bare.readableName, undefined)
+  assert.equal(bare.modelName, undefined)
+  assert.equal(bare.quantization, 'Q4_K_M')
+})
+
+await ok('主扫描：普通 gguf 也读元数据补名字（可关 / 可限次 / mmproj 不读）', async () => {
+  const base = {
+    dirs: ['/models'],
+    depth: 1,
+    exists: (p) => p === '/models' || p.startsWith('/models/'),
+    listDir: () => ['a.gguf', 'proj.mmproj.gguf'],
+    statSize: () => 12 * 1024 * 1024,
+    readHead: () => '',
+    readMeta: (p) =>
+      p.endsWith('a.gguf')
+        ? { 'general.name': 'A Name', 'general.architecture': 'llama', 'general.file_type': 15, 'llama.context_length': 8192 }
+        : {},
+  }
+  const list = scanLocalModels(base)
+  const a = list.find((item) => item.name === 'a.gguf')
+  assert.equal(a.modelName, 'A Name')
+  assert.equal(a.quantization, 'Q4_K_M')
+  assert.equal(a.contextLength, 8192)
+  assert.equal(list.metaReads, 1, 'mmproj 不白开文件')
+  const off = scanLocalModels({ ...base, ggufMeta: false })
+  assert.equal(off.find((item) => item.name === 'a.gguf').modelName, undefined)
+  assert.equal(off.metaReads, 0)
+  const limited = scanLocalModels({ ...base, maxMetaReads: 0 })
+  assert.equal(limited.metaReads, 1, '0 会被当成“没给”，回落默认上限')
+  // 元数据读取抛异常不能把整趟扫描带崩
+  const boom = scanLocalModels({ ...base, readMeta: () => { throw new Error('x') } })
+  assert.equal(boom.length, 2)
+  assert.equal(boom.find((item) => item.name === 'a.gguf').modelName, undefined)
 })
 
 

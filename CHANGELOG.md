@@ -4,6 +4,54 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.4.6] - 2026-11-04
+
+扫描改看魔数之后，面板上出现了一行 `local_model.gguf | 15.8GB`。那就是 35B 的模型，
+但**名字是错的**：WorkBuddy 把任何权重都存成 `local_model.gguf`，同一台机器上换个模型
+还是这个名字，光看文件名分不出 A3B 还是别的，也看不出量化。真名一直躺在文件里 ——
+GGUF 头部的 KV 区就写着 `general.name = "Qwen36_35B A3B REAP 0.25 …"`、`general.size_label = "A3B"`、
+`general.file_type = 15`（Q4_K_M）、`qwen35moe.context_length = 262144`。v0.4.5 只把这条路
+给 Ollama 走了（读 `metadata/*.json`），普通 `.gguf` 一个字节都没读。
+
+探这道 KV 区踩了三个坑，都是同一种错：**把「读到的字节数」当成「必须读到的字节数」**。
+
+1. **整块读头部**：先按 256KB / 1MB 把开头读进来再解析。GGUF 的 KV 区里躺着
+   `tokenizer.ggml.tokens`（这个 35B 有 24.8 万条字符串）和 `tokenizer.chat_template`，
+   它们把窗口占满，后面的 `general.file_type` 直接被截断 —— 窗口调多大都可能不够。
+2. **按长度表跳字符串数组**：改成「读长度、按长度跳」之后算出 `2.7111490394611174e+22 B`
+   这种天文数字。**那不是文件太大，是游标已经错了**：GGUF 的字符串数组是交错存储的
+   （每条 `u64 长度 + 载荷`），不是「一张长度表 + 一块载荷」，按长度表连续读 8 字节会把
+   载荷的首字节当成下一条的长度。
+3. **把跳过的字节也算进预算**：跳只是移动文件指针，本身不花内存。把跳过的量计进预算，
+   24MB 很快就被「跳过」烧完，于是又从半路放弃。
+
+现在的做法是**读与跳分账**：键名和类型必读，超过 256KB 的字符串值和字符串数组只走位
+（不复制 token 文本），非字符串数组超过 64 个元素也直接跳过，读的预算单独记。
+游标越界（`pos + n > fileSize`）立刻停 —— 越界就是游标错了，继续读只会拿到垃圾。
+半途超预算就返回已经拿到的键，不抛异常：多认出一个名字都是赚的。
+
+- **新增**：`readGgufMeta(path, io)` —— 读 GGUF 头部 KV，返回原始键值对（可选注入
+  `readMeta` 直通，或 `readRange` + `fileSize` 走内存假文件；默认走真实 fs）。
+  预算：最多读 24MB、最多跳 2GB、最多 4096 个键。
+- **新增**：`decorateWithGgufMeta(entry, meta)` —— 折进扫描条目：`modelName`
+  （`general.name` 整串）、`readableName`（`general.basename` + `general.size_label`，
+  即 `Qwen36_35B A3B`，比整串好认）、`architecture`、`sizeLabel`、`contextLength`、
+  `quantization`（表里没有的编号不显示，比如 mmproj 的 32）。
+- **新增**：扫描时按体积降序给前 40 个文件补元数据（`metaReads` 回报读了几次，
+  `ggufMeta: false` 可关）。**Ollama 的条目已有 metadata 就跳过**，不为了同样的信息
+  再开一遍 5GB 文件；即使读了也不让元数据顶掉 tag —— tag 是要发给 11434 的模型 id。
+- **变更**：面板显示名优先级改为 `tags[0] → readableName → modelName → 文件名`，
+  `general.name` 整串挪进悬停详情（它常常是 `…_REAP_0.25_V2_Agentic_…_Iter191_Fixed`
+  这种内部编号，一行塞不下）。`models` 路由多回 `metaReads`。
+- **修复**：投影文件（`local_model.mmproj.gguf`）现在也按 `general.type === 'mmproj'`
+  认，不再只靠文件名里的 `.mmproj.` —— 名字被改掉时才算得准。
+- **修复**：`readRange` 短读（文件被截断）不再把半截字节当值用，读到多少算多少。
+- **测试**：`test/launcher.mjs` +6（真造 GGUF 字节流：真名/量化/上下文、长 chat_template
+  之后的值照样读得到、字符串数组首条跨块时不把载荷当长度、非 GGUF / v1 / n_kv 离谱 → 空对象、
+  紧凑名与 mmproj 判定、扫描接线可关可限次）；`test/panel-host.mjs` +1 组（面板透传
+  `readableName`/`fullName`/`metaReads`）。真机验收：35B 报 `Qwen36_35B A3B` +
+  Q4_K_M + `A3B` + ctx 262144，读 44 个键 / 16ms，整趟扫描 31ms。
+
 ## [0.4.5] - 2026-11-04
 
 装了 Ollama 的机器上，「扫描本机模型」只列得出一个模型。不是扫描范围没覆盖到 ——
