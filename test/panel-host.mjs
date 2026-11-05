@@ -524,6 +524,27 @@ console.log('\n=== 17e. models：普通 .gguf 也带出 GGUF 里的真名（v0.4
   check('带回 metaReads（读了几个文件的元数据）', Number.isFinite(body.metaReads), String(body.metaReads))
 }
 
+console.log('\n=== 17f. adopt：普通 .gguf 撞上 11434 时，不能借 Ollama 的端口把自己注册成别的模型 ===')
+{
+  // 现场：面板选过 ollama 的模型后端口被粘在 11434，接着选一个普通 .gguf（workbuddy 的
+  // local_model.gguf），点「一键配置并试跑」。旧行为：端口沿用 11434 → 探到 Ollama 在应答 →
+  // wanted 'local_model' 在 /v1/models 里对不上 → 兜底抓列表第一个（embedding 模型常排第一）
+  // → 装出一个指向别的模型的 ollama provider。模型的归属由文件决定，不由上一次点的东西决定。
+  const { status, body } = await callRoute('adopt', {
+    modelPath: 'C:/models/local_model.gguf',
+    port: 11434,
+    contextWindow: 65536,
+    overwrite: true,
+    confirmHeavy: true,
+    sizeBytes: 16954484384,
+  })
+  check('200 + ok', status === 200 && body.ok === true, JSON.stringify(body.error ?? '') + ' stage=' + (body.stage ?? ''))
+  check('端口改回 llama.cpp 那条，不借 Ollama 的 11434', body.port === 8090, String(body.port))
+  check('注册成 llama.cpp 后端，不是 ollama', /llamacpp/.test(String(body.provider)), String(body.provider))
+  check('模型 id 不是 Ollama 清单里的第一个', body.model !== OLLAMA_TAG, String(body.model))
+  check('把改端口这件事说出来', body.portRedirected === true || /11434/.test(String(body.portNote ?? '')), JSON.stringify({ portRedirected: body.portRedirected, portNote: body.portNote }))
+}
+
 console.log('\n=== 18. stop：只停自己起过的，别人的一概不动 ===')
 {
   // 面板从没在这台机器上 spawn 过东西（用例全是假 fetch），所以表是空的。

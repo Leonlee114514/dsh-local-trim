@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.4.7",
-  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a cross-platform status panel (scan local weights by extension or GGUF magic, read each file's GGUF KV header for its real name/quant/context, resolve Ollama's sha256 blobs from its manifests, adopt with VRAM-aware resource pre-check, smoke-test with per-attempt timeouts and one cold-load retry, launch/stop the backend, delete a provider entry, watch trim savings) inside the plugin detail page.",
+  "version": "0.4.8",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a cross-platform status panel (scan local weights by extension or GGUF magic, read each file's GGUF KV header for its real name/quant/context, resolve Ollama's sha256 blobs from its manifests, adopt with VRAM-aware resource pre-check and a port that follows the file rather than the last click, smoke-test with per-attempt timeouts and one cold-load retry, launch/stop the backend, delete a provider entry, watch trim savings) inside the plugin detail page.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

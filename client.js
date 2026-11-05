@@ -403,6 +403,11 @@ window.__ModuleLoader__.load({
         item.name
       const titleOf = (item) => (item.fullName ? item.fullName + '\n' : '') + item.path
       const isOllama = (item) => item.source === 'ollama'
+      // 端口跟着「选中的这个文件」走，不跟着上一次选的走。选中 Ollama 的模型时跟到 11434
+      // （那个端口上跑的是 ollama，填 8090 会再去起一份 llama-server 白吃内存）；选中普通
+      // .gguf 时改回 8090 —— 否则端口会被上一次的 11434 粘住，插件跑去借 Ollama 的端口，
+      // 把一个 GGUF 注册成 Ollama 清单里的某个模型（v0.4.8）。
+      const portFor = (item) => (isOllama(item) && item.port ? String(item.port) : '8090')
       const gib = (bytes) => {
         const value = Number(bytes)
         if (!Number.isFinite(value) || value <= 0) return '?'
@@ -507,13 +512,10 @@ window.__ModuleLoader__.load({
                         disabled: busy !== '' || item.mmproj === true,
                         onClick: () => {
                           if (item.mmproj === true) return
-                          // 选中 Ollama 的模型时把端口一起跟过去：那个端口上跑的是 ollama，
-                          // 填成 8090 会让插件去起一份 llama-server，白吃一遍内存。
-                          setForm({
-                            ...form,
-                            modelPath: item.path,
-                            port: isOllama(item) && item.port ? String(item.port) : form.port,
-                          })
+                          // 端口跟着点中的这一条走：Ollama 的模型 → 11434，普通 .gguf → 8090。
+                          // 原来只在 ollama 条目上跟随，普通 .gguf 沿用 form.port，于是上一次选
+                          // ollama 留下的 11434 会一直粘着（v0.4.8 修的就是这个）。
+                          setForm({ ...form, modelPath: item.path, port: portFor(item) })
                         },
                       },
                       (item.mmproj === true ? '· ' : picked ? '● ' : '○ ') + labelOf(item),
@@ -942,13 +944,8 @@ window.__ModuleLoader__.load({
             if (prev.modelPath !== '') return prev
             const first = (result.models ?? []).find((item) => item.mmproj !== true)
             if (first === undefined) return prev
-            // 自动选中时端口跟着走：Ollama 的模型默认落到 11434，别让第一次点击
-            // 拿默认 8090 去再起一份 llama-server。
-            return {
-              ...prev,
-              modelPath: first.path,
-              port: first.source === 'ollama' && first.port ? String(first.port) : prev.port,
-            }
+            // 自动选中时端口跟着走：Ollama 的模型默认落到 11434，普通 .gguf 落 8090。
+            return { ...prev, modelPath: first.path, port: portFor(first) }
           })
         } catch (error) {
           setMessage({ tone: 'bad', text: '扫描失败：' + String(error?.message ?? error) })
@@ -1017,6 +1014,7 @@ window.__ModuleLoader__.load({
             setAdoptResult({ ok: false, text: lines.join('\n') })
             return
           }
+          if (result.portNote) lines.push('· ' + result.portNote)
           if (result.launch?.already === true) lines.push('端口 ' + result.port + ' 本来就在跑，跳过拉起')
           else if (result.launch?.ok === true) {
             lines.push('已拉起 llama-server（pid ' + result.launch.pid + '），' + result.launch.ms + 'ms 后应答')
