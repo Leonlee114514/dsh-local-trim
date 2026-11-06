@@ -630,7 +630,16 @@ v0.4.8 前这里会静默抓列表第一个，于是借错端口时会注册出�
 
 宿主里跑的还是旧代码时（只有 describe / save / probe / log 四条路由，没有 `status`），
 面板不会整块报错：它自动退回 `describe` 视图，并在顶部提示「重启一次 DSH 就能看到点灯、
-收益条和模型导入」。插件是 JS 模块，装在宿主进程里，改完源码要让宿主重新 apply 一次。
+收益条和模型导入」。
+
+**改了 `client.js` 只重载插件不够，必须完整重启 DSH。** 这不是保守说法，是宿主的实现决定
+的：`@deepseek-ai/dsh-client-modules` 在插件激活时就把 `client.js` 的字节读进内存并算出版本号
+（`initialBundleSnapshot` 里 `readFileSync` + `artifactRevision` 取 `mtimeMs`/`ctimeMs`/`size`
+做 sha1），之后每次对账（`reconcilePackage`）先比 `sourceKey` —— 那是 `baseUrl + '\0' +
+loaderName`，**文件内容变了它也不变** —— 相等就直接 `return false`，既不重读字节也不刷新版本号。
+所以热重载能让服务端 `lib/*.js` 生效，但浏览器那边拿到的仍是旧的面板代码。判断宿主当前在跑哪
+一份：`POST /api/dsh-local-trim/status` 的 `revision` 是配置版本，不是代码版本；要看代码版本，
+比对 `client.js` 的 `wc -c` 与你改动前后的大小，或直接在浏览器控制台里看有没有预期的日志。
 
 **面板整块不见、页面上只剩空白，宿主却一切正常**（v0.4.9 修的就是这个）：这说明面板在渲染
 期抛了异常，被宿主的插槽错误边界就地接管了。宿主给每个 `plugins.detail.section` 条目包了
