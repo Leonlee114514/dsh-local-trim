@@ -425,7 +425,7 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
 - 删成功会清掉在线缓存与 baseURL 缓存，然后重新拉一次状态；**磁盘上的模型文件一个字节都不
   动**，随时可以重新导入。
 
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama，v0.4.6 读 GGUF 真名，v0.4.7 试跑超时可配且冷加载自动重试，v0.4.8 端口跟着文件走）—— 上一块要求你先有端点，可刚下完模型的
+**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama，v0.4.6 读 GGUF 真名，v0.4.7 试跑超时可配且冷加载自动重试，v0.4.8 端口跟着文件走，v0.4.9 修面板被渲染期异常整块吞掉）—— 上一块要求你先有端点，可刚下完模型的
 时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个模型 → 一键配置并试跑**。
 
 点「扫描本机模型」后插件按 `modelRoots()` 的顺序找权重（每层最多下探两级，跳过
@@ -631,6 +631,17 @@ v0.4.8 前这里会静默抓列表第一个，于是借错端口时会注册出�
 宿主里跑的还是旧代码时（只有 describe / save / probe / log 四条路由，没有 `status`），
 面板不会整块报错：它自动退回 `describe` 视图，并在顶部提示「重启一次 DSH 就能看到点灯、
 收益条和模型导入」。插件是 JS 模块，装在宿主进程里，改完源码要让宿主重新 apply 一次。
+
+**面板整块不见、页面上只剩空白，宿主却一切正常**（v0.4.9 修的就是这个）：这说明面板在渲染
+期抛了异常，被宿主的插槽错误边界就地接管了。宿主给每个 `plugins.detail.section` 条目包了
+`SlotErrorBoundary`（`@deepseek-ai/dsh-client-ui-renderer`），`getDerivedStateFromError` 一旦
+捕获就把整块换成一个空的 `<div data-slot-error="plugins.detail.section">` —— 不崩进程、不写
+crash 日志，只往浏览器控制台打一行 `slot entry crashed in 'plugins.detail.section'`。
+v0.4.8 就是这样：`portFor` 声明在 `AdoptBox` 里面，`Panel` 的 `scanModels` 却引用了它，点一次
+「扫描本机模型」就在渲染期报 `ReferenceError`，整块面板当场消失。
+**排查办法**：打开浏览器开发者工具的控制台，看有没有 `slot entry crashed in ...`；本地跑
+`node test/client.mjs` 也能复现这类作用域错误（它自带最小 React 替身，真跑渲染、真执行
+`setState` 的 updater）；`node --check` 对此完全无感，只有语法错才报。
 
 面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，十三个端点
 `describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test` / `launch` /
@@ -888,8 +899,8 @@ reserveMb: 1024
 ## 开发
 
 ```bash
-npm run verify                  # = check + test，8 个文件语法 + 7 套测试
-npm run check                   # 只跑 node --check（lib/*.js + client.js + test/platform-sim.mjs）
+npm run verify                  # = check + test，13 个文件语法 + 9 套测试
+npm run check                   # 只跑 node --check（lib/*.js + client.js + test/ 里带平台/渲染逻辑的那几个）
 npm test                        # 只跑测试（unit + portable + host）
 npm run test:portable           # 只跑跨平台候选表推演（linux / darwin / win32 各一遍）
 npm run test:sim                # 假装自己是 linux / darwin，把整套测试再跑一遍
@@ -898,6 +909,7 @@ node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
+node test/client.mjs            # 真渲染 client.js（自带最小 React 替身），点「扫描本机模型」验面板不塌
 node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 13 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
 node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析与 GGUF KV 真名）+ 资源预检 + 停进程（不真起进程）
 node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
@@ -941,6 +953,15 @@ llama.cpp（`/v1/models` + `/v1/chat/completions`）跑真的 `apply(ctx)`，让
 
 > 这份用例显式传 `bridgeThrottleMs: 0`：它是在几毫秒内连着打同一批重活路由的，
 > 默认 800ms 间隔会把它们全挡掉。节流本身由最后几组用例单独验。
+
+`test/client.mjs` 是唯一碰 `client.js` 的用例，也是唯一能抓住「渲染期炸掉」的用例。它用
+一个最小 React 替身（`createElement` / `useState` / `useCallback` / `useEffect` / `useMemo` /
+`useRef` / `class Component`）载入真的 `client.js`（走 `window.__ModuleLoader__.load`），
+**真调函数组件、真在渲染期执行 `setState` 的 updater、真递归渲染出 DOM 树**，然后像用户那样
+点「扫描本机模型」，断言面板还活着、自动选中的是最大的那个模型、端口回到了 8090。
+数据用真机 `/status` 与 `/models` 的载荷回放（35B + 两个 Ollama tag + 一个 mmproj）。
+v0.4.9 之前 `portFor` 声明在 `AdoptBox` 里却从 `Panel` 引用，`node --check` 报不出任何问题
+（语法合法），只有这条回路会在那一行打出 `ReferenceError: portFor is not defined`。
 
 `test/launcher.mjs` 覆盖一键拉起的纯逻辑：端口解析、命令行切分（认双引号）、
 `whichOnPath` 补扩展名、四种后端的计划生成、找不到可执行文件与「需要模型参数」两条错误路径、

@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-trim",
-  "version": "0.4.8",
-  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a cross-platform status panel (scan local weights by extension or GGUF magic, read each file's GGUF KV header for its real name/quant/context, resolve Ollama's sha256 blobs from its manifests, adopt with VRAM-aware resource pre-check and a port that follows the file rather than the last click, smoke-test with per-attempt timeouts and one cold-load retry, launch/stop the backend, delete a provider entry, watch trim savings) inside the plugin detail page.",
+  "version": "0.4.9",
+  "description": "One-step local model onboarding plus a light harness for DSH: probes local inference endpoints, registers the provider, then trims tools, prompt sections, and tool schemas for that provider only. Ships a cross-platform status panel (scan local weights by extension or GGUF magic, read each file's GGUF KV header for its real name/quant/context, resolve Ollama's sha256 blobs from its manifests, adopt with VRAM-aware resource pre-check and a port that follows the file rather than the last click, smoke-test with per-attempt timeouts and one cold-load retry, launch/stop the backend, delete a provider entry, watch trim savings) inside the plugin detail page, guarded by a client-side render test that catches the scope and render-time errors node --check cannot see.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -55,9 +55,9 @@
   },
   "scripts": {
     "test": "npm run test:unit && npm run test:portable && npm run test:sim && npm run test:host",
-    "test:unit": "node test/launcher.mjs && node test/portable.mjs && node test/panel.mjs && node test/selfcheck.mjs && node test/provision.mjs && node test/autodetect.mjs && node test/stranger.mjs",
+    "test:unit": "node test/launcher.mjs && node test/portable.mjs && node test/panel.mjs && node test/client.mjs && node test/selfcheck.mjs && node test/provision.mjs && node test/autodetect.mjs && node test/stranger.mjs",
     "test:host": "node test/panel-host.mjs",
-    "check": "node --check lib/index.js && node --check lib/launcher.js && node --check lib/bridge.js && node --check lib/config.js && node --check lib/defaults.js && node --check lib/status.js && node --check lib/import-model.js && node --check client.js && node --check test/platform-sim.mjs && node --check test/fake-platform.mjs && node --check test/run-sim.mjs && node --check test/stranger.mjs",
+    "check": "node --check lib/index.js && node --check lib/launcher.js && node --check lib/bridge.js && node --check lib/config.js && node --check lib/defaults.js && node --check lib/status.js && node --check lib/import-model.js && node --check client.js && node --check test/client.mjs && node --check test/platform-sim.mjs && node --check test/fake-platform.mjs && node --check test/run-sim.mjs && node --check test/stranger.mjs",
     "verify": "npm run check && npm test",
     "test:portable": "node test/platform-sim.mjs linux && node test/platform-sim.mjs darwin && node test/platform-sim.mjs win32",
     "test:sim": "node test/run-sim.mjs"

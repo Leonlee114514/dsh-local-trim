@@ -4,6 +4,59 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.4.9] - 2026-11-06
+
+面板在插件详情页里「突然消失了」：整块不渲染、页面上只剩空白，宿主一切正常，连崩溃日志
+都没有。原因是 v0.4.8 引入的一个**作用域错误**：
+
+```js
+function AdoptBox(...) {          // 组件 A
+  const portFor = (item) => ...   // 声明在这里
+}
+function Panel({ subject }) {     // 组件 B
+  const scanModels = React.useCallback(async () => {
+    ...
+    setAdoptForm((prev) => ({ ...prev, port: portFor(first) }))   // ← 引用不到
+  }, [])
+}
+```
+
+语法合法，`node --check` 通过，**只有点过「扫描本机模型」之后才会在渲染期抛
+`ReferenceError: portFor is not defined`**。而宿主给每个插槽条目包了一层错误边界：
+
+```js
+// @deepseek-ai/dsh-client-ui-renderer/lib/client.js:631
+static getDerivedStateFromError(error) { ... return { failed: true } }
+componentDidCatch(error) { console.error(...); this.props.onEntryError(error) }
+if (this.state.failed) return <Anchor data-slot-error={this.props.slotKey} />
+```
+
+于是崩溃被**就地接管**：整块面板换成一个空的 `<div data-slot-error="plugins.detail.section">`，
+宿主不崩、进程不退出、crash 日志不产生 —— 用户看到的就是「控制面板凭空消失了」。
+
+改法：把 `isOllama` / `portFor` 这两个纯函数从 `AdoptBox` 内部提到 factory 作用域（两个组件
+都要用），并在源码里写清为什么必须放在那里。
+
+**新增 `test/client.mjs`（7 项）**，这是这个仓库第一次有 client 侧的测试。它自带一个最小
+React 替身（`createElement` / `useState` / `useCallback` / `useEffect` / `useMemo` / `useRef` /
+`class Component`），**真调函数组件、真在渲染期执行 `setState` 的 updater**、真递归渲染出 DOM
+树、真去点「扫描本机模型」按钮，再用真机 `/status` 与 `/models` 的载荷回放。因为 `client.js`
+是宿主进程外的模块（`window.__ModuleLoader__.load`），`node --check` 只能看语法，作用域和
+渲染期异常只有这条回路能抓住。
+
+写这条回路时踩到并修掉的三个坑（都写在测试注释里）：
+- `useState` 的 setter 必须在**调用时**抓住当前组件（`const owner = current`），否则 `await`
+  之后 `current` 已归零，更新写进别的袋子，首轮 3 个用例假失败；
+- 组件 visit 去重按**函数对象**而不是函数名，否则同名组件被跳过；
+- `flushEffects()` 除了 `await` effect 本身还要多转几圈微任务/宏任务 —— 组件里写的是
+  `if (mine) load()`（不返回 promise），`await` 只等到「请求发出去了」。
+
+`test:unit` 与 `check` 都接上了 `test/client.mjs`。顺带补上 `lib/status.js` 里早就该有的
+`provider` 字段（面板的收益条一直在读 `trim.provider`，服务端从没发过，所以那半句永远是空的
+—— 排障时看不出「这次装配被判成了哪个 provider」）。
+
+`npm run verify`：909 个 ✓、0 个 ✗。
+
 ## [0.4.8] - 2026-11-05
 
 点「拉起」一个 35B 的普通 `.gguf`，结果拉起的是 Ollama，注册出来的是

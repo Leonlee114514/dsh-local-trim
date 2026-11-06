@@ -242,6 +242,18 @@ window.__ModuleLoader__.load({
       return h('span', { style: S.badge, title }, dot(tone), h('span', null, text))
     }
 
+    // ── 模型的来源与端口 ──────────────────────────────────────────────────
+    // 这两个必须放模块作用域：AdoptBox 和 Panel 都要用。v0.4.8 把 portFor 写在 AdoptBox
+    // 里面，Panel 的 scanModels 却引用了它 —— 语法合法，点一次「扫描本机模型」才在渲染期
+    // 抛 ReferenceError，被宿主的 SlotErrorBoundary 接住，整块面板在页面上凭空消失，
+    // 宿主一切正常、连崩溃日志都不留。作用域问题 `node --check` 看不见，靠 test/client.mjs 守。
+    const isOllama = (item) => item?.source === 'ollama'
+    // 端口跟着「选中的这个文件」走，不跟着上一次选的走。选中 Ollama 的模型时跟到 11434
+    // （那个端口上跑的是 ollama，填 8090 会再去起一份 llama-server 白吃内存）；选中普通
+    // .gguf 时改回 8090 —— 否则端口会被上一次的 11434 粘住，插件跑去借 Ollama 的端口，
+    // 把一个 GGUF 注册成 Ollama 清单里的某个模型（v0.4.8）。
+    const portFor = (item) => (isOllama(item) && item.port ? String(item.port) : '8090')
+
     // ── 收益条 ────────────────────────────────────────────────────────────
     function TrimBar({ status }) {
       const trim = status?.trim ?? {}
@@ -402,12 +414,6 @@ window.__ModuleLoader__.load({
         item.modelName ??
         item.name
       const titleOf = (item) => (item.fullName ? item.fullName + '\n' : '') + item.path
-      const isOllama = (item) => item.source === 'ollama'
-      // 端口跟着「选中的这个文件」走，不跟着上一次选的走。选中 Ollama 的模型时跟到 11434
-      // （那个端口上跑的是 ollama，填 8090 会再去起一份 llama-server 白吃内存）；选中普通
-      // .gguf 时改回 8090 —— 否则端口会被上一次的 11434 粘住，插件跑去借 Ollama 的端口，
-      // 把一个 GGUF 注册成 Ollama 清单里的某个模型（v0.4.8）。
-      const portFor = (item) => (isOllama(item) && item.port ? String(item.port) : '8090')
       const gib = (bytes) => {
         const value = Number(bytes)
         if (!Number.isFinite(value) || value <= 0) return '?'
