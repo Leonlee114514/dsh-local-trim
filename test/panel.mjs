@@ -29,6 +29,7 @@ import {
   parseImportInput,
   pickModel,
   planAlign,
+  planReconcile,
   sanitizeProviderId,
   smokeTest,
   summarizeProvider,
@@ -768,6 +769,78 @@ await ok('探测回来没有上下文长度：退回兜底，不写 0', () => {
   assert.equal(plan.models[0].maxTokens, 8192)
 })
 
+console.log('import: 对账（planReconcile，只做减法）')
+
+await ok('后端少了一个：只摘那一个，活着的原样保留', () => {
+  // 对账是后台维护动作，不能碰用户调过的参数 —— 活着的那条一个字节都不许动。
+  const plan = planReconcile({
+    declared: [
+      { id: 'qwen3.5:9b', contextWindow: 40960, maxTokens: 8192 },
+      { id: 'qwen3:14b', contextWindow: 40960 },
+    ],
+    live: [{ id: 'qwen3.5:9b' }, { id: 'gemma4:12b' }],
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.action, 'prune')
+  assert.deepEqual(plan.removed, ['qwen3:14b'])
+  assert.deepEqual(plan.models, [{ id: 'qwen3.5:9b', contextWindow: 40960, maxTokens: 8192 }])
+})
+
+await ok('对账绝不补模型：后端多出来的不理', () => {
+  // 跟 planAlign 的分工就在这里：同一个端点常挂着好几条 provider，
+  // 对账要是也补，每条都会被塞进全量模型，等于替用户改模型选择器。
+  const plan = planReconcile({
+    declared: [{ id: 'a' }],
+    live: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.action, 'keep')
+  assert.deepEqual(plan.removed, [])
+  assert.deepEqual(plan.models.map((m) => m.id), ['a'])
+})
+
+await ok('全都不在后端了：action=remove，但不在这里真删', () => {
+  // 删 provider 不可撤销，纯函数只给结论，动手留给调用方。
+  const plan = planReconcile({
+    declared: [{ id: 'qwen3:14b' }, { id: 'qwen3:8b' }],
+    live: [{ id: 'gemma4:12b' }],
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.action, 'remove')
+  assert.deepEqual(plan.removed, ['qwen3:14b', 'qwen3:8b'])
+  assert.deepEqual(plan.models, [])
+})
+
+await ok('探测失败（live 是 undefined）不算「后端没模型」', () => {
+  // 这是整套对账最关键的一条：连不上时 live 是 undefined，后端真没模型时是 []。
+  // 混了就会在 Ollama 没起来的时候把用户的 provider 全删光。
+  const plan = planReconcile({ declared: [{ id: 'a' }] })
+  assert.equal(plan.ok, false)
+  assert.match(plan.error, /探测失败不等于模型没了/)
+  assert.equal(plan.models, undefined)
+})
+
+await ok('后端真的 0 个模型：照样判 remove', () => {
+  // 与上一条成对：live === [] 是有信息的（后端在应答，只是空了），必须区别对待。
+  const plan = planReconcile({ declared: [{ id: 'a' }], live: [] })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.action, 'remove')
+})
+
+await ok('省 :latest 的那条不算死声明', () => {
+  const plan = planReconcile({
+    declared: [{ id: 'nomic-embed-text' }],
+    live: [{ id: 'nomic-embed-text:latest' }],
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.action, 'keep')
+})
+
+await ok('本来就没有模型：拒绝，别拿空 provider 去删', () => {
+  const plan = planReconcile({ declared: [], live: [{ id: 'a' }] })
+  assert.equal(plan.ok, false)
+  assert.match(plan.error, /本来就没有模型/)
+})
 console.log('import: 试跑请求')
 
 await ok('成功时回报耗时与 token 数', async () => {

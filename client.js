@@ -4,13 +4,14 @@
  * 挂在插件详情页的 `plugins.detail.section` 槽位上：在 DSH Web 的
  * 「插件」列表里点开 dsh-local-trim，详情页底部就是这块面板。
  *
- * 浏览器里拿不到 cordis 服务，所有读写都走宿主侧注册的 HTTP bridge（14 条，全部 POST）：
+ * 浏览器里拿不到 cordis 服务，所有读写都走宿主侧注册的 HTTP bridge（15 条，全部 POST）：
  *   status   接管状态 + 裁剪收益 + provider 表 + 本插件起过的后端（主视图）
  *   check    给 provider 点灯（GET /v1/models），顺带把后端此刻真的有的模型 id 带回来
  *   probe    批量探测默认端口
  *   import   导入本地模型：探测 → 写 settings → 试跑（同一后端会复用已有 provider）
  *   test     对已注册 provider 发一次最小真实请求
  *   align    把一条 provider 的 models 对齐到后端此刻真的有的那份
+ *   reconcile 对账：后端已经没有的模型摘掉，全没了就删这条 provider（只做减法）
  *   save     写回高级配置
  *   describe 老宿主的兼容读取（没有 status 时降级用）
  *   log      读日志尾部
@@ -302,7 +303,7 @@ window.__ModuleLoader__.load({
     }
 
     // ── provider 表 ───────────────────────────────────────────────────────
-    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, onDelete, onAlign, launchedPorts }) {
+    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, onDelete, onAlign, onReconcile, launchedPorts }) {
       const list = Array.isArray(rows) ? rows : []
       const mine = new Set(Array.isArray(launchedPorts) ? launchedPorts.map((item) => Number(item?.port ?? item)) : [])
       // 删配置不可撤销（虽然能重新导入），点一次只进入确认态，第二次才真删。
@@ -324,12 +325,27 @@ window.__ModuleLoader__.load({
                 'span',
                 {
                   style: { ...S.hint, color: TONE.warn },
-                  title: `配置里一共声明了 ${counts.staleModels ?? 0} 条后端已经没有的模型。点某一行右边的「对齐」可以摘掉它们。`,
+                  title: `配置里一共声明了 ${counts.staleModels ?? 0} 条后端已经没有的模型。点右边的「对账」一次摘干净（只做减法）。`,
                 },
                 `· ${counts.stale} 个跟后端对不上`,
               )
             : null,
           h('span', { style: S.grow }),
+          // 「对账」= 只做减法的维护动作：后端没有的模型从各条本地 provider 里摘掉，
+          // 一条 provider 的模型全没了就连这条 provider 一起删。
+          // 跟行内「对齐」的分工：对齐是「我要跟后端一样」（会补模型），对账是「把死掉的清掉」。
+          h(
+            'button',
+            {
+              style: { ...S.small, ...(counts?.stale > 0 ? { color: TONE.warn } : {}) },
+              disabled: busy !== '',
+              title:
+                '把所有本地 provider 跟后端对一次账：后端已经没有的模型摘掉，' +
+                '一条 provider 声明的模型全没了就删掉这条。只做减法，绝不补模型。',
+              onClick: onReconcile,
+            },
+            busy === 'reconcile' ? '对账中…' : '对账',
+          ),
           h('button', { style: S.small, onClick: onCheck, disabled: busy !== '' }, busy === 'check' ? '检测中…' : '重新检测'),
         ),
         list.length === 0
@@ -986,6 +1002,25 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 对账：后端已经没有的模型从各条本地 provider 里摘掉，全没了就删 provider。
+      // 与 align 的区别只在「补不补」：align 会补上后端有但没注册的，对账只做减法。
+      const reconcile = async () => {
+        setBusy('reconcile')
+        setImportResult(null)
+        try {
+          const result = await call('reconcile', {})
+          setImportResult({
+            ok: result.ok === true,
+            text: (result.ok === true ? '✓ ' : '✗ ') + (result.message ?? result.error ?? ''),
+          })
+          await refreshStatus()
+        } catch (error) {
+          setImportResult({ ok: false, text: String(error?.message ?? error) })
+        } finally {
+          setBusy('')
+        }
+      }
+
       const test = async (row) => {        setBusy('test:' + row.id)
         setImportResult({
           ok: true,
@@ -1307,6 +1342,7 @@ window.__ModuleLoader__.load({
           onStop: stop,
           onDelete: runDelete,
           onAlign: align,
+          onReconcile: reconcile,
           launchedPorts: status.launched ?? [],
         }),
 

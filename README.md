@@ -58,7 +58,7 @@ token 会被立刻加回去。
 dsh plugin add dsh-local-trim
 ```
 
-钉版本：`dsh plugin add dsh-local-trim@0.5.4`。
+钉版本：`dsh plugin add dsh-local-trim@0.5.5`。
 
 为什么要专门说「不需要 git」——因为从 `github:` 源装是另一条路，那条路上 git 是硬门槛，
 见下一节。桌面端不自带 git，新机器上这两条路的差别就是「装得上」和「装不上」。
@@ -490,7 +490,7 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
 | `3 模型` | 声明的都在，后端也没多出别的 | 什么都不用做 |
 | `3 模型 · 后端还有 1 个没注册` | 后端多出一个能用的，配置里没写 | 想用就去下面「导入」它 |
 | `1 模型 · 2 个已不在后端`（黄） | 部分声明落空 | 点这一行的 **对齐** |
-| `0 模型 · 配置里的 2 个全不在了`（红） | 整条 provider 都是僵尸 | 点 **删除**，别对齐 |
+| `0 模型 · 配置里的 2 个全不在了`（红） | 整条 provider 都是僵尸 | 点 **对账**（会整条删掉），别对齐 |
 
 判活用的是「归一化后相等的 id」：`nomic-embed-text` 与 `nomic-embed-text:latest` 算同一条
 （Ollama 的 `/api/tags` 永远给带 tag 的全名，不归一化会全表飘红），但 `models/qwen.gguf`
@@ -522,8 +522,25 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
 - 走 `settings.update` 整条 profile 重写（`mergeLayers` 对数组是整体替换，所以新的 `models`
   会原样覆盖旧的），写前带 `revision` 做乐观锁。
 
-面板**不会自己改配置** —— 探测只是定时点灯，写配置必须是有人点了一下。误把「后端没起来」
+面板**不会因为点灯就改配置** —— 定时探测只更新徽章，不写 settings。误把「后端没起来」
 当成「模型被删了」然后自动清空，比让你多点一次糟糕得多。
+
+**对账**（v0.5.5 起）是唯一会自动写配置的动作，因为「模型没了、provider 还挂着」是纯粹的
+垃圾状态：留着它只会让模型选择器里全是点进去 404 的条目。
+
+- 面板右上角 **对账** 按钮 —— 把所有本地 provider 跟后端对一次账；
+- 启动时自动跑一次（配置里 `provision.reconcile: false` 可以关掉）；
+- **只做减法**：后端已经没有的模型从 `models:` 里摘掉；一条 provider 声明的模型**全都没了**
+  就整条删掉，而不是留一个空 `models:` —— 那在 `llm-pi-ai` 里是配置错误，不是「停用」；
+- 活着的条目原样保留（`contextWindow` / `maxTokens` / `reasoningEfforts` 一个字节不动），
+  `baseURL` / `displayName` / `compat` 也不动；
+- **绝不补模型**。这是它跟「对齐」的分界：对齐是你点按钮说「我要跟后端一模一样」，对账是
+  后台维护 —— 补模型会把同一端点上另一条 provider 的模型塞进来，那是替你做决定；
+- 三种情况一律不动：**后端连不上**（探测失败 ≠ 模型没了）、**后端只报当前加载的模型**
+  （llama.cpp 分不清「没装」和「没加载」）、**这条 provider 本来就没有模型**。
+
+`POST /api/dsh-local-trim/reconcile` 支持 `{ provider, apply: false }`：只算不改，把结论先看
+一眼再决定。
 
 **同一个后端只该有一条 provider**（v0.5.1 起）。以前每导入一个模型就新建一条
 `local-<后端>-<模型名>`，同一个 Ollama 攒出 `local-ollama-qwen3-14b`、`local-ollama-qwen3-8b`、
@@ -1112,7 +1129,7 @@ node test/panel.mjs             # 面板视图模型 + 导入流程（离线，�
 node test/client.mjs            # 真渲染 client.js（自带最小 React 替身），点「扫描本机模型」验面板不塌
 node test/client-host.mjs       # 有没有 client 宿主都要说出来：headless profile 上不许静默
 node test/publish.mjs           # 发布就绪自检（publishConfig / files / dsh 声明 / optional peer）
-node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 14 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
+node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 15 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
 node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析与 GGUF KV 真名）+ 资源预检 + 停进程（不真起进程）
 node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
 node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径

@@ -4,6 +4,74 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.5.5] - 2026-11-14
+
+一句话：**模型删了，provider 也得跟着消失 —— 以前两边根本没人在对账。**
+
+`ollama rm qwen3:14b` 之后，配置里那条 `- id: qwen3:14b` 会永远留着。0.5.4 让它不再骗人
+（徽章变黄、表头说「N 个跟后端对不上」），但**擦掉它的动作还得你自己点**。而「点删除」这件事
+要求你先意识到那条 provider 已经空了 —— 正是面板在帮你判断的那件事。
+
+### 谁在纵容这个状态（三个原因叠在一起）
+
+1. `ollama rm` 只删磁盘上的 manifest 与 blob，它不知道 DSH 存在；
+2. 宿主 `listModels` 只要凭据不抛就返回 profile 里声明的模型，**不问后端**；
+3. 插件的 `provision()` 开头是 `if (existing.length > 0) { …; return }` —— 有可达的本地
+   provider 就整段跳过，只读不写，什么都不删。
+
+所以「删除模型」这个动作在配置层完全不可见。0.5.5 补上的是这条链的最后一环。
+
+### `planReconcile`：只做减法的纯函数
+
+新函数 `lib/import-model.js` 的 `planReconcile({ declared, live })`，返回
+`{ action: 'keep' | 'prune' | 'remove' }`：
+
+- `removed.length === 0` → `keep`；
+- `kept.length === 0` → `remove`（`models: []`，调用方据此删整条 provider）；
+- 否则 → `prune`，`models` 只留活着的那些，**条目原样保留**（用户调过的 `contextWindow` /
+  `maxTokens` / `reasoningEfforts` 不会被探测值覆盖）。
+
+两条必须记住的判据：
+
+- **`live` 必须是数组才动手。** `live === undefined` 与 `live === []` 是两件事：前者是「没问到」
+  （探测失败），后者是「后端真的一个模型都没有」。混在一起就会在服务没起来的时候清空配置。
+- **只减不增。** 同一个端点常常挂着多条 provider（`local-ollama`、`local-ollama-qwen3-14b`…），
+  补模型会把后端全量模型塞进每一条，等于替用户改模型选择器。要「跟后端一模一样」请用「对齐」。
+
+### `reconcilePanel`：三种情况一律不动
+
+`POST /api/dsh-local-trim/reconcile`（第 15 条 bridge 路由），入参 `{ provider?, apply? }`，
+`apply !== false` 即真写。跳过逻辑比动作逻辑更重要：
+
+| 情况 | 行为 | 理由 |
+| --- | --- | --- |
+| 后端连不上 | skip | 探测失败 ≠ 模型没了 |
+| 后端只报当前加载的模型（llama.cpp） | skip | 分不清「没装」和「没加载」 |
+| provider 本来就没有 `models` | skip | 没什么可对账的 |
+| 云端 provider | 不参与 | 没有「本机删了模型」这回事 |
+
+第二条是这次最容易写错的地方。llama.cpp 的 `/v1/models` 只列当前**已加载**的那一个，
+照它删模型会把「暂时没加载」当成「已经删了」。判据是 `probe.via === 'ollama'` 或
+`backendFor(baseURL) ∈ {ollama, vllm, lmstudio}` —— 这几个后端会枚举全部已装模型。
+
+全死时走 `unregisterProvider`（`settings.mutate` 的 `unset`），**不是** `update` 写一个空
+`models` 数组：空 `models` 在 `llm-pi-ai` 里是配置错误，不是「停用」。
+
+### 挂在哪：启动一次 + 一个按钮
+
+- `provision()` 的 `existing.length > 0` 分支不再直接 return，先跑一次静默对账；
+  配置里 `provision.reconcile: false` 可关。
+- 面板表头加 **对账** 按钮（`counts.stale > 0` 时变黄），一次对全部本地 provider。
+- 默认**不**在每次点灯时自动跑：点灯是 15 秒一次的只读探测，往里塞写操作会让「刷新面板」
+  变成破坏性动作。
+
+### 测试
+
+- `test/panel.mjs` 加 7 条 `planReconcile` 纯函数断言（部分死 / 全死 / 后端多出来 / `live`
+  为 `undefined` / `live: []` / `:latest` 归一 / `declared: []`）。
+- `test/panel-host.mjs` 加第 22 组 17 条路由断言（含 llama.cpp 跳过、连不上不动、`apply:false`
+  只算不改、全死走 `mutate unset`）。
+- `npm run verify`：1169 → **1245 ✓ / 0 ✗**。
 ## [0.5.4] - 2026-11-14
 
 一句话：**「在线」不再只表示端口能 ping 通，升级也不再被旧默认值卡住 —— 这两个毛病都是「看着没问题，其实在骗人」。**

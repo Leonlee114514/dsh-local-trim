@@ -255,8 +255,8 @@ const callRoute = async (name, body) => {
   return { status, body: text.length > 0 ? JSON.parse(text) : undefined }
 }
 
-console.log('\n=== 1. 十四条路由都注册上了 ===')
-for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch', 'stop', 'models', 'adopt', 'delete', 'align']) {
+console.log('\n=== 1. 十五条路由都注册上了 ===')
+for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch', 'stop', 'models', 'adopt', 'delete', 'align', 'reconcile']) {
   check(name, routes.has('/api/dsh-local-trim/' + name))
 }
 
@@ -753,6 +753,93 @@ console.log('\n=== 21. align：把 models 对齐到后端真的有的那份 ==='
   delete cur()[dead]
   delete cur()[fresh]
   delete cur()[allDead]
+}
+console.log('\n=== 22. reconcile：后端没了的模型摘掉，全没了就删 provider ===')
+{
+  const cur = () => settingsState['llm-pi-ai'].value.providers
+
+  // 不说哪条 → 对全部本地 provider 对账（这里只验不炸、返回 ok）。
+  const all = await callRoute('reconcile', {})
+  check('不带 provider 也能跑', all.body.ok === true, JSON.stringify(all.body.error ?? all.body.message))
+  check('带回 actions 数组', Array.isArray(all.body.actions), typeof all.body.actions)
+
+  const ghost = await callRoute('reconcile', { provider: '__nope__' })
+  check('不存在的 provider 明确报错', ghost.body.ok === false && /没有本地 provider/.test(ghost.body.error ?? ''), ghost.body.error ?? '')
+
+  // 云端 provider 不归这里管：它没有「本机删了模型」这回事。
+  const cloud = await callRoute('reconcile', { provider: 'deepseek-eo' })
+  check('云端 provider 直接报不在本地', cloud.body.ok === false && /没有本地 provider/.test(cloud.body.error ?? ''), cloud.body.error ?? '')
+
+  // llama.cpp 只报当前加载的那一个模型：它说「只有 A」可能只是没加载 B，
+  // 这时候摘模型是错的 —— 必须跳过，而且理由要说清是「分不清」而不是「连不上」。
+  const lcpp = 'local-reconcile-llamacpp'
+  cur()[lcpp] = {
+    baseURL: 'http://127.0.0.1:8090/v1',
+    models: [{ id: 'qwen3-4b' }, { id: 'not-loaded-right-now' }],
+  }
+  const skipped = await callRoute('reconcile', { provider: lcpp })
+  check('llama.cpp 跳过不摘模型', skipped.body.ok === true && skipped.body.changed === false, JSON.stringify(skipped.body))
+  check('跳过理由说清是分不清没装和没加载', /分不清/.test(JSON.stringify(skipped.body.actions ?? [])), JSON.stringify(skipped.body.actions ?? []))
+  check('跳过时配置一条没少', cur()[lcpp].models.length === 2, String(cur()[lcpp].models.length))
+
+  // 连不上：跟「后端真的空了」是两回事，必须一条都不动。
+  const dead = 'local-reconcile-dead'
+  cur()[dead] = {
+    baseURL: 'http://127.0.0.1:9999/v1',
+    models: [{ id: 'whatever' }],
+  }
+  const deadResult = await callRoute('reconcile', { provider: dead })
+  check('连不上就不动配置', deadResult.body.ok === true && deadResult.body.changed === false, JSON.stringify(deadResult.body))
+  check('连不上时 models 一条没少', cur()[dead].models.length === 1, String(cur()[dead].models.length))
+
+  // 部分死：只摘死的那几条，活着的一个字节都不动（用户调参不许被冲掉）。
+  const zombie = 'local-reconcile-target'
+  cur()[zombie] = {
+    displayName: '本地对账靶子',
+    baseURL: 'http://127.0.0.1:11434/v1',
+    defaultMaxTokens: 2048,
+    compat: { thinkingFormat: 'chat-template' },
+    models: [
+      { id: OLLAMA_TAG, contextWindow: 12345, maxTokens: 777, reasoningEfforts: { off: null, low: 'low' } },
+      { id: 'qwen3:14b', contextWindow: 40960 },
+      { id: 'qwen3:8b', contextWindow: 40960 },
+    ],
+  }
+  const pruned = await callRoute('reconcile', { provider: zombie })
+  check('部分死：对账成功', pruned.body.ok === true && pruned.body.changed === true, JSON.stringify(pruned.body))
+  check('摘掉的是那两条僵尸', JSON.stringify(pruned.body.actions?.[0]?.removed ?? []) === JSON.stringify(['qwen3:14b', 'qwen3:8b']), JSON.stringify(pruned.body.actions?.[0]?.removed ?? []))
+  check('配置里只剩活的那条', cur()[zombie].models.length === 1, String(cur()[zombie].models.length))
+  check('活着的条目原样保留（含用户调参）', JSON.stringify(cur()[zombie].models[0]) === JSON.stringify({ id: OLLAMA_TAG, contextWindow: 12345, maxTokens: 777, reasoningEfforts: { off: null, low: 'low' } }), JSON.stringify(cur()[zombie].models[0]))
+  check('对账不碰 displayName / compat', cur()[zombie].displayName === '本地对账靶子' && cur()[zombie].compat?.thinkingFormat === 'chat-template', JSON.stringify(cur()[zombie]))
+  check('文案说清摘掉几个', /摘掉 2 个/.test(pruned.body.message ?? ''), pruned.body.message ?? '')
+
+  // 全死：这条 provider 一个模型都不在后端了 → 整条删掉（不是留个空 models）。
+  const allDead = 'local-reconcile-alldead'
+  cur()[allDead] = {
+    baseURL: 'http://127.0.0.1:11434/v1',
+    models: [{ id: 'qwen3:14b' }, { id: 'qwen3:8b' }],
+  }
+  const removed = await callRoute('reconcile', { provider: allDead })
+  check('全死：对账成功', removed.body.ok === true && removed.body.changed === true, JSON.stringify(removed.body))
+  check('全死：整条 provider 删掉了', cur()[allDead] === undefined, JSON.stringify(cur()[allDead]))
+  check('全死：走的是 mutate unset 而不是 update 写空数组', mutations.some((item) => JSON.stringify(item.ops ?? []) === JSON.stringify([{ op: 'unset', path: ['providers', allDead] }])), JSON.stringify(mutations.at(-1)?.ops ?? []))
+  check('全死：文案说清是删掉', /删掉/.test(removed.body.message ?? ''), removed.body.message ?? '')
+
+  // 只算不改：apply:false 时要把结论报出来，但配置一个字节都不动。
+  const dry = 'local-reconcile-dry'
+  cur()[dry] = {
+    baseURL: 'http://127.0.0.1:11434/v1',
+    models: [{ id: 'qwen3:14b' }, { id: OLLAMA_TAG }],
+  }
+  const planned = await callRoute('reconcile', { provider: dry, apply: false })
+  check('apply:false 也能报结论', planned.body.ok === true && planned.body.changed === false, JSON.stringify(planned.body))
+  check('apply:false 时 applied 是 false', planned.body.actions?.[0]?.applied === false, JSON.stringify(planned.body.actions ?? []))
+  check('apply:false 时配置没动', cur()[dry].models.length === 2, String(cur()[dry].models.length))
+
+  delete cur()[lcpp]
+  delete cur()[dead]
+  delete cur()[zombie]
+  delete cur()[dry]
 }
 console.log(`\n${fail === 0 ? '=== 面板宿主侧集成全部通过 ===' : `=== ${fail} 项失败 ===`}`)
 process.exit(fail === 0 ? 0 : 1)
