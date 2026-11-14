@@ -144,11 +144,11 @@ await ok('裁成功时 reason 一律为空（不把上轮的成因带过来）',
 
 console.log('status: 接管文案')
 
-await ok('accessor+purge-slot 是好的，且点名 dsh-purge', () => {
+await ok('accessor+purge-slot 是好的，且说清是转发内层 slot', () => {
   const result = summarizeTakeover({ ok: true, via: 'accessor+purge-slot' }, { enabled: true })
   assert.equal(result.active, true)
   assert.equal(result.tone, 'good')
-  assert.match(result.label, /dsh-purge/)
+  assert.match(result.label, /slot/)
 })
 
 await ok('accessor-native 也认', () => {
@@ -378,6 +378,42 @@ await ok('云端 provider 也照常算差集（不因为它不裁剪就跳过）
   const row = status.providers[0]
   assert.equal(row.local, false)
   assert.deepEqual(row.extraModels, ['deepseek-reasoner'])
+})
+
+console.log('status: 凭据没配好时，选择器里看不到这个 provider')
+
+// 宿主对「profile 声明了 apiKeyEnv 但解析不到值」的处理是抛 MISSING_CREDENTIAL，
+// llm-pi-ai 的 listModels 把它吞成空数组，模型目录再按「空组丢弃」过滤掉，
+// 于是用户在模型选择器里只会发现这个 provider 不见了，看不到任何原因。
+// 面板必须替它说出来，否则用户会以为是插件没把 provider 写进去。
+
+await ok('凭据没值：warn，并说清选择器里看不到它', () => {
+  const status = buildPanelStatus({
+    providers: [{ id: 'local-ollama', profile: { baseURL: 'http://127.0.0.1:11434/v1', apiKeyEnv: 'MY_LOCAL_KEY', models: [{ id: 'qwen3:8b' }] } }],
+    credentials: { 'local-ollama': { ref: 'MY_LOCAL_KEY', configured: false } },
+  })
+  const row = status.providers[0]
+  assert.equal(row.credential.tone, 'warn')
+  assert.equal(row.credential.configured, false)
+  assert.match(row.credential.label, /MY_LOCAL_KEY/)
+  assert.match(row.credential.label, /选择器里会看不到/)
+})
+
+await ok('凭据有值：不吵，只说已配置', () => {
+  const status = buildPanelStatus({
+    providers: [{ id: 'local-ollama', profile: { baseURL: 'http://127.0.0.1:11434/v1', apiKeyEnv: 'MY_LOCAL_KEY', models: [{ id: 'qwen3:8b' }] } }],
+    credentials: { 'local-ollama': { ref: 'MY_LOCAL_KEY', configured: true } },
+  })
+  assert.equal(status.providers[0].credential.tone, 'muted')
+  assert.match(status.providers[0].credential.label, /已配置/)
+})
+
+await ok('没声明 apiKeyEnv 的 provider 不出现凭据行（本地端点绝大多数如此）', () => {
+  const status = buildPanelStatus({
+    providers: [{ id: 'local-ollama', profile: { baseURL: 'http://127.0.0.1:11434/v1', models: [{ id: 'qwen3:8b' }] } }],
+    credentials: {},
+  })
+  assert.equal(status.providers[0].credential, undefined)
 })
 
 console.log('status: client 半边有没有宿主')

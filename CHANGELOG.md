@@ -4,6 +4,153 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.5.3] - 2026-11-14
+
+一句话：**dsh-purge 从「隐式前提」降级成「可选增强」，顺手堵掉一个「一处坏、全盘失效」的口子。**
+
+0.5.2 把工具名和段名清单里的本机拟合清掉了，但漏了一条更深的耦合：整个注入面都写死在
+`dsh-purge` 这个名字上。追问「dsh-purge 其实也是本机特殊环境」之后查下来，这条耦合里
+**一半是真拟合、一半是必须保留的互操作契约**，得分开处理。
+
+### 段名：装了沿用它的名字，没装用自己的
+
+原来的代码两个方向都写死了 `'dsh-purge'`：
+
+```js
+if (sectionName === 'dsh-purge') { /* 换正文 */ }      // 按名读
+keptSections.unshift({ name: 'dsh-purge', ... })        // 按名写
+```
+
+在一台从未装过 dsh-purge 的机器上，这等于**凭空造一个带第三方插件名字的段** ——
+直接违反 `lib/defaults.js` 开头那条自定纪律（不写任何本机特有的插件名）。
+
+但不能简单改名，因为装了的时候这个名字是**必要契约**，三条证据：
+
+- `dsh-purge-community/lib/identity.js:333` `leadWithInject` 里
+  `if (section.name === "dsh-purge" || section.name === CAPABILITY_SECTION) continue;`
+  —— 只有这个名字的段被跳过，其余会被 inject 的 matcher 逐条剥离；
+- 同文件 `:195` / `:660` / `:981` 都用精确名找段、定位插入点、决定是否原样保留；
+- **宿主本身被 dsh-purge 打过补丁**：`@deepseek-ai/dsh-system-prompt/lib/index.js` 旁边
+  留着 `index.js.dshpurge.bak`，`diff` 出来四处 `// [dsh-purge]` 改动，其中一处是
+  complete preset 分支只保留 `name.startsWith("dsh-purge")` 的段 —— 换个名字，注入直接被砍掉。
+
+所以改成**按机器决定**：`purgePresent()` 查 `globalThis.__dshPurgeHungPrompt` 和
+`prompt.assemble` 上的 `ASSEMBLE_GUARD` slot，有就写 `dsh-purge`，没有就写
+`local-trim:inject`。**读的时候两个名字都认**，热装/热卸 dsh-purge 时装配里残留的上一个
+名字的段也能被接住。
+
+### 段名改成前缀识别：它升级改个名，25K 正文就换不掉了
+
+探针里有一个形态是「注入段叫 `dsh-purge:v2`」（dsh-purge 自己就用
+`name.startsWith('dsh-purge')` 认段，它升级时完全可能这么改）。原来的精确匹配下，
+这个形态只省了 3.4K（30042 → 26580）—— 段裁剪生效了，但那段 25K 原文一个字没换，
+因为没认出来。
+
+改成 `isInjectSection(name)` = `name === 'local-trim:inject' || name.startsWith('dsh-purge')`
+之后，同一个形态 30042 → **1580**，和基线完全一致。
+
+大小写不同（`DSH-Purge`）**不**被认成注入段，这是刻意的：宿主和 dsh-purge 都按精确大小写
+匹配，放宽会把用户自己命名的段也吃掉。
+
+### schema 面抛错会连累提示词面（一处坏、全盘失效）
+
+`slimToolSchemas` 里量体积用的是裸 `JSON.stringify`：
+
+```js
+const before = list.reduce((sum, s) => sum + JSON.stringify(s ?? {}).length, 0)
+```
+
+循环引用抛 `TypeError: Converting circular structure to JSON`，深度几千层抛
+`RangeError: Maximum call stack size exceeded`，BigInt 抛
+`TypeError: Do not know how to serialize a BigInt`。异常穿出 `trimAssembly`，被外层的
+`try { return trimAssembly(result, agent) } catch { return result }` 吞掉 ——
+**提示词裁剪、注入替换、context 裁剪一起失效**，而面板只会说「未裁剪」。
+
+实测（13 种极端装配形态）：改前循环引用 / 深度 3000 / BigInt 三种形态全部 27499 → 27499
+原样返回；改后三种都正常裁剪，循环引用那条 27499 → **889**。
+
+修法是三层：`schemaBytes()` 把 `JSON.stringify` 包进 try/catch（量不出来就返回 `null`，
+统计整体跳过但照裁）、`slimSchema` 加 `WeakSet` 见集合防自引用（末尾 `delete` 掉，
+同一个对象在兄弟位置重复出现不会被误判成环）、`slimToolSchemas` 把 `list.map(slimSchema)`
+整体包一层 try/catch（爆栈时只放弃 schema 面）。
+
+### 顺带清掉的死条目与文案
+
+- `DEFAULT_DROP_SECTIONS` 里的 `'dsh-purge:anchor'` 删掉 —— 这个名字在
+  dsh-purge-community 1.6.93 全树 0 命中，是 0.3.0 时按想象加的。`dshpg-capabilities`
+  保留（`lib/capability-protocol.js:11` 真实存在）。
+- 自检行从「`dsh-purge 已装（本插件在其外层收尾，无需改它源码）`」改成
+  「`dsh-purge（可选） 已装 → 注入段沿用它的段名 / 未装 → 注入段用本插件自己的段名`」——
+  原来的写法让陌生用户以为必须装。
+- `lib/status.js` 的接管文案去掉 dsh-purge 字样，改成「内层访问器的 slot 已转发」。
+- README 同步：注入面那一行不再点名 dsh-purge、自检样例跟着改、「已知边界」把
+  「未安装时也能工作」改写成「可选增强，不是前提」并说明段名怎么选。
+
+### 新增回归用例（`test/autodetect.mjs`，13 项）
+
+- 段名带后缀 `dsh-purge:v2`：25K 原文真的被换掉 + 注入正文进了装配；
+- 删掉 `globalThis.__dshPurgeHungPrompt` 后：用自己的段名、不凭空造 `dsh-purge` 段、
+  注入正文照样写进去；
+- 循环引用 / BigInt / 深度 3000 三种畸形 schema 各两条断言：**不拖累提示词裁剪**、
+  **不拖累注入替换**。
+
+`test/selfcheck.mjs` 的 `mkSections(withPurge)` 也修了：原来两种情况都放 `dsh-purge` 段，
+导致「没装」场景根本测不到补段那条路。
+
+**这 13 条都做了变异验证**（改回旧实现，确认断言真的会红）—— 第一版不是：
+
+- 原本写的是「存在一个 `startsWith('dsh-purge')` 的段」，改回精确匹配后**仍然绿**。
+  原因是认不出注入段时会额外 `unshift` 一个新的短段，`find` 照样找得到。
+  改成断言「原文 `ZZZZZZZZZZ` 不在任何段里」之后才真的红（`段=["harness:identity","dsh-purge","tool:mindmap"]`）。
+- schema 那 6 条也分别验证过：只回退 `schemaBytes` 的 try/catch → 循环引用与 BigInt 四条红
+  （深度 3000 仍绿，因为它死在递归而不是序列化）；只回退 `list.map` 外面那层 → 深度 3000
+  两条红。两层各挡一类，缺一层就有断言失去意义。
+- `injectSectionName()` 改回恒返回 `PURGE_SECTION` → 无 dsh-purge 的三条全红。
+
+验证：`npm run verify` → **1139 项 ✓ / 0 ✗**（0.5.2 是 1126）。
+
+### 写进去的 provider 在模型选择器里一个都看不到
+
+用户报「新会话里选不到本地模型，插件等于被悬空」。查下来是本插件自己挖的坑，而且是
+**写配置时看着完全正常、只在选择器里空掉**的那类。
+
+链路（宿主安装树里，一条链走到底）：
+
+1. `dsh-api-session-controller/lib/types/catalog.js` 的 `buildModelCatalog()` 对每条 provider
+   `await ctx.llm.listModels(id)`，末尾 **`.filter(group => group.models.length > 0)`** ——
+   空模型组被**静默丢弃**，连 `failures` 都不进，所以界面上没有任何报错。
+2. `dsh-llm-pi-ai/lib/index.js:2036` 的 `listModels()`：`resolveApiKey()` 抛
+   `MISSING_CREDENTIAL` 时 `return []`。
+3. `:3090` 的 `resolveApiKey()`：`const ref = profile.apiKeyEnv; if (ref === void 0) return void 0;`
+   —— **不声明凭据引用才免鉴权**；声明了就必须解析到值，否则抛错。
+
+而本插件 0.5.2 之前 `buildProfile()` 把 `apiKeyEnv: DSH_LOCAL_LLM_API_KEY` **无条件写进
+profile**（理由写在注释里：pi-ai 在没有 credential 声明时不带 `Authorization` 头，
+llama.cpp 会静默返回空 completion）。那个 ref 从来没有被赋过值，于是：
+配置里三条 provider 全在 → `listModels` 全返回 `[]` → 目录过滤 → **选择器里一个本地模型都没有**。
+
+修法（都不写死任何变量名 / 端口 / provider id）：
+
+- `buildProfile()` 的 `apiKeyEnv` **去掉默认值**，只在调用方显式给了才写进 profile；
+- 兜底改成 `headers: { Authorization: 'Bearer local' }`（`DEFAULT_AUTH_HEADER`）——
+  pi-ai 的 `getClientApiKey()` 只要见到 `authorization` 头就返回 `"unused"` 放行，
+  对不校验值的本地端点无害，正好补上原来那条「不带 Authorization 头」的理由；
+- 声明了 `apiKeyEnv` 时**不再塞兜底头**（会和真 key 抢同一个头）；
+- `apiKeyFromEnv()`（写死读 `DSH_LOCAL_LLM_API_KEY`）换成 `apiKeyForProfile(profile)`：
+  按 profile 自己声明的 ref 走 `credentials` 服务、退回 `process.env`，没声明就不带 key；
+- `provision.apiKeyEnv` 可配，显式给了才透传；
+- **可见性**：`lib/status.js` 的 provider 行新增 `credential: {ref, configured, tone, label}`，
+  凭据没值时给 warn「凭据 X 没有值 —— 模型选择器里会看不到这个 provider」，
+  不再让人对着空列表猜。
+
+新增用例 6 条：默认不带 `apiKeyEnv`、默认带兜底头、显式给了才写、声明凭据时不塞兜底头
+（`test/provision.mjs` 4 条）+ 凭据三态（未配 / 已配 / 未声明，`test/panel.mjs` 3 条）。
+
+**旧配置要用户自己动手**：已经写进 `cordis.patch.yml` 的 provider 插件不会去改，
+那几行 `apiKeyEnv` 得删掉或给 ref 配上值 —— 面板会 warn 指出是哪一条。
+
+验证：`npm run verify` → **1145 项 ✓ / 0 ✗**。
+
 ## [0.5.2] - 2026-11-14
 
 一句话：**默认值不再拟合这台机器。** 起因是一个很自然的追问 ——「之前那些问题是不是因为

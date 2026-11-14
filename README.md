@@ -24,7 +24,7 @@ DSH 没有「按模型裁工具」的开关：
 
 - `dsh-tools` 的 Config 只有 `mode` / `maxParallel`；
 - agent-preset 只能声明插件，不列 ≠ 不注册；
-- `dsh-purge` 也没有工具过滤字段。
+- 提示词类插件（比如 `dsh-purge`）也没有工具过滤字段。
 
 唯一原语是 `tools.restrict({ allow })`，它把限制追加到调用者所在 scope 的层，**只影响该 agent
 及其子 agent** —— 正好满足「只给本地模型精简」。本插件就是把这个原语和三个提示词层面的
@@ -38,7 +38,7 @@ DSH 没有「按模型裁工具」的开关：
 | --- | --- | --- |
 | 1. 工具面 | 只留本地真用得上的工具 | `tools.restrict({ allow })`，allow = 实际可见名 ∩ 白名单 |
 | 2. 提示词面 | 丢掉本地用不到的大段 | `system-prompt/assemble` 里按段名过滤 `sections` / `contexts` |
-| 3. 注入面 | 整份系统提示词换成一页纸 | 替换 `dsh-purge` 注入段正文，保留头 80 / 尾 96 字符 |
+| 3. 注入面 | 整份系统提示词换成一页纸 | 替换注入段正文，保留头 80 / 尾 96 字符 |
 | 4. schema 面 | 截断工具描述 | 递归截 `description`，`type` / `properties` / `required` 一字不动 |
 
 第 3 层有个关键细节：宿主 `dsh-agent-loop` 在渲染完 prompt 后会检查
@@ -166,9 +166,17 @@ pnpm add link:../../../path/to/dsh-local-trim
      `enable_thinking`，llama.cpp 不认。）
   2. 模型上的 `reasoningEfforts: { off: null, low: low }` —— 上面那个分支的前提
      是 `model.reasoning === true`，而它由这个字段推出来。
-  3. `apiKeyEnv` —— 本地端点不校验 key，但 provider 没有 credential 声明时
-     pi-ai 不带 `Authorization` 头，llama.cpp 会**静默返回空 completion**
-     （不是 401，非常难查）。默认指向 `DSH_LOCAL_LLM_API_KEY`，值为空也行。
+  3. `headers: { Authorization: 'Bearer local' }` —— 本地端点不校验 key，但 pi-ai
+     的 OpenAI 兼容实现要求「有 key 或有 `Authorization` 头」二者之一，都没有就在
+     发请求前抛 `No API key for provider`；而 provider 没有 credential 声明时它自己
+     不会加这个头，llama.cpp 则会**静默返回空 completion**（不是 401，非常难查）。
+     所以插件写 profile 时默认带一个占位头。
+
+     **不要为了「随便填个值」去写 `apiKeyEnv`**：宿主的语义是「声明了引用就必须能
+     解析到值」，解析不到会抛 `MISSING_CREDENTIAL`，然后 `listModels` 把这条
+     provider 吞成空模型列表，宿主的模型目录再把空组过滤掉 —— 结果就是**配置里明明
+     有，模型选择器里一个都看不到**。真要校验 key 的机器（vLLM `--api-key`）才写
+     `apiKeyEnv`，并且用 credentials 服务或环境变量把值备好。
 
   不需要关思考就在 `provision` 里写 `chatTemplateKwargs: null`。
 - 探测与写入失败都不会影响裁剪，把原因写进日志（默认
@@ -224,7 +232,8 @@ llama-server -m model.gguf --mmproj mmproj.gguf \
     providers:
       my-local:                       # provider id 自己定，带 local 标记会被自动识别
         displayName: 本地 llama.cpp
-        apiKeyEnv: DSH_LOCAL_LLM_API_KEY  # 见上文第 3 点：缺了会静默返回空串
+        headers:                        # 见上文第 3 点：不加这个头 pi-ai 直接抛
+          Authorization: Bearer local
         api: openai-completions
         baseURL: http://127.0.0.1:8090/v1
         defaultContextWindow: 65536     # 必须和 -c 一致
@@ -262,7 +271,8 @@ providers:
     displayName: Ollama
     api: openai-completions
     baseURL: http://localhost:11434/v1
-    apiKeyEnv: OLLAMA_API_KEY        # 随便填个值，Ollama 不校验
+    headers:
+      Authorization: Bearer local    # Ollama 不校验，但 pi-ai 要这个头
     defaultContextWindow: 32768
     defaultMaxTokens: 4096
 ```
@@ -284,7 +294,7 @@ providers:
     displayName: vLLM
     api: openai-completions
     baseURL: http://192.168.1.9:8000/v1   # 局域网机器也自动识别（192.168.x）
-    apiKeyEnv: VLLM_API_KEY
+    apiKeyEnv: VLLM_API_KEY               # 只有开了 --api-key 才需要；值要真配上
     defaultContextWindow: 32768
     defaultMaxTokens: 4096
     compat:
@@ -302,7 +312,8 @@ providers:
     displayName: LM Studio
     api: openai-completions
     baseURL: http://127.0.0.1:1234/v1
-    apiKeyEnv: LMSTUDIO_API_KEY
+    headers:
+      Authorization: Bearer local    # LM Studio 不校验
     defaultContextWindow: 16384
     defaultMaxTokens: 4096
 ```
@@ -338,7 +349,6 @@ providers:
           # 第三方（装了才有）
           - tool:mindmap
           - free-search:engines
-          - dsh-purge:anchor
           - dshpg-capabilities
           - mnemon:routing
           - plugin:dsh-imagegen
@@ -401,6 +411,11 @@ EOF
 内置默认（`DEFAULT_INJECT`）是一页纸的版本：身份 + 5 条行为准则 + 工具速查 + 输出格式。
 正文多长不影响正确性，只影响省下的量 —— 想更省就写更短，但别把工具用法删到模型认不出。
 
+注入正文写进哪个段由机器决定，不用你配：装了 `dsh-purge` 就沿用它的段名 `dsh-purge`
+（它按精确名认段，宿主也被它的补丁改成只留 `name.startsWith('dsh-purge')` 的段）；没装就写进
+`local-trim:inject`。读的时候两个名字都认，热装/热卸不会漏。段名变了也能认出来 ——
+`dsh-purge` 升级成 `dsh-purge:v2` 之类的前缀仍会被当成注入段替换掉。
+
 ---
 
 ## 云端隔离
@@ -431,7 +446,7 @@ v0.4.0 起版面按「先看状态，再动手」重排，从上到下五块：
 
 | 徽章 | 含义 |
 | --- | --- |
-| 接管 prompt.assemble | 生效方式（叠在 dsh-purge 外层 / 叠在既有访问器外层 / 接管原生），失败时直接把原因写在这里 |
+| 接管 prompt.assemble | 生效方式（叠在既有访问器外层 / 接管原生），失败时直接把原因写在这里 |
 | 注入正文 | 一页纸注入有多少字符、来源是 `config` / `light-inject.md` / 内置 |
 | 一步到位 | 自动注册 provider 的结果 |
 | 提示词裁剪 / schema 瘦身 | 两层各自的开关状态 |
@@ -803,7 +818,7 @@ client 半边没有宿主 —— 这个 profile 没有 client-modules 服务，�
 ```
 ✓ tools 服务          可 restrict
 ✓ systemPrompt 服务   可用
-✓ dsh-purge           已装（本插件在其外层收尾，无需改它源码）
+✓ dsh-purge（可选）  已装 → 注入段沿用它的段名，本插件在其外层收尾
 ✓ assemble 接管       accessor+purge-slot
 ✓ 轻量注入正文        <字符数>，来源 ~/.dsh/local-llm/light-inject.md
 ✓ 工具白名单          <keep 项数> 项
@@ -1012,9 +1027,17 @@ reserveMb: 1024
 ## 已知边界
 
 - 只做本进程内的裁剪，不碰模型权重，不改任何第三方插件源码。
-- `dsh-purge` 未安装时也能工作（接管原生 `prompt.assemble`），只是没有头 80 / 尾 96 的
+- `dsh-purge` 是可选增强，不是前提：装了就把注入段写进它的段名（它按精确名认段，宿主也
+  被它的补丁改成只留 `name.startsWith('dsh-purge')` 的段，换名字注入会被丢掉）；没装就写进
+  本插件自己的 `local-trim:inject`，接管原生 `prompt.assemble`，只是没有头 80 / 尾 96 的
   保留逻辑（没有那层兜底就不需要）。
 - 段名来自各插件的 `systemPrompt.section({ name })`，插件升级改段名后要在 `dropSections` 里同步。
+- **插件不会去改你已经写好的 provider 配置。** 0.5.3 之前写进去的 provider 里带着
+  `apiKeyEnv: DSH_LOCAL_LLM_API_KEY` 这类凭据引用，如果那个 ref 从没被赋过值，宿主会抛
+  `MISSING_CREDENTIAL` → `listModels` 返回空 → 模型目录把整组过滤掉，**选择器里就一个本地
+  模型都没有**（配置看着是好的，所以特别难查）。升级后新写入的 provider 不再带 `apiKeyEnv`，
+  但旧的那几条要你自己动手：删掉 `apiKeyEnv` 那行、或给那个 ref 配上值。面板会把「凭据没有值
+  → 选择器里看不到」标成 warn 提示。
 - llama.cpp 侧的调参只到「一键拉起时给一组能跑的默认值」（`--n-gpu-layers auto --fit on --cache-type-k/v q8_0`）；要换量化、换 KV cache 精度、限并发，改高级配置里的启动命令，插件不替你优化推理性能。
 - **资源预检是估算，不是保证。** `checkModelFit` 用 `os.freemem()` / `os.totalmem()`、
   模型文件体积、以及探测到的显存总量做减法：`hostBytes = sizeBytes − gpuBytes`。
@@ -1036,7 +1059,7 @@ npm test                        # 只跑测试（unit + portable + host）
 npm run test:portable           # 只跑跨平台候选表推演（linux / darwin / win32 各一遍）
 npm run test:sim                # 假装自己是 linux / darwin，把整套测试再跑一遍
 
-node test/selfcheck.mjs         # 两个场景：装了 / 没装 dsh-purge
+node test/selfcheck.mjs         # 三个场景：装了 dsh-purge / 没装 / 默认值普适性
 node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）

@@ -115,7 +115,8 @@ check('显示名带后端', profile.displayName.includes('llama.cpp'), profile.d
 check('默认关思考（避免 content 被 reasoning 吃光）', profile.compat?.chatTemplateKwargs?.enable_thinking === false)
 check('thinkingFormat 一起写进 compat', profile.compat?.thinkingFormat === 'chat-template')
 check('模型声明 reasoningEfforts（否则 enable_thinking 发不出去）', profile.models?.[0]?.reasoningEfforts?.low === 'low')
-check('provider 带 apiKeyEnv（本地端点也会要求 Authorization 头）', typeof profile.apiKeyEnv === 'string' && profile.apiKeyEnv.length > 0)
+check('默认不声明 apiKeyEnv（声明了就必须能解析到值，否则选择器里看不到这个 provider）', profile.apiKeyEnv === undefined, String(profile.apiKeyEnv))
+check('默认带一个兜底 Authorization 头（pi-ai 没有 key 也没有这个头会直接抛）', profile.headers?.Authorization === 'Bearer local', JSON.stringify(profile.headers))
 
 const noKwargs = buildProfile({
   provider: 'x',
@@ -124,6 +125,15 @@ const noKwargs = buildProfile({
   chatTemplateKwargs: null,
 })
 check('可显式关掉 compat', noKwargs.compat === undefined)
+
+const named = buildProfile({
+  provider: 'x',
+  baseURL: 'http://127.0.0.1:8000/v1',
+  models: hit.models,
+  apiKeyEnv: 'MY_LOCAL_KEY',
+})
+check('显式给了 apiKeyEnv 才写进去', named.apiKeyEnv === 'MY_LOCAL_KEY', String(named.apiKeyEnv))
+check('声明了凭据引用就不再塞兜底 Authorization（会和真 key 抢同一个头）', named.headers === undefined, JSON.stringify(named.headers))
 
 console.log('\n=== 6. 写 settings ===')
 const writes = []

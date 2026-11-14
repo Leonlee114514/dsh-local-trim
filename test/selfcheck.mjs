@@ -79,9 +79,11 @@ const HOST_SCOPED_TOOLS = [
   'ops_read_files',
 ]
 
-const mkSections = () => [
+// 装了 dsh-purge 的机器上，装配里有一个 dsh-purge 注入段；
+// 没装的机器上根本没有这个段 —— 这一点必须如实模拟，否则测不到「补段」那条路。
+const mkSections = (withPurge = true) => [
   { name: 'harness:identity', text: 'identity body' },
-  { name: 'dsh-purge', text: BIG_INJECT, order: -100000, interpolate: false },
+  ...(withPurge ? [{ name: 'dsh-purge', text: BIG_INJECT, order: -100000, interpolate: false }] : []),
   { name: 'tool:read', text: 'read tool' },
   { name: 'tool:mindmap', text: 'M'.repeat(900) },
   { name: 'free-search:engines', text: 'S'.repeat(500) },
@@ -188,7 +190,7 @@ async function scenario(withPurge) {
   const tools = makeTools()
   const prompt = {}
   // 原生 assemble(context)：只收一个参数，内部组装出 assembly
-  const nativeAssemble = async (_context) => ({ sections: mkSections(), contexts: [], tools: [] })
+  const nativeAssemble = async (_context) => ({ sections: mkSections(withPurge), contexts: [], tools: [] })
   let purge
   if (withPurge) {
     purge = installPurgeGuard(prompt, nativeAssemble)
@@ -235,9 +237,16 @@ async function scenario(withPurge) {
   const out = await prompt.assemble({ agent: localAgent })
 
   const keptNames = out.sections.map((s) => s.name)
-  const injectSection = out.sections.find((s) => s.name === 'dsh-purge')
+  // 段名跟着「有没有 dsh-purge」走：装了沿用 dsh-purge，没装用本插件自己的名字。
+  const expectedInjectName = withPurge ? 'dsh-purge' : 'local-trim:inject'
+  const injectSection = out.sections.find((s) => s.name === expectedInjectName)
   check('大段被丢', !keptNames.includes('tool:mindmap') && !keptNames.includes('free-search:engines'))
   check('保留 tool:read / tool:bash', keptNames.includes('tool:read') && keptNames.includes('tool:bash'))
+  check(
+    `注入段用了 ${expectedInjectName}`,
+    Boolean(injectSection),
+    `段名=${JSON.stringify(keptNames)}`,
+  )
   check('注入被换成轻量版', Boolean(injectSection) && injectSection.text.includes('LIGHT BODY'))
   check('inject 段 interpolate=false', injectSection.interpolate === false)
   check(
@@ -262,11 +271,20 @@ async function scenario(withPurge) {
     check('无 dsh-purge 时正文即轻量版', injectSection.text === 'LIGHT BODY', `len=${injectSection.text.length}`)
   }
 
-  // 云端：必须拿到同一对象、注入完整
+  // 云端：必须原样放行，一个字都不动
   const cloudOut = await prompt.assemble({ agent: cloudAgent })
-  const cloudInject = cloudOut.sections.find((s) => s.name === 'dsh-purge')
-  check('云端段数不变', cloudOut.sections.length === mkSections().length, `len=${cloudOut.sections.length}`)
-  check('云端注入完整', Boolean(cloudInject) && cloudInject.text.length === refText.length)
+  check('云端段数不变', cloudOut.sections.length === mkSections(withPurge).length, `len=${cloudOut.sections.length}`)
+  if (withPurge) {
+    const cloudInject = cloudOut.sections.find((s) => s.name === 'dsh-purge')
+    check('云端注入完整', Boolean(cloudInject) && cloudInject.text.length === refText.length)
+  } else {
+    // 没装 dsh-purge 时装配里本来就没有注入段；云端更不该凭空多出一段。
+    check(
+      '云端没有凭空多出注入段',
+      !cloudOut.sections.some((s) => s.name === 'local-trim:inject'),
+      `段名=${JSON.stringify(cloudOut.sections.map((s) => s.name))}`,
+    )
+  }
 }
 
 await scenario(true)

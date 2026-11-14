@@ -362,6 +362,23 @@ window.__ModuleLoader__.load({
                     (row.contextWindow ? ' · ctx ' + fmt(row.contextWindow) : ''),
                 ),
                 row.local ? h('span', { style: S.hint }, '· 本地') : null,
+                // 凭据声明了却解析不到值 —— 宿主会把这条 provider 的模型列表吞成空，
+                // 于是配置里看得见、模型选择器里一个都没有。只有这种情况才提示；
+                // 已配置或没声明凭据都不占地方。
+                row.credential?.configured === false
+                  ? h(
+                      'span',
+                      {
+                        style: { ...S.hint, color: TONE.warn },
+                        title:
+                          '这条 provider 声明了凭据引用 ' +
+                          row.credential.ref +
+                          '，但那个 ref 没有值。宿主的 listModels 会因此返回空列表，' +
+                          '模型选择器里就看不到它。删掉 apiKeyEnv 那行、或给它配个值。',
+                      },
+                      '· 凭据未配置',
+                    )
+                  : null,
                 h('span', { style: S.grow }),
                 h('span', { style: S.hint }, row.state?.label ?? ''),
                 // 本地 provider 一律给「拉起」：灯是灰的（未检测）时也需要这个按钮，
