@@ -86,6 +86,28 @@ LM Studio 数据目录之后）。**没有删除任何候选** —— 本机实�
 `test/autodetect.mjs` 的「routes 缺省」三条跟着语义改了：现在缺省走自动识别，
 `local-qwen` 与 `ollama` 都该命中，云端仍放行。
 
+### 发布到 npm：新用户不再需要 git
+
+这一版同时发了 npm（`dsh-local-trim@0.5.2`），起因是排查「新用户从市场下载能不能装成功」时
+发现了一条硬门槛：宿主对 `github:` 源会先跑 `git -c credential.helper= ls-remote -- <repo> HEAD`
+探连通性，而 DSH 桌面端**不自带 git**。没有 git 的机器上这条路必失败，且两侧的报错都指错方向
+（命令行说「add the exact key under `allowBuilds`」，市场说「找不到能用的 pnpm…退出码 9009」，
+真实原因只是那句中文的「不是内部或外部命令」被归进了 `unknown`）。
+
+改成 `dsh plugin add dsh-local-trim` 之后走 registry tarball，pnpm 不需要 git。实测干净 PATH
+（无 git / 无 pnpm / 无 node，只用宿主自带的）→ exit 0、871 ms、`+ dsh-local-trim 0.5.2`，
+boot 自检 11 行全绿。
+
+> registry 里会多出一个 `0.0.0-stage`：npm 11 首次发布新包名时自动塞的 staged publishing 占位
+> 存根（`"stub": true`，336 B）。`dist-tags.latest` 不指向它，装不到它，无害。用 Granular
+> Access Token 删不掉（`E403 … may not perform this action`），要删只能去
+> `https://www.npmjs.com/package/dsh-local-trim/v/0.0.0-stage` 点 Delete version。
+
+市场条目不用改：`data/plugins/Leonlee114514__dsh-local-trim.yml` 里只写 url/name/category/description，
+`npm` 与 `version` 由市场仓库的 `scripts/probe-npm.mjs` 从 registry 自动解析（它要求 npm 包里的
+`repository` 指回同一个 GitHub 仓库，防抢名），每日 02:23 UTC 全量重探，所以最迟次日市场的安装
+命令会自动变成 npm 那条。
+
 验证：`npm run verify` → **1126 项 ✓ / 0 ✗**（0.5.1 是 1111）。
 
 ## [0.5.1] - 2026-11-14
@@ -206,7 +228,8 @@ settings 都不写。
 
 这版改不了宿主的行为，能做的两件事都做了：
 
-1. README 的「安装」开头加了一节「装之前先看这一条：机器上有没有 `git`」，写清楚怎么判断、
+1. README 的「安装」开头加了一节「装之前先看这一条：机器上有没有 `git`」（0.5.2 之后这节
+   挪到了「方式二：`github:` 源」底下，因为 npm 那条路不需要 git），写清楚怎么判断、
    各平台怎么装，以及**不想装 git 的绕法**——把源固定到 commit（`github:owner/repo#<sha>`）。
    这条实测能成：那种形式走 codeload tarball，pnpm 不需要 git；宿主那次 `git ls-remote`
    仍会失败但分类是 `unknown`、不中止安装。

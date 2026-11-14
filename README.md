@@ -50,35 +50,20 @@ token 会被立刻加回去。
 
 ## 安装
 
-### 装之前先看这一条：机器上有没有 `git`
+### 方式一：npm（推荐，v0.5.2 起）
 
-从 `github:` 源装插件时，宿主在真正跑 pnpm 之前会先执行一次
-`git -c credential.helper= ls-remote -- <repo> HEAD` 探连通性。**没有 git 就直接失败**，
-而且两侧的报错都指错方向：
-
-- 命令行 `dsh plugin add github:...` 会说「add the exact key under `allowBuilds`」（其实不是 build 被拦）
-- 市场会说「找不到能用的 pnpm…退出码 9009」（其实是那句中文的「不是内部或外部命令」被误当成 pnpm 故障）
-
-先确认一下：
+包已发布到 npm，**这条路不需要 git**，也不需要自己装 pnpm（宿主自带）：
 
 ```bash
-git --version        # 报「不是内部或外部命令」/ command not found 就先装 git
+dsh plugin add dsh-local-trim
 ```
 
-Windows 装 [Git for Windows](https://git-scm.com/download/win)，macOS 跑 `xcode-select --install`，
-Debian/Ubuntu 跑 `apt install git`。DSH 桌面端**不自带** git（安装树里没有任何 git 二进制），
-所以这是新机器的常见坑。
+钉版本：`dsh plugin add dsh-local-trim@0.5.2`。
 
-**不想装 git 的绕法**：把源固定到某个 commit —— 这种形式走 codeload tarball，pnpm 不需要 git：
+为什么要专门说「不需要 git」——因为从 `github:` 源装是另一条路，那条路上 git 是硬门槛，
+见下一节。桌面端不自带 git，新机器上这两条路的差别就是「装得上」和「装不上」。
 
-```bash
-dsh plugin add "github:Leonlee114514/dsh-local-trim#<40 位 commit sha>"
-```
-
-（sha 从仓库页面的 commit 列表里复制。宿主那条 `git ls-remote` 检查仍会跑一次并失败，
-但失败的分类是 `unknown` 而不会中止安装，pnpm 随后用 tarball 装成功 —— 这是实测过的路径。）
-
-### 方式一：`dsh plugin add`（推荐，v0.1.1 起）
+### 方式二：`github:` 源 + `dsh plugin add`（v0.1.1 起，需要 git）
 
 包已声明 `dsh.bundle`，装完自动生效，默认开启自动识别（`routes: []`）：
 
@@ -94,7 +79,34 @@ dsh plugin add github:Leonlee114514/dsh-local-trim
     routes: [my-local-provider]   # 只裁这一个 provider
 ```
 
-### 方式二：本地源码 + `link:`
+#### 这条路的前置条件：机器上得有 `git`
+
+宿主在真正跑 pnpm 之前会先执行一次 `git -c credential.helper= ls-remote -- <repo> HEAD`
+探连通性。**没有 git 就直接失败**，而且两侧的报错都指错方向：
+
+- 命令行 `dsh plugin add github:...` 会说「add the exact key under `allowBuilds`」（其实不是 build 被拦）
+- 市场会说「找不到能用的 pnpm…退出码 9009」（其实是那句中文的「不是内部或外部命令」被误当成 pnpm 故障）
+
+先确认一下：
+
+```bash
+git --version        # 报「不是内部或外部命令」/ command not found 就先装 git
+```
+
+Windows 装 [Git for Windows](https://git-scm.com/download/win)，macOS 跑 `xcode-select --install`，
+Debian/Ubuntu 跑 `apt install git`。DSH 桌面端**不自带** git（安装树里没有任何 git 二进制），
+所以这是新机器的常见坑。**能装 npm 那条路就别走这条**（见方式一）。
+
+**不想装 git 的绕法**：把源固定到某个 commit —— 这种形式走 codeload tarball，pnpm 不需要 git：
+
+```bash
+dsh plugin add "github:Leonlee114514/dsh-local-trim#<40 位 commit sha>"
+```
+
+（sha 从仓库页面的 commit 列表里复制。宿主那条 `git ls-remote` 检查仍会跑一次并失败，
+但失败的分类是 `unknown` 而不会中止安装，pnpm 随后用 tarball 装成功 —— 这是实测过的路径。）
+
+### 方式三：本地源码 + `link:`
 
 适合改代码调试。
 
