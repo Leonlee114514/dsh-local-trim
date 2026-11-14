@@ -1248,6 +1248,7 @@ window.__ModuleLoader__.load({
       const inject = status.inject ?? {}
       const provision = status.provision ?? {}
       const flags = status.flags ?? {}
+      const legacy = status.legacy ?? null
 
       return h(
         'div',
@@ -1271,6 +1272,17 @@ window.__ModuleLoader__.load({
 
         // ② 收益条
         h(TrimBar, { status }),
+
+        // ②.5 旧默认值提示
+        // 配置字段一旦写进 profile 就永久留着，插件分不清那是用户要的还是上一版默认值。
+        // 不说这一句，用户会以为「升级了但白名单怎么还是老样子」。
+        legacy !== null
+          ? h(
+              'div',
+              { style: { ...S.hint, color: TONE.warn }, title: legacy.detail ?? '' },
+              legacy.label + '（点保存可以固化；改这两个框就按你写的算）',
+            )
+          : null,
 
         state.writable === false
           ? h('div', { style: S.bad }, '宿主没有把本插件登记成可写设置条目，面板只能看不能改。重载一次插件通常能修好。')

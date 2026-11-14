@@ -302,6 +302,61 @@ await ok('全都不在：bad（这条 provider 该删了，不是该改配置）
   assert.match(row.models.label, /全不在了/)
 })
 
+// 「在线」说的是这条 provider 能不能用，不是端口能不能 ping 通。
+// 端点活着但模型全没了，点进去每个模型都是 404 —— 这时候挂绿点就是在骗人。
+await ok('部分模型不在后端：徽章从绿降到 warn，不再只说「在线」', () => {
+  const status = buildPanelStatus({
+    providers: [twoModels],
+    online: { 'local-ollama': { ok: true, ms: 10, models: [{ id: 'gemma4:12b' }] } },
+  })
+  const row = status.providers[0]
+  assert.equal(row.state.tone, 'warn')
+  assert.match(row.state.label, /在线/)
+  assert.match(row.state.label, /10ms/)
+  assert.match(row.state.label, /1 个模型不在后端/)
+})
+
+await ok('配置里的模型后端全没有：徽章直接 bad，并说清端口是通的', () => {
+  const status = buildPanelStatus({
+    providers: [twoModels],
+    online: { 'local-ollama': { ok: true, ms: 10, models: [{ id: 'something-else' }] } },
+  })
+  const row = status.providers[0]
+  assert.equal(row.state.tone, 'bad')
+  assert.match(row.state.label, /端口通/)
+  assert.match(row.state.label, /全没有/)
+  assert.doesNotMatch(row.state.label, /^连不上/)
+})
+
+await ok('探测没回模型清单（live 未知）时保持绿：不知道 ≠ 没有', () => {
+  const status = buildPanelStatus({
+    providers: [twoModels],
+    online: { 'local-ollama': { ok: true, ms: 10 } },
+  })
+  const row = status.providers[0]
+  assert.equal(row.state.tone, 'good')
+  assert.match(row.state.label, /^在线 · 10ms$/)
+  assert.deepEqual(row.missingModels, [])
+})
+
+await ok('表头「在线 N 个」跟行徽章同一套判据：全死的不算在线', () => {
+  const status = buildPanelStatus({
+    providers: [
+      { id: 'local-a', profile: { baseURL: 'http://127.0.0.1:11434/v1', models: [{ id: 'x' }] } }, // 全死
+      { id: 'local-b', profile: { baseURL: 'http://127.0.0.1:11434/v1', models: [{ id: 'y' }] } }, // 活
+      { id: 'local-c', profile: { baseURL: 'http://127.0.0.1:11434/v1', models: [{ id: 'z' }, { id: 'w' }] } }, // 部分死
+    ],
+    online: {
+      'local-a': { ok: true, ms: 10, models: [] },
+      'local-b': { ok: true, ms: 10, models: [{ id: 'y' }] },
+      'local-c': { ok: true, ms: 10, models: [{ id: 'z' }] },
+    },
+  })
+  assert.equal(status.counts.local, 3)
+  // a 全死 → 不算；b 一致 → 算；c 部分不在 → 还算（能用，只是配置该改）
+  assert.equal(status.counts.online, 2)
+})
+
 await ok('表头汇总：几条对不上、一共几条旧模型', () => {
   const status = buildPanelStatus({
     providers: [
