@@ -45,12 +45,22 @@ jobs:
           "
       - name: Self-check (with and without dsh-purge)
         run: node test/selfcheck.mjs
+      # 这个插件目前只能从 github: 源装，而宿主装 git 源之前先跑 git ls-remote ——
+      # 新机器没装 Git 就直接失败，报错还指错方向。发到 npm 才能绕开。
+      # 这条把「发上去能装」的几件事钉住（publishConfig / files / dsh 声明 / optional peer）。
+      - name: Publish readiness (manifest only, no network)
+        run: node test/publish.mjs
       - name: Provider auto-detection
         run: node test/autodetect.mjs
       - name: One-step provision (probe + register)
         run: node test/provision.mjs
       - name: Control panel view model and import flow
         run: node test/panel.mjs
+      # 面板只在 web profile 里画得出来（槽位由 dsh-client-ui-plugin-manager 提供）。
+      # headless/sdk/acp 上没有这个服务，inject 回调永不触发 —— 原来那里一行日志都没有，
+      # 用户装完只会觉得「没反应」。这条用例钉住「有没有宿主都要说出来」。
+      - name: Client half host detection (web vs headless)
+        run: node test/client-host.mjs
       - name: Control panel bridge routes (apply + fake settings/backend)
         run: node test/panel-host.mjs
       - name: One-click backend launch (plan + wait, no real spawn)

@@ -95,14 +95,16 @@ for (const provider of CLOUD) {
   check(`${provider} 原样放行`, out === assembly, `段=${out.sections.length}`)
 }
 
-// 不写 routes 时退回 local-qwen
+// 不写 routes（undefined / 非数组）时按「没给名单」处理 = 自动识别，不猜任何 provider 名
 calls.length = 0
 apply(makeCtx(), { injectText: 'LIGHT', schemaTrim: false, selfCheck: false, provision: false })
 const h2 = calls.find((c) => c.event === 'system-prompt/assemble')?.handler
 const a1 = makeAssembly()
-check('routes 缺省仍只认 local-qwen（local-qwen 命中）', (await h2(a1, { agent: makeAgent('local-qwen') }, async () => a1)) !== a1)
+check('routes 缺省仍走自动识别（local-qwen 命中）', (await h2(a1, { agent: makeAgent('local-qwen') }, async () => a1)) !== a1)
 const a2 = makeAssembly()
-check('routes 缺省时 ollama 不命中', (await h2(a2, { agent: makeAgent('ollama') }, async () => a2)) === a2)
+check('routes 缺省时 ollama 也按地址自动命中', (await h2(a2, { agent: makeAgent('ollama') }, async () => a2)) !== a2)
+const a4 = makeAssembly()
+check('routes 缺省时云端仍放行', (await h2(a4, { agent: makeAgent('deepseek-official') }, async () => a4)) === a4)
 
 // schemaTrim: false 时 tools 不动
 calls.length = 0

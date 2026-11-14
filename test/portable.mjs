@@ -147,7 +147,41 @@ await ok('localModelDirs：尊重 DSH_LOCAL_MODELS_DIR', async () => {
   })
 })
 
+await ok('目录约定排在通用位置之后（别让私人习惯压过标准布局）', async () => {
+  const roots = modelRoots()
+  // ~/.workbuddy/local-models 是「装了 WorkBuddy 才有」的约定，不能排在
+  // llama.cpp / LM Studio 的通用位置前面
+  const workbuddy = roots.findIndex((dir) => /\.workbuddy[\\/]local-models$/.test(dir))
+  const llamaCpp = roots.findIndex((dir) => /llama\.cpp[\\/]models$/.test(dir))
+  assert.ok(workbuddy > llamaCpp && llamaCpp >= 0, `workbuddy=${workbuddy} llama.cpp=${llamaCpp}`)
+
+  const dirs = localModelDirs()
+  const ai = dirs.findIndex((dir) => /[\\/]AI[\\/]models$/.test(dir))
+  const lmstudio = dirs.findIndex((dir) => /LM-Studio[\\/]models$/.test(dir))
+  if (ai >= 0) assert.ok(ai > lmstudio, `AI/models=${ai} LM-Studio=${lmstudio}`)
+})
+
 console.log('=== 跨平台：可执行文件候选 ===')
+
+await ok('KNOWN_LAUNCHERS：显式变量 → 标准位置 → 目录约定 → 裸名字', async () => {
+  const io = { exists: () => false, listDir: () => [] }
+  for (const known of KNOWN_LAUNCHERS) {
+    const list = known.candidates(io)
+    const last = list[list.length - 1]
+    assert.ok(
+      typeof last === 'string' && !last.includes('/') && !last.includes(String.fromCharCode(92)),
+      `${known.id} 的候选表最后一项应该是裸命令名，实际是 ${last}`,
+    )
+  }
+  const ollama = KNOWN_LAUNCHERS.find((item) => item.id === 'ollama')
+  await withEnv({ OLLAMA_BIN: '/opt/custom/ollama' }, async () => {
+    assert.equal(ollama.candidates(io)[0], '/opt/custom/ollama')
+  })
+  const llama = KNOWN_LAUNCHERS.find((item) => item.id === 'llamacpp')
+  await withEnv({ LLAMA_SERVER_BIN: '/opt/custom/llama-server' }, async () => {
+    assert.equal(llama.candidates(io)[0], '/opt/custom/llama-server')
+  })
+})
 
 await ok('KNOWN_LAUNCHERS：每个后端的 candidates 都是非空字符串数组', async () => {
   const io = { exists: () => false, listDir: () => [] }

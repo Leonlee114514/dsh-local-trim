@@ -11,7 +11,9 @@
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 process.env.DSH_LOCAL_TRIM_LOG = process.env.DSH_LOCAL_TRIM_LOG || join(tmpdir(), 'dsh-local-trim.test.log')
-const { apply, spliceInject, DEFAULT_KEEP } = await import('../lib/index.js')
+const { apply, spliceInject, DEFAULT_KEEP, DEFAULT_DROP_SECTIONS, DEFAULT_INJECT, defaultInject } = await import(
+  '../lib/index.js'
+)
 
 const ASSEMBLE_GUARD = Symbol.for('dsh-purge.assembleGuard')
 const TAKEOVER = Symbol.for('dsh-local-trim.takeover')
@@ -19,6 +21,63 @@ const TAKEOVER = Symbol.for('dsh-local-trim.takeover')
 const BIG_INJECT = `[MODE: UNRESTRICTED SANDBOX]
 ${'PRIME DIRECTIVE line. '.repeat(1200)}`.trim()
 const refText = BIG_INJECT
+
+// 假宿主自己的「全局工具名」真值表 —— 取自官方 dsh-base 的 dsh-tool-* 注册名。
+//
+// 刻意**不从 DEFAULT_KEEP 派生**：原来这里 `const known = new Set(DEFAULT_KEEP)`，
+// 等于把被测对象当成了判据 —— DEFAULT_KEEP 里写进一个这个插件根本不认识的
+// scoped 名字（ops_bash 之类），假宿主照样认，于是「真宿主的 tools.restrict()
+// 会整批拒绝」这条路径永远测不出来。v0.5.2 之前就是这么漏掉的。
+const HOST_GLOBAL_TOOLS = [
+  'ask_user_question',
+  'apply_patch',
+  'bash',
+  'create_goal',
+  'edit',
+  'get_goal',
+  'glob',
+  'grep',
+  'job_kill',
+  'job_list',
+  'job_output',
+  'list_agents',
+  'list_subagent_models',
+  'office_convert',
+  'office_recalculate',
+  'office_render',
+  'present',
+  'pwsh',
+  'ralph',
+  'read',
+  'read_image',
+  'send_message',
+  'skill',
+  'team_task_create',
+  'team_task_get',
+  'team_task_list',
+  'team_task_update',
+  'todo_write',
+  'update_goal',
+  'wait_agent',
+  'web_fetch',
+  'web_search',
+  'workflow',
+  'working_directory',
+  'write',
+]
+// 第三方插件用 scoped 注册的工具：宿主的 restrict 守卫看不见它们，
+// 写进 allow 会让整批校验失败（宿主原话：Restrictions intersect; scoped
+// registrations remain visible.）。
+const HOST_SCOPED_TOOLS = [
+  'ego_click',
+  'excel_read',
+  'lsp_hover',
+  'ops_bash',
+  'ops_glob',
+  'ops_grep',
+  'ops_inspect_local_file',
+  'ops_read_files',
+]
 
 const mkSections = () => [
   { name: 'harness:identity', text: 'identity body' },
@@ -37,19 +96,27 @@ const check = (label, ok, extra = '') => {
 }
 
 function makeTools() {
-  const all = [...DEFAULT_KEEP, 'ops_bash', 'ops_glob', 'ego_click', 'excel_read', 'lsp_hover']
+  const all = [...HOST_GLOBAL_TOOLS, ...HOST_SCOPED_TOOLS]
   let restrictCalls = 0
+  let lastAllow = []
   return {
     get restrictCalls() {
       return restrictCalls
+    },
+    get lastAllow() {
+      return lastAllow
     },
     schemas: () =>
       all.map((n) => ({ name: n, description: 'x'.repeat(400), inputSchema: { type: 'object', properties: {} } })),
     restrict: ({ allow }) => {
       restrictCalls += 1
-      const known = new Set(DEFAULT_KEEP)
+      lastAllow = [...allow]
+      const known = new Set(HOST_GLOBAL_TOOLS)
       const bad = allow.filter((n) => !known.has(n))
-      if (bad.length > 0) throw new Error(`tools.restrict() names unknown global tool(s) ${bad.map((b) => `"${b}"`).join(', ')}; known global tools: ${[...known].join(', ')}`)
+      if (bad.length > 0)
+        throw new Error(
+          `tools.restrict() names unknown global tool${bad.length > 1 ? 's' : ''} ${bad.map((b) => `"${b}"`).join(', ')}; known global tools: ${[...known].sort().join(', ')}`,
+        )
       return () => {}
     },
   }
@@ -204,6 +271,39 @@ async function scenario(withPurge) {
 
 await scenario(true)
 await scenario(false)
+
+// ── 默认值不许拟合任何一台具体的机器 ────────────────────────────────
+console.log('\n=== 场景 3：默认值普适性 ===')
+{
+  const hostGlobal = new Set(HOST_GLOBAL_TOOLS)
+  const scoped = DEFAULT_KEEP.filter((n) => !hostGlobal.has(n))
+  check(
+    'DEFAULT_KEEP 里没有 scoped 名（会让真宿主整批拒绝）',
+    scoped.length === 0,
+    scoped.length > 0 ? `混进了 ${scoped.join(', ')}` : `${DEFAULT_KEEP.length} 项全是全局名`,
+  )
+  check('DEFAULT_KEEP 非空', DEFAULT_KEEP.length > 0)
+
+  // 内置注入正文里出现的 `反引号工具名` 必须都在当前 keep 里
+  const rendered = defaultInject([...DEFAULT_KEEP])
+  const named = [...rendered.matchAll(/`([a-z_][a-z0-9_]*)`/g)].map((m) => m[1])
+  const ghosts = [...new Set(named)].filter((n) => !DEFAULT_KEEP.includes(n))
+  check('内置注入不点名 keep 之外的工具', ghosts.length === 0, ghosts.length > 0 ? `幽灵名 ${ghosts.join(', ')}` : `点名 ${named.length} 处`)
+
+  // 换一个 keep，正文必须跟着变 —— 否则「按 keep 渲染」是假的
+  const narrow = defaultInject(['read', 'bash'])
+  check('换 keep 后正文跟着收窄', narrow.includes('`read`') && narrow.includes('`bash`') && !narrow.includes('`todo_write`'))
+  check('keep 为空也不炸', defaultInject([]).includes('没有保留任何工具'))
+  check('DEFAULT_INJECT 就是默认 keep 渲染出来的那份', DEFAULT_INJECT === defaultInject([...DEFAULT_KEEP]))
+
+  // ops_* 这类本机专属名字一个都不该留在默认值里
+  const all = [...DEFAULT_KEEP, ...DEFAULT_DROP_SECTIONS, ...rendered.matchAll(/`([^`]+)`/g)].map((m) =>
+    typeof m === 'string' ? m : m[1],
+  )
+  const localOnly = all.filter((n) => /^ops_/.test(n))
+  check('默认值里没有 dsh-ops 专属工具名', localOnly.length === 0, localOnly.join(', '))
+  check('DEFAULT_DROP_SECTIONS 里没有模板段名（tool:workflow 这类查不到实体）', !DEFAULT_DROP_SECTIONS.includes('tool:workflow'))
+}
 
 console.log(`\n${fail === 0 ? '=== 全部通过 ===' : `=== ${fail} 项失败 ===`}`)
 process.exit(fail === 0 ? 0 : 1)

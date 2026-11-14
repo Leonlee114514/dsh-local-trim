@@ -143,7 +143,18 @@ const settingsStub = {
   update: async (ns, patch, revision) => {
     updates.push({ ns, patch, revision })
     const row = settingsState[ns] ?? { revision: 0, value: {} }
-    settingsState[ns] = { revision: row.revision + 1, value: { ...row.value, ...patch } }
+    // 照 dsh-settings 的 mergeLayers 写：plain object 递归合并，其它值（含数组）整体替换。
+    // 用 `{...row.value, ...patch}` 平铺会把整个 providers 表换掉 —— 那样「对齐只动了一条
+    // provider」这件事在测试里根本验不出来（别的 provider 全没了，存下来的引用也失效）。
+    const merge = (under, over) => {
+      const out = { ...under }
+      for (const [key, value] of Object.entries(over ?? {})) {
+        const plain = (node) => node !== null && typeof node === 'object' && !Array.isArray(node)
+        out[key] = plain(value) && plain(under?.[key]) ? merge(under[key], value) : value
+      }
+      return out
+    }
+    settingsState[ns] = { revision: row.revision + 1, value: merge(row.value, patch) }
   },
   // 真删键只能走 mutate 的 unset —— update 走 mergeLayers，写 null 只会留下一个 null。
   // 这里照 dsh-settings 的语义实现：只在「用户层自己定义过」时真删，否则键留着。
@@ -244,8 +255,8 @@ const callRoute = async (name, body) => {
   return { status, body: text.length > 0 ? JSON.parse(text) : undefined }
 }
 
-console.log('\n=== 1. 十三条路由都注册上了 ===')
-for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch', 'stop', 'models', 'adopt', 'delete']) {
+console.log('\n=== 1. 十四条路由都注册上了 ===')
+for (const name of ['describe', 'save', 'probe', 'log', 'status', 'check', 'import', 'test', 'launch', 'stop', 'models', 'adopt', 'delete', 'align']) {
   check(name, routes.has('/api/dsh-local-trim/' + name))
 }
 
@@ -279,6 +290,10 @@ console.log('\n=== 3. status：接管状态 + 收益 + provider 表 ===')
   check('云端 provider 不打灯', view.providers.find((r) => !r.local)?.state.tone === 'muted')
   check('values 一起带回来给表单用', typeof body.values === 'object' && body.values !== null)
   check('revision 带回来', body.revision === 3, `revision=${body.revision}`)
+  // 这份 ctxStub 没有 clientModules 服务，也没让 inject 回调跑 —— 正好是最坏情况。
+  // 面板宿存只能报「未知」，不能崩、也不能假报「有宿主」。
+  check('client 宿存一起带回来（stub 下是未知，不是缺字段）', typeof view.client?.state === 'string', `state=${view.client?.state}`)
+  check('client 宿存未知时不说「不可用」', !/不可用/.test(view.client?.label ?? ''), view.client?.label)
 }
 
 console.log('\n=== 4. check：强制刷新点灯 ===')
@@ -328,6 +343,47 @@ console.log('\n=== 8. import：模型不在列表里 ===')
   const { body } = await callRoute('import', { endpoint: 'http://127.0.0.1:8090', model: 'not-there' })
   check('ok=false', body.ok === false)
   check('列出可用模型供选择', Array.isArray(body.models) && body.models.includes('qwen3-4b'), JSON.stringify(body.models))
+}
+
+console.log('\n=== 8b. import：同一后端复用已有 provider，不再长出第二条 ==="')
+{
+  // 同一个 Ollama 每导入一个模型就新建一条 `local-ollama-<模型名>`，是面板上半截
+  // 越拉越长的根因。这里造一条通用条目 `local-ollama`，导入第二个模型时必须追加进去。
+  const cur = () => settingsState['llm-pi-ai'].value.providers
+  cur()['local-ollama'] = {
+    displayName: 'Ollama',
+    baseURL: 'http://127.0.0.1:11434/v1',
+    models: [{ id: 'gemma4:12b', contextWindow: 32768, maxTokens: 4096 }],
+  }
+
+  const before = updates.length
+  const { body } = await callRoute('import', { endpoint: 'http://127.0.0.1:11434', model: 'qwen3:4b' })
+  check('导入成功', body.ok === true, JSON.stringify(body.error ?? ''))
+  check('复用了 local-ollama', body.provider === 'local-ollama', `provider=${body.provider}`)
+  check('回报说清了是复用', body.reused === 'local-ollama', JSON.stringify(body.reused))
+  check('追加的是这个模型', body.appended === 'qwen3:4b', JSON.stringify(body.appended))
+  check('只写了一次 settings', updates.length === before + 1, `${before} → ${updates.length}`)
+
+  const row = cur()['local-ollama']
+  check('老模型还在', row.models.some((m) => m.id === 'gemma4:12b'), JSON.stringify(row.models.map((m) => m.id)))
+  check('新模型接在后面', row.models.some((m) => m.id === 'qwen3:4b'), JSON.stringify(row.models.map((m) => m.id)))
+  check('老模型条目没被改写', JSON.stringify(row.models.find((m) => m.id === 'gemma4:12b')) === JSON.stringify({ id: 'gemma4:12b', contextWindow: 32768, maxTokens: 4096 }), JSON.stringify(row.models.find((m) => m.id === 'gemma4:12b')))
+  check('displayName 没被覆盖', row.displayName === 'Ollama', String(row.displayName))
+  check('没有多长出一条 local-ollama-qwen3-4b', cur()['local-ollama-qwen3-4b'] === undefined, JSON.stringify(Object.keys(cur())))
+
+  // 再导入同一个模型：不重复加，也不当成失败 —— 用户想要的结果已经在了。
+  const dedupe = await callRoute('import', { endpoint: 'http://127.0.0.1:11434', model: 'qwen3:4b' })
+  check('重复导入不报错', dedupe.body.ok === true, JSON.stringify(dedupe.body.error ?? ''))
+  check('重复导入不重复加', cur()['local-ollama'].models.filter((m) => m.id === 'qwen3:4b').length === 1, JSON.stringify(cur()['local-ollama'].models.map((m) => m.id)))
+  check('重复导入标 alreadyThere', dedupe.body.alreadyThere === true, JSON.stringify(dedupe.body.alreadyThere))
+
+  // 用户显式点了 provider id 就是他有意指定，不许被「复用」改写。
+  const explicit = await callRoute('import', { endpoint: 'http://127.0.0.1:11434', model: 'qwen3:4b', provider: 'my-own-ollama' })
+  check('显式 provider 不被复用改写', explicit.body.provider === 'my-own-ollama', `provider=${explicit.body.provider}`)
+  check('显式 provider 建出独立条目', cur()['my-own-ollama'] !== undefined, JSON.stringify(Object.keys(cur())))
+
+  delete cur()['local-ollama']
+  delete cur()['my-own-ollama']
 }
 
 console.log('\n=== 9. test：对已注册 provider 试跑 ===')
@@ -610,6 +666,93 @@ console.log('\n=== 20. delete：删的是 provider 配置，不是磁盘上的 g
   check('unset 的 path 是 providers.<id>'
     , JSON.stringify(mutations.at(-1)?.ops ?? []) === JSON.stringify([{ op: 'unset', path: ['providers', doomed] }]),
     JSON.stringify(mutations.at(-1)?.ops ?? []))
+}
+console.log('\n=== 21. align：把 models 对齐到后端真的有的那份 ===')
+{
+  // mergeLayers 每一层都造新对象，所以这里不能存一次引用就用到底 —— 每次现取。
+  const cur = () => settingsState['llm-pi-ai'].value.providers
+  // 一条「声明 3 个、后端只有 1 个」的靶子（第 1 个活着，后 2 个是 ollama rm 留下的死声明）。
+  // contextWindow 故意写成 12345，用来验证「活着的条目原样保留，不拿探测值覆盖用户调参」。
+  const zombie = 'local-align-target'
+  cur()[zombie] = {
+    displayName: '本地对齐靶子',
+    baseURL: 'http://127.0.0.1:8090/v1',
+    defaultMaxTokens: 2048,
+    compat: { thinkingFormat: 'chat-template' },
+    models: [
+      { id: 'qwen3-4b', contextWindow: 12345, maxTokens: 777, reasoningEfforts: { off: null, low: 'low' } },
+      { id: 'deleted-a', contextWindow: 32768 },
+      { id: 'deleted-b', contextWindow: 32768 },
+    ],
+  }
+
+  const noName = await callRoute('align', {})
+  check('不说对齐哪个就直说', noName.body.ok === false && /对齐哪个 provider/.test(noName.body.error ?? ''), noName.body.error ?? '')
+
+  const ghost = await callRoute('align', { provider: '__nope__' })
+  check('不存在的 provider 明确报错', ghost.body.ok === false && /没有 provider/.test(ghost.body.error ?? ''), ghost.body.error ?? '')
+
+  // 连不上的端口 → 不许动配置。探测失败跟「后端一个模型都没有」是两回事，
+  // 混在一起会把整条 provider 的模型清空（数据丢失），这是必须钉住的一条。
+  const dead = 'local-align-dead'
+  cur()[dead] = {
+    baseURL: 'http://127.0.0.1:9999/v1',
+    models: [{ id: 'whatever', contextWindow: 4096 }],
+  }
+  const deadResult = await callRoute('align', { provider: dead })
+  check('后端连不上就不动配置', deadResult.body.ok === false && /连不上/.test(deadResult.body.error ?? ''), deadResult.body.error ?? '')
+  check('连不上时 models 一条没少', cur()[dead].models.length === 1, String(cur()[dead].models.length))
+  check('连不上时文案说配置没动', /配置没动/.test(deadResult.body.error ?? ''), deadResult.body.error ?? '')
+
+  const aligned = await callRoute('align', { provider: zombie })
+  check('对齐成功', aligned.body.ok === true, JSON.stringify(aligned.body))
+  check('报告摘掉了 2 条', Array.isArray(aligned.body.removed) && aligned.body.removed.length === 2, JSON.stringify(aligned.body.removed ?? []))
+  check('摘掉的是那两条死声明', JSON.stringify(aligned.body.removed ?? []) === JSON.stringify(['deleted-a', 'deleted-b']), JSON.stringify(aligned.body.removed ?? []))
+  check('活着的条目留在 kept 里', JSON.stringify(aligned.body.kept ?? []) === JSON.stringify(['qwen3-4b']), JSON.stringify(aligned.body.kept ?? []))
+  check('配置里只剩活的那条', cur()[zombie].models.length === 1, String(cur()[zombie].models.length))
+  check('留下来的还是那条活模型', cur()[zombie].models[0].id === 'qwen3-4b', String(cur()[zombie].models[0]?.id))
+  // 对齐只改 models：用户的调参（contextWindow/maxTokens/reasoningEfforts）和 compat 都不许被重置。
+  check('用户调参没被探测值覆盖', cur()[zombie].models[0].contextWindow === 12345 && cur()[zombie].models[0].maxTokens === 777, JSON.stringify(cur()[zombie].models[0]))
+  check('reasoningEfforts 没丢', cur()[zombie].models[0].reasoningEfforts?.low === 'low', JSON.stringify(cur()[zombie].models[0].reasoningEfforts))
+  check('compat 没被动', cur()[zombie].compat?.thinkingFormat === 'chat-template', JSON.stringify(cur()[zombie].compat))
+  check('baseURL 没被动', cur()[zombie].baseURL === 'http://127.0.0.1:8090/v1', String(cur()[zombie].baseURL))
+  check('文案说清摘掉几条', /摘掉 2 条/.test(aligned.body.message ?? ''), aligned.body.message ?? '')
+
+  // 再点一次：已经没有差值，必须报 changed:false 而不是又写一遍 settings。
+  const updatesBefore = updates.length
+  const again = await callRoute('align', { provider: zombie })
+  check('第二次对齐不再改动', again.body.ok === true && again.body.changed === false, JSON.stringify(again.body))
+  check('没有差值时一次 settings 都不写', updates.length === updatesBefore, `${updatesBefore} → ${updates.length}`)
+
+  // 后端有、配置没注册的模型要补进来：换一条只有死声明的空壳，指向 11434（那边报 qwen3:4b）。
+  const fresh = 'local-align-fresh'
+  cur()[fresh] = {
+    baseURL: 'http://127.0.0.1:11434/v1',
+    models: [{ id: 'gone-long-ago', contextWindow: 32768 }],
+  }
+  const filled = await callRoute('align', { provider: fresh })
+  check('补上了后端有但没注册的', JSON.stringify(filled.body.added ?? []) === JSON.stringify(['qwen3:4b']), JSON.stringify(filled.body.added ?? []))
+  check('补进来的用的是后端报的 id', cur()[fresh].models.some((model) => model.id === 'qwen3:4b'), JSON.stringify(cur()[fresh].models.map((m) => m.id)))
+  check('死声明一起摘掉', !cur()[fresh].models.some((model) => model.id === 'gone-long-ago'), JSON.stringify(cur()[fresh].models.map((m) => m.id)))
+
+  // 全部都不在 → 不许对齐成 0 个模型（llm-pi-ai 里空 models 是配置错误，不是「停用」）。
+  const allDead = 'local-align-alldead'
+  cur()[allDead] = {
+    baseURL: 'http://127.0.0.1:9999/v1',
+    models: [{ id: 'x' }, { id: 'y' }],
+  }
+  // 用一个「在线但一个模型都没有」的端口不好造，这里就近验证 planAlign 的拒绝分支：
+  // 直接 import 纯函数断言（路由层对空后端也会走同一条）。
+  const { planAlign } = await import('../lib/import-model.js')
+  const empty = planAlign({ declared: [{ id: 'x' }], live: [] })
+  check('全不在时 planAlign 拒绝', empty.ok === false && /应该直接删掉/.test(empty.error ?? ''), empty.error ?? '')
+  check('拒绝时不给空 models', empty.models === undefined, JSON.stringify(empty.models))
+
+  // 清场：别让后面（如果有）的断言看到这些靶子。
+  delete cur()[zombie]
+  delete cur()[dead]
+  delete cur()[fresh]
+  delete cur()[allDead]
 }
 console.log(`\n${fail === 0 ? '=== 面板宿主侧集成全部通过 ===' : `=== ${fail} 项失败 ===`}`)
 process.exit(fail === 0 ? 0 : 1)

@@ -4,6 +4,270 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.5.2] - 2026-11-14
+
+一句话：**默认值不再拟合这台机器。** 起因是一个很自然的追问 ——「之前那些问题是不是因为
+插件过分拟合本机环境了」。查下来 0.5.1 修的那三个 bug 都不是，但顺藤摸出五处确实只对
+本机成立的默认值，其中一处会让新用户的小模型一直调不存在的工具。
+
+### 内置注入正文点名了只有本机才有的工具（危害最大的一处）
+
+`DEFAULT_INJECT` 的 `## 工具` 段原文写着：
+
+```
+- 找文件 `ops_glob`，搜内容 `ops_grep`，读片段 `ops_read_files`，精确读 `ops_inspect_local_file`
+- 跑命令 `ops_bash`（bash 语法，不是 PowerShell）
+```
+
+这五个名字来自第三方插件 dsh-ops 的 scoped 注册，官方 `@deepseek-ai/dsh-tool-*` 里
+**一个都没有**。这段正文会原样喂给本地小模型 —— 没装 dsh-ops 的机器上，模型会照着它调一个
+永不存在的工具，一路失败到上下文塞满，用户看到的只是「这个模型真笨」。
+
+现在改成按 `keep` 白名单**现渲染**：`defaultInject(keepNames)` 拿 `TOOL_GROUPS`（读取 /
+修改 / 执行 / 流程四组，每组是 `[工具名, 中文短语]`）过滤出真的还在的工具，不在表里的白名单
+名字追加成最后一行裸名单，一个都没留就输出「当前没有保留任何工具」。`DEFAULT_INJECT` 保留成
+`defaultInject()` 的求值结果，老引用照样能用。
+
+### `DEFAULT_KEEP` 里有 5 个写进去必然失败的 scoped 名
+
+`ops_bash` / `ops_glob` / `ops_grep` / `ops_read_files` / `ops_inspect_local_file` 全都在
+白名单里。但 `tools.restrict({ allow })` 只认**全局**工具名，宿主原话是
+`Restrictions intersect; scoped registrations remain visible.` —— 也就是说 scoped 注册本来
+就不受限制，写进 allow 既没用、又会让整批校验失败。实测本机的 `local-trim.log` 里靠
+`applyRestrict` 从报错里抠名字剔除了 **81 次**，等于每轮都在交一次无意义的异常。
+
+清掉这五个，补上官方有而白名单漏掉的 `apply_patch`（改文件的主力，比 `write` 整文件覆盖
+省得多）。`DEFAULT_KEEP` 从 19 项变成 15 项，全部取自官方 `dsh-tool-*` 的注册名。
+
+### `DEFAULT_DROP_SECTIONS` 里的 `tool:workflow` 是个永远不会命中的死条目
+
+`dsh-tool-workflow` 的段名是模板字符串 `` `tool:${toolName}` ``（`toolName` 默认
+`"workflow"`，可被配置改掉），整个安装树里 `grep -rlF "tool:workflow"` **0 命中**。留着它
+只会让「我丢掉了这一段的 325 字符」这句话是假的。
+
+顺手把 18 条按来源分成两组：官方 7 条（`ui:deliverable-file-references`、`app:web-surface`、
+`tool:goal`、`tool:ralph`、`tool:session-query`、`tool:pty`、`harness:source`）和第三方 10 条
+（装了什么才有）。以后有人问「这条为什么没用」，一眼能看出它属于哪一类。
+
+### `routePlan()` 兜底成 `['local-qwen']`
+
+`routes` 不是数组时（正常配置不会发生，默认是 `[]`），路由集合被塞进一个写死的 provider id。
+那是某个 profile 里恰好存在的名字，换台机器就是一条永不命中的死路由，同时还顺手关掉了自动
+识别。现在按「没给名单 = 空集合 + 走自动识别」处理。
+
+### 后端候选表里「目录约定」压过了「官方安装位置」
+
+`ollama` 的候选第一位曾是 `~/AI/ollama/ollama.exe`，`llama-server` 的第一位是
+`workbuddyBinary()`（`~/.workbuddy/local-models/bin/<build>/`）。这两条都只是**某些人的目录
+习惯**，不是任何安装器会写的位置：换台机器它们返回空，等于白排；两台都装了的机器上，被选中
+的反而是那个非官方副本。
+
+现在统一成「显式环境变量 → 平台标准位置 → 目录约定 → PATH 裸名字」，模型目录同理
+（`~/AI/models`、`~/.workbuddy/local-models` 排到 `~/models`、`~/llama.cpp/models`、
+LM Studio 数据目录之后）。**没有删除任何候选** —— 本机实测 `~/AI/ollama/ollama.exe` 是唯一
+存在的那个（`%LOCALAPPDATA%\Programs\Ollama` 与 `Program Files` 都没有），删掉会让本机直接
+扫不到后端。降权而不是删除，是这个改动的前提。
+
+### 测试：让「scoped 名会被拒」这条路径真的被测到
+
+`test/selfcheck.mjs` 原来用 `DEFAULT_KEEP` 冒充「宿主的合法全局工具集」：
+`const known = new Set(DEFAULT_KEEP)`。于是 `ops_*` 在这套假宿主里永远是合法名字，
+**「真宿主会整批拒绝」这条路径永远走不到** —— 这就是上面第二条能一路带到 0.5.1 的原因。
+
+现在假宿主自带两份独立清单：`HOST_GLOBAL_TOOLS`（35 个官方全局名）与 `HOST_SCOPED_TOOLS`
+（8 个 scoped 名），`restrict({ allow })` 只认前者、报错文案照抄宿主原文。另外新增「场景 3：
+默认值普适性」8 条断言 —— 默认白名单不含 scoped 名、内置注入不点名白名单之外的工具、换
+`keep` 后正文跟着收窄、`keep` 为空不炸、`DEFAULT_INJECT === defaultInject([...DEFAULT_KEEP])`。
+
+`test/portable.mjs` 新增两条：目录约定必须排在通用位置之后（`~/.workbuddy` 在
+`~/llama.cpp/models` 之后、`~/AI/models` 在 LM Studio 之后），以及每个后端的候选表最后一项
+必须是裸命令名、显式环境变量必须排第一。
+
+`test/autodetect.mjs` 的「routes 缺省」三条跟着语义改了：现在缺省走自动识别，
+`local-qwen` 与 `ollama` 都该命中，云端仍放行。
+
+验证：`npm run verify` → **1126 项 ✓ / 0 ✗**（0.5.1 是 1111）。
+
+## [0.5.1] - 2026-11-14
+
+一句话：**面板不再只念配置，它开始读后端。** 起因是一个真实场景 ——
+`ollama rm` 掉两个模型之后，面板上半截照旧写着「5 模型 · 在线 46ms」，全是绿的。
+
+### 「N 模型」原来数的是配置里的数组长度，和后端真实情况无关
+
+`checkPanel` 点灯时其实已经把 `/v1/models` 的完整响应拿在手里了，但 `light()` 只留了
+`{ok, ms, error}`，**`probe.models` 被直接丢掉**。于是面板能告诉你「这个端口通」，却答不出
+「你配的那些模型还在不在」。而 Ollama 对不存在的模型名照样给 `/v1/models` 200，所以绿灯
+从来不等于配置有效。
+
+这版把探测结果留下来（15 秒缓存一起带上），和配置里声明的一条条对，算出三类差：
+
+- **missing** —— 配置里声明了、后端此刻没有（`ollama rm` 留下的死声明）
+- **extra** —— 后端有、配置里没注册（能直接导入的那种）
+- **一致** —— 一声不响
+
+判活用的是 `sameModel(a, b)`：归一化后相等。这条比看起来重要 —— Ollama 的 `/api/tags`
+永远报带 tag 的全名（`nomic-embed-text:latest`），用户手写配置常省掉，不归一化会把每一条
+都判成已删除，**全表飘红比不报还糟**。反过来 `models/qwen.gguf` 这种文件式 id 不补
+`:latest`，否则 llama.cpp 那边全飘红。
+
+颜色分两档是有意的：全死（`bad`）该删 provider，部分死（`warn`）该改配置。处置不同，
+不该是同一个颜色。
+
+顺带修掉一个**只在真机上才会炸的 bug**：`buildPanelStatus` 里写了
+`declared.filter((value) => !hasModel(liveSet, value))`，而 `hasModel` **从来没被定义过**。
+`node --check` 只查语法不查未定义标识符，所以这个 `ReferenceError` 要等面板真的拿到在线
+模型才抛 —— 也就是用户的机器上，而不是测试里。现在 missing / extra 都走同一个
+`sameModel`（并把它从私有改成导出，让面板与对齐共用一套判据，否则会出现「面板标红两条、
+对齐只删一条」）。
+
+### 「对齐」按钮：改成后端真的有的那份
+
+`ollama rm` 删的是磁盘上的权重，`cordis.patch.yml` 里那条 `- id: qwen3:14b` 声明没有任何
+东西会去清。原来只能逐条手动改，这版加了 `POST /api/dsh-local-trim/align`（第 14 条路由，
+进 `HEAVY_ROUTES` 因为要打网络）。
+
+`planAlign` 是纯函数，三条原则：
+
+1. **活着的条目原样保留** —— 用户的 `contextWindow` / `maxTokens` / `reasoningEfforts` 是他
+   自己的调参结果，对齐不是「重置成探测值」，只摘死记录、补新记录。
+2. **判活跟面板同一套判据**（`sameModel`），见上。
+3. **绝不产出空 `models` 数组** —— 一条 provider 0 个模型在 `llm-pi-ai` 里是配置错误，不是
+   「不用它」。全都不在了就明确让人去删 provider。
+
+`alignPanel` 里最关键的一条是：**探测失败直接返回、一个字节都不写**。探测失败和「后端一个
+模型都没有」是两回事，混在一起会把整条 provider 的模型清空 —— 那是数据丢失。所以后端连不上
+时返回的是「后端连不上（…），配置没动」。
+
+写回走 `settings.update` 整条 profile 重写（`mergeLayers` 对数组是整体替换，所以新的
+`models` 会原样覆盖旧的），写前带 `revision` 做乐观锁；成功后清在线缓存与 baseURL 缓存再
+`planAll()` —— 不清缓存的话刷新面板还是旧红字。没有差值时返回 `changed: false`，一次
+settings 都不写。
+
+面板**不会自己改配置**。误把「后端没起来」当成「模型被删了」然后自动清空，比让用户多点
+一次糟糕得多。
+
+### 导入不再长出第二条 provider
+
+`defaultProviderId` 每次都按「后端 + 模型名」造 id，于是同一个 Ollama 攒出
+`local-ollama-qwen3-14b`、`local-ollama-qwen3-8b`、`local-ollama-gemma4-12b`……每条只挂一个
+模型，删模型还得记着删对应那条。这就是面板上半截越拉越长的源头。
+
+现在导入时先找这个端点是不是已经有一条**通用名**条目（`local-ollama` / `local-llamacpp`），
+有就 `appendModelToProfile` 追进去，返回里带 `reused` 说清是复用。两条边界是有意的：
+
+- **用户手填了 provider id 就不复用**（`parseImportInput` 新增 `explicitProvider`）—— 那是
+  他主动指定的，不去猜。
+- **自己起名的条目不当复用目标** —— `local-ollama-qwen3-14b` 这种分开配的往往调过 ctx /
+  compat，塞新模型会让人意外。
+
+端点比较用 `canonicalEndpoint`：补 `/v1`、`localhost`/`[::1]`/`0.0.0.0` 统一成 `127.0.0.1`、
+去尾斜杠。不收敛回环名的话「复用」会失效 —— 用户填 `localhost:11434` 就照样长出第二条。
+
+顺带修掉另一个潜伏 bug：`backendByName` 认不出来时返回的是**空串**而不是 `undefined`，所以
+`BACKEND_BY_PORT[port] ?? backendByName(hint) ?? 'local'` 里那句 `?? 'local'` 兜不住空串，
+生成的是 `local--qwen3-4b`（双连字符）。`PROVIDER_ID_RE` 恰好放行，所以一直没炸，只是 id
+难看又难认。现在统一走 `genericProviderId()`，认不出后端时前缀就是 `local`。
+
+### 测试
+
+- `test/panel.mjs` 52 → **77 项**：新增 8 条差集断言（全一致 / 部分不在 / 全不在 / 后端多余
+  不报警 / 省略 `:latest` / 文件式 gguf id / 未检测与连不上都不飘红 / 云端也照常算差集）、
+  表头 `counts.stale` 汇总、11 条「复用同一后端」断言（含端口认不出时的双连字符回归）、
+  5 条 `planAlign` 纯函数断言（摘死补新且活着的原样保留 / 无差值不写 / `:latest` 不误判 /
+  全死拒绝 / 缺 ctx 退回兜底不写 0）。
+- `test/panel-host.mjs` 新增第 8b 组 15 条：真跑 `apply()` 走 import 路由，验「复用
+  `local-ollama` 而不是新建」「老模型没被改写」「displayName 没被覆盖」「重复导入标
+  `alreadyThere`」「显式 provider 不被改写」；第 21 组 20 条验 align 的完整链路。
+- 顺手修了 `test/panel-host.mjs` 的 `settingsStub.update`：原来 `{...row.value, ...patch}`
+  平铺会把整个 `providers` 表换掉，和真实 `mergeLayers` 不符 —— 那样「对齐只动了一条
+  provider」在测试里根本验不出来。现在照 `mergeLayers` 写：plain object 递归、数组整体替换。
+- `npm run verify` → **1111 项 ✓ / 0 ✗**（0.5.0 基线 969）。
+
+## [0.5.0] - 2026-11-14
+
+这一版没有新功能，全部是「新用户能不能用起来」的适配性修补。起因是一个很朴素的问题：
+别人从市场下载这个插件，面对不同的电脑和环境，能装上、能跑起来、能看懂出了什么事吗？
+把三个环节各测了一遍，得到三处静默失败，逐个补掉。
+
+### 机器上没装 git 就装不上（不是这个插件的问题，但会算在它头上）
+
+市场装 `github:owner/repo` 这类源时，宿主在跑 pnpm 之前会先执行
+`git -c credential.helper= ls-remote -- <repo> HEAD` 探连通性。**DSH 桌面端不自带 git**
+（安装树里连一个 git 二进制都没有），所以全新机器上这一步直接失败。更糟的是两侧的报错
+都指错方向：
+
+- 命令行说的是「add the exact key under `allowBuilds`」—— 其实和 build 授权无关
+- 市场说的是「找不到能用的 pnpm…退出码 9009」—— 其实是那句中文「不是内部或外部命令」
+  命中了 `cmdNotFound` 的判定，把 git 缺失误诊成 pnpm 故障
+- 宿主侧的分类器对三种真实输出（`spawn git ENOENT` / 中文「不是内部或外部命令」/
+  `ERR_PNPM_GIT_RESOLVE_FAILED`）一律返回 `unknown`，而只有 `network` / `timeout` 才会
+  中止安装 —— 于是安装继续往下跑，让 pnpm 再失败一次，用户看到的是两段互相矛盾的报错
+
+这版改不了宿主的行为，能做的两件事都做了：
+
+1. README 的「安装」开头加了一节「装之前先看这一条：机器上有没有 `git`」，写清楚怎么判断、
+   各平台怎么装，以及**不想装 git 的绕法**——把源固定到 commit（`github:owner/repo#<sha>`）。
+   这条实测能成：那种形式走 codeload tarball，pnpm 不需要 git；宿主那次 `git ls-remote`
+   仍会失败但分类是 `unknown`、不中止安装。
+2. 加 `publishConfig` 并为「发到 npm」补了发布就绪自检，发上去之后这条路彻底绕开 git。
+
+### headless / sdk / acp profile 上面板不出现，而且一行日志都没有
+
+控制面板挂在 `plugins.detail.section` 槽位上，这个槽位由
+`@deepseek-ai/dsh-client-ui-plugin-manager` 声明，而它只被 `dsh-web-app` 依赖。
+所以只有 `web` profile 有面板，`headless` / `sdk` / `sdk-minimal` / `acp` 都没有。
+
+原来的问题是**完全静默**：`ctx.inject(['clientModules'], cb)` 在服务不存在时回调永不触发，
+于是「自愈 + 写日志」整段不执行。用户装完插件，界面上什么都没有，日志里也查不到任何字，
+只能认为插件坏了 —— 但裁剪其实完全正常。
+
+改法分两层：
+
+- `apply` 时立刻读 profile 自己的 `package.json` 里 `dsh.profile.bundles`，看有没有
+  `dsh-web-app`。这是唯一不依赖服务注册时序的证据，进程活多久都算得出来。
+  判定为没有宿主就当场写一行日志说明情况（原来要等 1.5 秒的定时器，而 headless profile
+  常常在定时器触发前就因鉴权失败退出了 —— 实测踩到过）。
+- 向上找带 `dsh.profile.bundles` 的 `package.json` 而不是写死相对路径：源码以 `link:`
+  挂进 profile 时模块真实路径在源码目录里，层级和装到 `node_modules` 时不同，写死层数会
+  指向不存在的文件而且静默失败。找不到就退回原来的服务探测。
+
+自检那一行用 `·` 而不是 `✗` —— 「这个 profile 没有面板位」是 profile 的选择，不是故障，
+用 ✗ 会让 headless 用户以为插件坏了。`status` 里也带上 `client: {state, tone, label, detail}`。
+
+### 「未裁剪」原来只有一个模糊说法
+
+`summarizeTrim` 在没裁到东西时只报「N 字符，未裁剪」，把五种完全不同的成因混在一起：
+云端 provider 被放行（设计如此）、没拿到 provider 名、本地 provider 但段名一个没命中
+（该去查配置了）、裁剪被关、这次没有 sections。前两种不用管，第三种要处理，但界面说的是同一句话。
+
+现在 `trimAssembly` 每条早退路径都记下成因（`provider-not-local` / `no-provider` /
+`nothing-matched` / `trim-disabled` / `no-sections`），`status.js` 按成因给不同文案。
+面板上「该裁但没命中」用警告色并附一整行解释，其余保持中性。
+
+### 新增测试
+
+- `test/client-host.mjs`（12 项）——「有没有宿主都要说出来」。两种场景各跑一遍：没有
+  `clientModules` 服务时必须明说面板不会出现、同时说明裁剪照常生效；有服务时要清 `pkgMeta`
+  缓存、把本包标脏、报 ready。这条用例的价值在于它能在 CI 上跑 —— 原来这个静默点只能靠
+  真机装一遍才发现。
+- `test/publish.mjs`（31 项）—— 发布就绪自检：`publishConfig`、`files` 覆盖运行时真正加载的
+  三样东西（`lib/`、`client.js`、`cordis.patch.yml`）、`dsh.bundle` / `dsh.client` 声明齐全、
+  schemastery 保持 optional peer（写成硬依赖会让 profile 里多装一份副本，和宿主那份打架）。
+- `test/panel.mjs` 加 11 条（累计 52 项）：五种成因文案 + `summarizeClientHost` 三态；
+  `test/panel-host.mjs` 加 2 条（`status` 里带 `client` 字段，且 stub 下是「未知」不是「不可用」）。
+
+`npm run verify`：909 → **969 项，0 失败**。
+
+### 真机验证
+
+全新 `DSH_HOME`，用真 CLI 装 tgz，再用真宿主 boot：
+
+| profile | bundles 里有 dsh-web-app | 日志 |
+| --- | --- | --- |
+| `headless` | 否 | `· client 半边 没有宿主（面板不会出现，裁剪照常生效）`，当场判定，不等定时器 |
+| `web` | 是 | `… 待探测` → 80ms 后 `client 半边有宿主 —— clientModules 服务可用` |
+
 ## [0.4.9] - 2026-11-06
 
 面板在插件详情页里「突然消失了」：整块不渲染、页面上只剩空白，宿主一切正常，连崩溃日志

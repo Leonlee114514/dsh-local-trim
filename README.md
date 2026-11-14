@@ -4,8 +4,7 @@
 [DeepSeek Harness](https://github.com/deepseek-ai) 里顺畅干活，而云端 provider 一个字节都不动。
 
 **它做什么**：把工具面、系统提示词、工具 schema 三个面同时收窄，并把注入的整份系统提示词
-换成一页纸。本地模型工具调用能力实测未退化（`ops_bash` / `ops_glob` / `ops_read_files`
-两步串行都正确）。
+换成一页纸。本地模型工具调用能力实测未退化（`bash` / `glob` / `read` 两步串行都正确）。
 
 > 这里不给具体的请求体数值。绝对值由你自己的 harness 决定 —— 装了多少插件、注册了多少工具、
 > 系统提示词有哪几段，每个人的基线不同，裁剪空间也就不同。想知道自己省了多少，
@@ -50,6 +49,34 @@ token 会被立刻加回去。
 ---
 
 ## 安装
+
+### 装之前先看这一条：机器上有没有 `git`
+
+从 `github:` 源装插件时，宿主在真正跑 pnpm 之前会先执行一次
+`git -c credential.helper= ls-remote -- <repo> HEAD` 探连通性。**没有 git 就直接失败**，
+而且两侧的报错都指错方向：
+
+- 命令行 `dsh plugin add github:...` 会说「add the exact key under `allowBuilds`」（其实不是 build 被拦）
+- 市场会说「找不到能用的 pnpm…退出码 9009」（其实是那句中文的「不是内部或外部命令」被误当成 pnpm 故障）
+
+先确认一下：
+
+```bash
+git --version        # 报「不是内部或外部命令」/ command not found 就先装 git
+```
+
+Windows 装 [Git for Windows](https://git-scm.com/download/win)，macOS 跑 `xcode-select --install`，
+Debian/Ubuntu 跑 `apt install git`。DSH 桌面端**不自带** git（安装树里没有任何 git 二进制），
+所以这是新机器的常见坑。
+
+**不想装 git 的绕法**：把源固定到某个 commit —— 这种形式走 codeload tarball，pnpm 不需要 git：
+
+```bash
+dsh plugin add "github:Leonlee114514/dsh-local-trim#<40 位 commit sha>"
+```
+
+（sha 从仓库页面的 commit 列表里复制。宿主那条 `git ls-remote` 检查仍会跑一次并失败，
+但失败的分类是 `unknown` 而不会中止安装，pnpm 随后用 tarball 装成功 —— 这是实测过的路径。）
 
 ### 方式一：`dsh plugin add`（推荐，v0.1.1 起）
 
@@ -284,48 +311,48 @@ providers:
         provision: true      # 探测本地端点并自动写 provider；false 关闭
 
         # 本地模型用不到的段。名字取自各插件的 systemPrompt.section({ name })。
-        # 这份清单对应的是「装了很多插件」的 profile：你装了哪几个插件，就删哪几个插件
-        # 产出的段，别整套照抄。名字对不上的段会被静默忽略，不会报错。
+        # 这份清单是「默认值」——装了什么插件就命中什么，名字对不上的段会被静默忽略，
+        # 不会报错。想更省就按自己装的东西加，不用整套照抄。
+        # 前 7 条是官方包里的段名（装了就有），后面是常见第三方插件的段名。
         dropSections:
+          # 官方
+          - ui:deliverable-file-references
+          - app:web-surface
+          - tool:goal
+          - tool:ralph
+          - tool:session-query
+          - tool:pty
+          - harness:source
+          # 第三方（装了才有）
           - tool:mindmap
           - free-search:engines
           - dsh-purge:anchor
           - dshpg-capabilities
           - mnemon:routing
           - plugin:dsh-imagegen
-          - ui:deliverable-file-references
-          - app:web-surface
-          - tool:goal
-          - tool:ralph
-          - tool:workflow
-          - tool:session-query
-          - tool:pty
           - dsh-excel-chat:interaction
           - dsh-ops:repository-tooling:mode-standard
           - dsh-ops:repository-tooling:mode-ptc
           - dsh-ops:repository-tooling:mode-cordis
-          - harness:source
 
         dropContexts:
           - mnemon:memory-view
           - mnemon:runtime-memory
 
-        # 白名单同时写规范名和 dsh-ops 的 ops_* 名：不同 profile 装的工具包不一样，
-        # 有的注册 bash/read/glob/grep，有的注册 ops_bash/ops_read_files/…，
-        # 两种名字都列上，这份配置就能同时用在两种 profile 上。
+        # 白名单**只写全局工具名**。scoped 注册的工具（dsh-ops 的 ops_bash /
+        # ops_read_files 之类）写进来会让 tools.restrict({ allow }) 整批校验失败：
+        # 宿主原话是「Restrictions intersect; scoped registrations remain visible.」，
+        # 也就是 scoped 工具本来就不受限制，写进来既没用又会把整次 restrict 打回。
+        # 名字全部来自官方 dsh-base 的 dsh-tool-* 注册名。
         keep:
           - bash
           - pwsh
-          - ops_bash
           - read
-          - ops_read_files
-          - ops_inspect_local_file
           - write
           - edit
+          - apply_patch
           - glob
-          - ops_glob
           - grep
-          - ops_grep
           - working_directory
           - job_output
           - job_list
@@ -425,6 +452,51 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
 - 删成功会清掉在线缓存与 baseURL 缓存，然后重新拉一次状态；**磁盘上的模型文件一个字节都不
   动**，随时可以重新导入。
 
+**「N 模型」这个数字读的是后端实况，不是配置**（v0.5.1 起）。
+
+以前那列写的是配置里 `models:` 数组的长度，于是 `ollama rm qwen3:14b` 之后面板照旧写「5 模型」，
+你没法从面板看出有两条早就跑不起来了。现在点灯时顺手把 `/v1/models` 报回来的 id 记下来
+（15 秒缓存），和配置里声明的一条条对，四种结果分开说：
+
+| 面板显示 | 含义 | 该做什么 |
+| --- | --- | --- |
+| `3 模型` | 声明的都在，后端也没多出别的 | 什么都不用做 |
+| `3 模型 · 后端还有 1 个没注册` | 后端多出一个能用的，配置里没写 | 想用就去下面「导入」它 |
+| `1 模型 · 2 个已不在后端`（黄） | 部分声明落空 | 点这一行的 **对齐** |
+| `0 模型 · 配置里的 2 个全不在了`（红） | 整条 provider 都是僵尸 | 点 **删除**，别对齐 |
+
+判活用的是「归一化后相等的 id」：`nomic-embed-text` 与 `nomic-embed-text:latest` 算同一条
+（Ollama 的 `/api/tags` 永远给带 tag 的全名，不归一化会全表飘红），但 `models/qwen.gguf`
+这种文件式 id 不会被补 `:latest` 去误伤 llama.cpp。
+
+**对齐按钮**（v0.5.1 起）就是「把这条 provider 的 `models:` 改成后端此刻真的有的那份」：
+
+- 摘掉已不在后端的，补上后端有但没注册的，**活着的条目原样保留** —— 你调过的
+  `contextWindow` / `maxTokens` / `reasoningEfforts` 不会被探测值覆盖。
+- `baseURL`、`displayName`、`compat` 一律不动。
+- **后端连不上时一个字节都不写**。探测失败和「后端一个模型都没有」是两回事，混在一起会把
+  整条 provider 的模型清空 —— 那是数据丢失，不是对齐。
+- **不会对齐成 0 个模型**。全都不在了就明确让你去删 provider：空 `models` 在 `llm-pi-ai` 里
+  是配置错误，不是「停用」。
+- 没有差值时返回「跟后端一致，没动」，不写 settings。
+- 走 `settings.update` 整条 profile 重写（`mergeLayers` 对数组是整体替换，所以新的 `models`
+  会原样覆盖旧的），写前带 `revision` 做乐观锁。
+
+面板**不会自己改配置** —— 探测只是定时点灯，写配置必须是有人点了一下。误把「后端没起来」
+当成「模型被删了」然后自动清空，比让你多点一次糟糕得多。
+
+**同一个后端只该有一条 provider**（v0.5.1 起）。以前每导入一个模型就新建一条
+`local-<后端>-<模型名>`，同一个 Ollama 攒出 `local-ollama-qwen3-14b`、`local-ollama-qwen3-8b`、
+`local-ollama-gemma4-12b`……每条只挂一个模型，删模型还得记着删对应那条。现在导入时先看这个
+端点是不是已经有一条**通用名**条目（`local-ollama` / `local-llamacpp` 这种）：
+
+- 有 → 把模型**追加**进去（已存在就不重复加，也不报错），返回里带 `reused` 说清是复用。
+- 没有 → 照旧新建一条。
+- **你手填了 provider id 就不复用** —— 那是你主动指定的，插件不去猜你的意思。自己起名的条目
+  （`local-ollama-qwen3-14b`）也不会被当成复用目标：分开配的往往调过 ctx / compat，塞新模型
+  会让人意外。
+- 端点比较会收敛回环名（`localhost` 与 `127.0.0.1` 同一个）和尾斜杠，不同端口就是不同后端。
+
 **④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama，v0.4.6 读 GGUF 真名，v0.4.7 试跑超时可配且冷加载自动重试，v0.4.8 端口跟着文件走，v0.4.9 修面板被渲染期异常整块吞掉）—— 上一块要求你先有端点，可刚下完模型的
 时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个模型 → 一键配置并试跑**。
 
@@ -440,14 +512,19 @@ $DSH_LOCAL_MODELS_DIR                ← 你自己指定的目录，排最前
 ~/.cache/llama.cpp
 ~/.lmstudio/models
 <dataDir>/LM-Studio/models           ← Win: %LOCALAPPDATA% / mac: ~/Library/Application Support
-~/.workbuddy/local-models/files      ← WorkBuddy 下载目录（兼容保留）
-~/AI/models
+~/.workbuddy/local-models/files      ← WorkBuddy 下载目录（兼容保留，排在通用位置之后）
+~/models                             ← llama.cpp 惯例：权重直接摊在目录里，不套 files/
+~/AI/models                          ← 目录约定，不是官方安装位置，所以垫后
 ~/Downloads                          ← 只扫一层
 ```
 
+「目录约定」和「官方位置」是分开排的：`~/AI/models`、`~/.workbuddy/...` 这类只是某些人的
+习惯布局，换台机器就不存在，所以都排在 `~/models`、`~/llama.cpp/models`、LM Studio 数据目录
+之后 —— 否则一个人的私人习惯会压过所有人共有的标准布局。
+
 **另外单独走一趟 Ollama 存储**（`scanOllamaModels`）：`OLLAMA_MODELS` 环境变量排最前，
-然后是 Windows `~/AI/models/ollama`、`%LOCALAPPDATA%\ollama\models`、`~/.ollama/models`，
-macOS `~/.ollama/models`、`/usr/share/ollama/.ollama/models`，Linux 再加
+然后是 `~/.ollama/models`、`%LOCALAPPDATA%\ollama\models`（Windows）、`~/AI/models/ollama`
+（目录约定，垫后），macOS `~/.ollama/models`、`/usr/share/ollama/.ollama/models`，Linux 再加
 `/usr/lib/ollama/models`、`/opt/ollama/models`。不是去 `blobs` 里猜哪些文件是权重 ——
 **读 `manifests/` 与 `manifests-v2/`，只取 `mediaType` 为 `application/vnd.ollama.image.model`
 的那一层**，再拿它的 digest 指回 `blobs/sha256-…`。这样得到的名字是人话：
@@ -562,12 +639,13 @@ Ollama 的模型显示 tag 并带一个 `Ollama` 徽标和量化标签，后面�
 
 llama.cpp 这一条是 v0.3.7 的重点：模型已经下好了就别让人再下一次 20GB。插件按这个顺序找
 
-1. `llama-server`（Windows 补 `.exe`）：`LLAMA_SERVER_BIN` → `~/.workbuddy/local-models/bin/<build>/`
-   （WorkBuddy 的布局，取最新 build）→ `~/AI/llama.cpp/`（Windows）/ Homebrew 与 `/usr/local/bin`（macOS、Linux）
-   → PATH；
+1. `llama-server`（Windows 补 `.exe`）：`LLAMA_SERVER_BIN` → 平台标准位置（Windows
+   `%LOCALAPPDATA%\llama.cpp\`、`~/AI/llama.cpp/`；macOS Homebrew 与 `/usr/local/bin`；Linux
+   `/usr/local/bin`、`/usr/bin`）→ `~/.workbuddy/local-models/bin/<build>/`（WorkBuddy 的布局，
+   取最新 build，垫后）→ PATH；
 2. 权重：按 `modelRoots()` 的顺序找（`DSH_LOCAL_MODELS_DIR` → `~/models` → `~/llama.cpp/models`
    → `~/.cache/llama.cpp` → `~/.lmstudio/models` → `<dataDir>/LM-Studio/models` →
-   `~/.workbuddy/local-models/files` → `~/Downloads`），第一个含权重的目录胜出；
+   `~/.workbuddy/local-models/files` → `~/AI/models` → `~/Downloads`），第一个含权重的目录胜出；
    认权重同样看后缀**或**文件头魔数（Ollama 的 `sha256-…` blob 就是靠魔数认的）；
    同一目录里优先 `local_model.gguf`，跳过 `.mmproj.`（那是视觉投影）；
    这里**只按文件名挑**，不读 GGUF 里的真名（面板那条④才会读，见上文）；
@@ -584,8 +662,8 @@ llama.cpp 这一条是 v0.3.7 的重点：模型已经下好了就别让人再�
 错误里带着查过的路径。
 
 顺序是：**先探测**，端口本来就在应答就直接告诉你「没有重复拉起」；没应答才找可执行文件
-（`OLLAMA_BIN` 环境变量 → 平台默认安装位置：Windows `~/AI/ollama/ollama.exe`、
-`%LOCALAPPDATA%\Programs\Ollama\ollama.exe`、`C:\Program Files\Ollama\ollama.exe`；
+（`OLLAMA_BIN` 环境变量 → 平台默认安装位置：Windows `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`、
+`C:\Program Files\Ollama\ollama.exe`、`~/AI/ollama/ollama.exe`（目录约定，垫后）；
 macOS `/Applications/Ollama.app/...`、Homebrew `/opt/homebrew/bin`；Linux `/usr/local/bin`、
 `/usr/bin`、`/snap/bin` → PATH），拉起后按 `拉起后等端口（秒）` 轮询
 `/v1/models`，成功后顺手把点灯缓存清掉。
@@ -675,6 +753,29 @@ v0.4.8 就是这样：`portFor` 声明在 `AdoptBox` 里面，`Panel` 的 `scanM
 
 ### 面板不出现怎么办
 
+**先确认你的 profile 有没有面板这个位置。** 控制面板挂在 `plugins.detail.section` 槽位上，
+这个槽位由 `@deepseek-ai/dsh-client-ui-plugin-manager` 声明，而它只被 `dsh-web-app` 依赖。
+所以：
+
+| profile 模板 | bundles 里有 `dsh-web-app` | 面板 |
+| --- | --- | --- |
+| `web`（桌面端 / `dsh web`） | 有 | 能画 |
+| `headless` / `sdk` / `sdk-minimal` / `acp` | 没有 | **画不出来** |
+
+headless 这类 profile 上，宿主根本不提供 `clientModules` 服务，插件的 client 半边没有地方可挂 ——
+这不是插件坏了，**裁剪、注入、schema 瘦身、一步到位全都照常生效**，只是没有那块界面。
+启动自检和日志第一行会明说这件事：
+
+```
+client 半边没有宿主 —— 这个 profile 没有 client-modules 服务，面板不会出现（裁剪照常生效）。…
+（profile 的 bundle 清单里没有 dsh-web-app）
+```
+
+要看面板就换 `web` profile，或者在浏览器里打开 DSH Web。判定方式是读 profile 自己的
+`package.json` 里 `dsh.profile.bundles`，不经服务注册，所以进程活多久都能算出来。
+
+在 `web` profile 里还是不出现，再按下面两条查：
+
 先看日志末行是「控制面板 UI 已进入 client 条目表」还是「需要完整重启一次 DSH」。
 宿主的 `dsh-client-modules` 会把每个包第一次扫描的结果缓存起来（`pkgMeta`），
 插件热重载不会清这个缓存 —— 所以如果**先装插件、后补 `dsh.client` 声明**，只重载插件
@@ -684,7 +785,7 @@ v0.4.8 就是这样：`portFor` 声明在 `AdoptBox` 里面，`Panel` 的 `scanM
 ---
 
 ## 启动自检
-插件装载时往 `~/.dsh/local-llm/local-trim.log` 写 10 项检查。下面是形态示例，数字取自
+插件装载时往 `~/.dsh/local-llm/local-trim.log` 写 11 项检查。下面是形态示例，数字取自
 某一份具体配置（你的会不一样，`<…>` 处随配置变化）：
 
 ```
@@ -698,10 +799,19 @@ v0.4.8 就是这样：`portFor` 声明在 `AdoptBox` 里面，`Panel` 的 `scanM
 ✓ 生效路由            自动识别（baseURL 指向回环/私有网段，或 provider 名带 local/ollama 等标记）
 ✓ schema 瘦身         description 140 / 参数 90
 ✓ 一步到位            <探测结果，如「已有配置好的 local-llamacpp」>
-控制面板 bridge 已挂载：/api/dsh-local-trim/{describe,save,probe,log}
+✓ client 半边         有宿主（面板可用）
+控制面板 bridge 已挂载：/api/dsh-local-trim/{describe,save,probe,log,status,check,import,test,launch,stop,models,adopt,delete,align}
 控制面板 UI 已进入 client 条目表（刷新页面即可在插件详情页看到）
 就绪：仅对 本地端点（自动识别） 生效，其它 provider 原样放行
 ```
+
+最后一行 `client 半边` 有三种形态，都不是故障：
+
+| 标记 | 含义 |
+| --- | --- |
+| `✓ 有宿主（面板可用）` | profile 里有 `dsh-web-app`，面板能画 |
+| `· 没有宿主（面板不会出现，裁剪照常生效）` | headless / sdk / acp profile，面板无处可挂；用 `·` 而不是 ✗，因为这不是错 |
+| `… 待探测（1.5 秒后自动判定并写一行日志）` | 还没探测到；web profile 上会在一秒内变成「有宿主」 |
 
 想关掉：`config.selfCheck: false`。
 
@@ -784,10 +894,10 @@ CI 在 `ubuntu-latest`（Node 20/22/24）、`windows-latest`、`macos-latest` �
 | 能力 | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | 用户目录 / 数据目录 | `%USERPROFILE%` / `%LOCALAPPDATA%` | `~` / `~/Library/Application Support` | `~` / `$XDG_DATA_HOME` |
-| 找 ollama | 用户目录安装 + `Program Files` + PATH | `.app` 包内 + Homebrew + PATH | `/usr/local/bin`、`/usr/bin`、`/snap/bin` + PATH |
-| 找 llama-server | WorkBuddy build + 用户目录 + PATH（补 `.exe`） | Homebrew + `/usr/local/bin` + PATH | 同 macOS |
+| 找 ollama | `%LOCALAPPDATA%\Programs\Ollama` + `Program Files` + `~/AI/ollama`（约定，垫后）+ PATH | `.app` 包内 + Homebrew + PATH | `/usr/local/bin`、`/usr/bin`、`/snap/bin` + PATH |
+| 找 llama-server | `%LOCALAPPDATA%\llama.cpp` + `~/AI/llama.cpp` + WorkBuddy build（约定，垫后）+ PATH（补 `.exe`） | Homebrew + `/usr/local/bin` + PATH | 同 macOS |
 | 找 vLLM / LM Studio | `LM-Studio/lms.exe`、`Program Files` + PATH | `.app` 包内 + PATH | `/usr/local/bin` + PATH |
-| 扫权重 | `~/models`、`~/AI/models`、`~/Downloads`… + Ollama 存储（含 `%LOCALAPPDATA%\ollama\models`） | `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`… + `~/.ollama/models`、`/usr/share/ollama/.ollama/models` | 同 macOS，另加 LM Studio 数据目录、`/usr/lib/ollama/models`、`/opt/ollama/models` |
+| 扫权重 | `~/models`、`~/llama.cpp/models`、`~/AI/models`（约定，垫后）、`~/Downloads`… + Ollama 存储（含 `%LOCALAPPDATA%\ollama\models`） | `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`… + `~/.ollama/models`、`/usr/share/ollama/.ollama/models` | 同 macOS，另加 LM Studio 数据目录、`/usr/lib/ollama/models`、`/opt/ollama/models` |
 | 显存探测 | `nvidia-smi`（在 system32，靠 PATH） | `nvidia-smi` / `rocm-smi` / `sysctl hw.memsize` | `nvidia-smi` / `rocm-smi` |
 | 拉起 / 停止进程 | 支持（`spawn` + signal 0 探测） | 支持 | 支持 |
 
@@ -908,7 +1018,7 @@ reserveMb: 1024
 ## 开发
 
 ```bash
-npm run verify                  # = check + test，13 个文件语法 + 9 套测试
+npm run verify                  # = check + test，15 个文件语法 + 10 套单元测试 + 跨平台推演
 npm run check                   # 只跑 node --check（lib/*.js + client.js + test/ 里带平台/渲染逻辑的那几个）
 npm test                        # 只跑测试（unit + portable + host）
 npm run test:portable           # 只跑跨平台候选表推演（linux / darwin / win32 各一遍）
@@ -919,7 +1029,9 @@ node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
 node test/client.mjs            # 真渲染 client.js（自带最小 React 替身），点「扫描本机模型」验面板不塌
-node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 13 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
+node test/client-host.mjs       # 有没有 client 宿主都要说出来：headless profile 上不许静默
+node test/publish.mjs           # 发布就绪自检（publishConfig / files / dsh 声明 / optional peer）
+node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 14 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
 node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析与 GGUF KV 真名）+ 资源预检 + 停进程（不真起进程）
 node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
 node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径

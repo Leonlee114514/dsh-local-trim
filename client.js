@@ -4,12 +4,13 @@
  * 挂在插件详情页的 `plugins.detail.section` 槽位上：在 DSH Web 的
  * 「插件」列表里点开 dsh-local-trim，详情页底部就是这块面板。
  *
- * 浏览器里拿不到 cordis 服务，所有读写都走宿主侧注册的 HTTP bridge（12 条，全部 POST）：
+ * 浏览器里拿不到 cordis 服务，所有读写都走宿主侧注册的 HTTP bridge（14 条，全部 POST）：
  *   status   接管状态 + 裁剪收益 + provider 表 + 本插件起过的后端（主视图）
- *   check    给 provider 点灯（GET /v1/models）
+ *   check    给 provider 点灯（GET /v1/models），顺带把后端此刻真的有的模型 id 带回来
  *   probe    批量探测默认端口
- *   import   导入本地模型：探测 → 写 settings → 试跑
+ *   import   导入本地模型：探测 → 写 settings → 试跑（同一后端会复用已有 provider）
  *   test     对已注册 provider 发一次最小真实请求
+ *   align    把一条 provider 的 models 对齐到后端此刻真的有的那份
  *   save     写回高级配置
  *   describe 老宿主的兼容读取（没有 status 时降级用）
  *   log      读日志尾部
@@ -17,10 +18,16 @@
  *   adopt    一键配置：起服务 → 等应答 → 注册 provider → 试跑
  *   launch   对已有 provider 拉起后端
  *   stop     只停本插件自己 spawn 的那个 pid
+ *   delete   删 provider 配置（不删磁盘上的 gguf）
  *
  * 版面顺序按「一眼看状态 → 想动手时再动手」排：
- *   状态带 → 收益条 → provider 表（点灯/试跑/拉起/停止）→ 本机模型一键配置
+ *   状态带 → 收益条 → provider 表（点灯/试跑/拉起/停止/对齐/删除）→ 本机模型一键配置
  *   → 端点导入 → 折叠的高级配置。
+ *
+ * provider 表那两列数字要分清：
+ *   「N 模型」里的 N 是**面板读到的实况**（`/v1/models` 说有几个），不是配置里写了几条。
+ *   配置里声明了、后端已经没有的，单独用「· N 个已不在后端」标出来并给一个「对齐」按钮 ——
+ *   面板不会自己改配置，改配置必须由人点一下。
  *
  * 文案只有中文。这是有意选择：插件面向中文使用者，硬塞一套英文会多出一半
  * 需要同步的字符串，却没有第二个读者。要加语言时，把这里的字面量搬进
@@ -262,9 +269,13 @@ window.__ModuleLoader__.load({
       }
       const savedPct = Number(trim.savedPct) || 0
       const width = Math.max(0, Math.min(100, savedPct))
+      // 没裁剪时分两种：本该裁却没命中（要去查配置），和本来就不该裁（云端放行）。
+      // 都写成「未裁剪」等于让用户自己去猜是哪一种。
+      const expected = trim.local === true
+      const zeroLabel = savedPct > 0 ? '省 ' + savedPct + '%' : expected ? '该裁但没命中' : '未裁剪'
       return h(
         'div',
-        { style: S.trim },
+        { style: { ...S.trim, flexWrap: 'wrap' } },
         h('span', null, '最近一次装配'),
         h('span', { style: S.big }, fmt(trim.charsIn)),
         h('span', { style: S.arrow }, '→'),
@@ -275,7 +286,7 @@ window.__ModuleLoader__.load({
           { style: { flex: '1 1 160px', minWidth: 120, height: 8, borderRadius: 4, background: 'rgba(127,127,127,.18)', overflow: 'hidden' } },
           h('span', { style: { display: 'block', width: width + '%', height: '100%', background: TONE.good } }),
         ),
-        h('span', { style: { ...S.hint, fontWeight: 600 } }, savedPct > 0 ? '省 ' + savedPct + '%' : '未裁剪'),
+        h('span', { style: { ...S.hint, fontWeight: 600, color: savedPct > 0 ? TONE.good : expected ? TONE.warn : undefined } }, zeroLabel),
         h(
           'span',
           { style: S.hint },
@@ -283,11 +294,15 @@ window.__ModuleLoader__.load({
             .filter(Boolean)
             .join(' · '),
         ),
+        // 成因单独占一行：面板宽度有限，塞进上面那行会被挤掉。
+        trim.seen === true && savedPct <= 0 && trim.label
+          ? h('div', { style: { ...S.hint, flex: '1 1 100%', marginTop: 4 }, title: trim.reason ?? '' }, trim.label)
+          : null,
       )
     }
 
     // ── provider 表 ───────────────────────────────────────────────────────
-    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, onDelete, launchedPorts }) {
+    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, onDelete, onAlign, launchedPorts }) {
       const list = Array.isArray(rows) ? rows : []
       const mine = new Set(Array.isArray(launchedPorts) ? launchedPorts.map((item) => Number(item?.port ?? item)) : [])
       // 删配置不可撤销（虽然能重新导入），点一次只进入确认态，第二次才真删。
@@ -302,6 +317,18 @@ window.__ModuleLoader__.load({
           { style: { ...S.row, margin: '10px 0 4px' } },
           h('span', { style: { fontWeight: 600 } }, '模型 provider'),
           h('span', { style: S.hint }, `共 ${counts?.total ?? 0} 个 · 本地 ${counts?.local ?? 0} 个 · 在线 ${counts?.online ?? 0} 个`),
+          // 汇总先说一句「有几条跟后端对不上」，用户不用逐行读就知道该不该往下看。
+          // 只在真的算出了差集时出现 —— 没检测的时候说这句话就是瞎猜。
+          counts?.stale > 0
+            ? h(
+                'span',
+                {
+                  style: { ...S.hint, color: TONE.warn },
+                  title: `配置里一共声明了 ${counts.staleModels ?? 0} 条后端已经没有的模型。点某一行右边的「对齐」可以摘掉它们。`,
+                },
+                `· ${counts.stale} 个跟后端对不上`,
+              )
+            : null,
           h('span', { style: S.grow }),
           h('button', { style: S.small, onClick: onCheck, disabled: busy !== '' }, busy === 'check' ? '检测中…' : '重新检测'),
         ),
@@ -314,7 +341,26 @@ window.__ModuleLoader__.load({
                 badge(row.state?.tone ?? 'muted', '', row.state?.label ?? ''),
                 h('span', { style: { fontWeight: 600 } }, row.displayName || row.id),
                 h('span', { style: { ...S.mono, color: MUTED } }, row.baseURL),
-                h('span', { style: S.hint }, row.modelCount + ' 模型' + (row.contextWindow ? ' · ctx ' + fmt(row.contextWindow) : '')),
+                h(
+                  'span',
+                  {
+                    style: {
+                      ...S.hint,
+                      ...(row.models?.tone ? { color: TONE[row.models.tone] } : {}),
+                    },
+                    title:
+                      row.missingModels?.length > 0
+                        ? '配置里声明了 ' +
+                          row.modelCount +
+                          ' 个模型，后端此刻只有 ' +
+                          (row.liveModelCount ?? 0) +
+                          ' 个。不在后端的：' +
+                          row.missingModels.join(', ')
+                        : '',
+                  },
+                  (row.models?.label ?? row.modelCount + ' 模型') +
+                    (row.contextWindow ? ' · ctx ' + fmt(row.contextWindow) : ''),
+                ),
                 row.local ? h('span', { style: S.hint }, '· 本地') : null,
                 h('span', { style: S.grow }),
                 h('span', { style: S.hint }, row.state?.label ?? ''),
@@ -356,6 +402,22 @@ window.__ModuleLoader__.load({
                   },
                   busy === 'test:' + row.id ? '试跑中…' : '试跑',
                 ),
+                // 只有「配置声明跟后端实况不一致」时才给对齐键：全一致时这个按钮
+                // 没有任何用，摆在那里只会让人以为点了会改配置。
+                row.models?.tone !== undefined
+                  ? h(
+                      'button',
+                      {
+                        style: { ...S.small, ...(row.models.tone === 'bad' ? { color: TONE.bad } : {}) },
+                        disabled: busy !== '',
+                        title:
+                          '按后端此刻真的有的模型改写这条 provider 的 models —— ' +
+                          '摘掉已删除的、补上后端有但没注册的；baseURL / 显示名 / compat 都不动',
+                        onClick: () => onAlign(row),
+                      },
+                      busy === 'align:' + row.id ? '对齐中…' : '对齐',
+                    )
+                  : null,
                 // 删的是这条 provider 配置，不是磁盘上的 gguf —— title 上写明白，
                 // 免得有人以为点了会丢模型。
                 h(
@@ -891,6 +953,22 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 对齐：把这条 provider 的 models 改成后端此刻真的有的那份。
+      // 只改 models 数组，baseURL / 显示名 / compat 都不动 —— 那些是用户自己的设置。
+      const align = async (row) => {
+        setBusy('align:' + row.id)
+        setImportResult(null)
+        try {
+          const result = await call('align', { provider: row.id })
+          setImportResult({ ok: result.ok === true, text: (result.ok === true ? '✓ ' : '✗ ') + (result.message ?? result.error ?? '') })
+          await refreshStatus()
+        } catch (error) {
+          setImportResult({ ok: false, text: String(error?.message ?? error) })
+        } finally {
+          setBusy('')
+        }
+      }
+
       const test = async (row) => {        setBusy('test:' + row.id)
         setImportResult({
           ok: true,
@@ -1160,6 +1238,9 @@ window.__ModuleLoader__.load({
         head,
 
         // ① 状态带
+        // 注意：这里刻意不放「client 宿存」徽章 —— 面板能画出来，本身就证明宿主在。
+        // 真正需要「面板可能不出现」的场景（headless/sdk/acp profile）里没有面板可画，
+        // 所以那条信息走启动自检那一行和日志，不走 UI。
         h(
           'div',
           { style: S.band },
@@ -1196,6 +1277,7 @@ window.__ModuleLoader__.load({
           onLaunch: launch,
           onStop: stop,
           onDelete: runDelete,
+          onAlign: align,
           launchedPorts: status.launched ?? [],
         }),
 
