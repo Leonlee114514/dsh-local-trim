@@ -47,6 +47,10 @@ const makeCtx = () => ({
           { provider: 'deepseek-official', baseURL: 'https://api.deepseek.com' },
           { provider: 'anthropic', baseURL: 'https://api.anthropic.com' },
           { provider: 'my-openai', baseURL: 'https://api.openai.com/v1' },
+          // 域名前缀碰巧叫 localhost 的公网地址。以前拿正则 match 整串 URL 会把它
+          // 当成本地，于是云端请求被裁掉七成提示词，用户只看到「省了 78%」。
+          { provider: 'cloud-lookalike', baseURL: 'http://localhost.attacker.com/v1' },
+          { provider: 'cloud-userinfo', baseURL: 'http://localhost@attacker.com/v1' },
         ],
       }
     }
@@ -78,7 +82,9 @@ if (typeof assembleHandler !== 'function') {
 }
 
 const LOCAL = ['local-qwen', 'ollama', 'vllm-box', 'lmstudio']
-const CLOUD = ['deepseek-official', 'anthropic', 'my-openai']
+// cloud-lookalike / cloud-userinfo 的名字和主机名都「像本地」，但解析出来的 host
+// 是公网域名 —— 必须原样放行，否则会把云端请求裁掉。
+const CLOUD = ['deepseek-official', 'anthropic', 'my-openai', 'cloud-lookalike', 'cloud-userinfo']
 
 for (const provider of LOCAL) {
   const assembly = makeAssembly()

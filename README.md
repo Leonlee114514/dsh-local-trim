@@ -203,11 +203,20 @@ pnpm add link:../../../path/to/dsh-local-trim
 | 写法 | 含义 |
 | --- | --- |
 | 不写 | 早期默认：只认 `local-qwen` 这一个名字（建议显式写 `[]` 或写具体名字） |
-| `[]` | **自动识别**：provider 的 baseURL 指向回环/私有网段，或 provider 名带 local/ollama/vllm/lmstudio 等标记 |
+| `[]` | **自动识别**：provider 的 baseURL 指向回环/私有网段；没有 baseURL 时才退回看名字（local/ollama/vllm/lmstudio 等标记） |
 | `[my-provider, ollama]` | 只认写出来的名字（精确匹配，`my-provider-turbo` 不会命中） |
 
-自动识别的 baseURL 特征：`127.0.0.1` / `localhost` / `0.0.0.0` / `[::1]` /
-`host.docker.internal` / `10.x` / `192.168.x` / `172.16–31.x`。
+自动识别的 baseURL 特征是**先解析 hostname 再判**（v0.5.6 起），不是拿正则 match 整串 URL：
+
+- 回环整段 `127.0.0.0/8`（不止 `127.0.0.1`）、`localhost`、`0.0.0.0`、`[::1]`
+- 私有网段 `10.x` / `192.168.x` / `172.16–31.x`、链路本地 `169.254.x`、CGNAT `100.64–127.x`（Tailscale 之类）
+- IPv6：ULA `fc00::/7`、链路本地 `fe80::/10`、IPv4-mapped `::ffff:127.0.0.1`
+- 容器内主机名 `host.docker.internal` / `host.containers.internal` / `gateway.docker.internal`
+- `.local`（mDNS）、`.internal`、`.localhost` 后缀，以及**单标签主机名**（`gpu-box`，公网 DNS 里不存在）
+
+反过来，`http://localhost.attacker.com/v1` 这种「域名前缀碰巧叫 localhost」的公网地址
+**不算本地**——以前用正则 match 整串会把它当本地，于是云端请求被裁掉大半提示词。
+有 baseURL 时一律以地址为准，名字不再翻案（`openrouter-llama-3` 不算本地）。
 
 ---
 
@@ -875,11 +884,11 @@ client 半边没有宿主 —— 这个 profile 没有 client-modules 服务，�
 ✓ 轻量注入正文        <字符数>，来源 ~/.dsh/local-llm/light-inject.md
 ✓ 工具白名单          <keep 项数> 项
 ✓ 裁剪段落            <dropSections 项数> 段 + <dropContexts 项数> 个 context
-✓ 生效路由            自动识别（baseURL 指向回环/私有网段，或 provider 名带 local/ollama 等标记）
+✓ 生效路由            自动识别（baseURL 解析出的 hostname 是回环/私有网段；没有 baseURL 时才看名字）
 ✓ schema 瘦身         description 140 / 参数 90
 ✓ 一步到位            <探测结果，如「已有配置好的 local-llamacpp」>
 ✓ client 半边         有宿主（面板可用）
-控制面板 bridge 已挂载：/api/dsh-local-trim/{describe,save,probe,log,status,check,import,test,launch,stop,models,adopt,delete,align}
+控制面板 bridge 已挂载：/api/dsh-local-trim/{describe,save,probe,log,status,check,import,test,launch,stop,models,adopt,delete,align,reconcile}
 控制面板 UI 已进入 client 条目表（刷新页面即可在插件详情页看到）
 就绪：仅对 本地端点（自动识别） 生效，其它 provider 原样放行
 ```
@@ -1123,7 +1132,7 @@ npm run test:portable           # 只跑跨平台候选表推演（linux / darwi
 npm run test:sim                # 假装自己是 linux / darwin，把整套测试再跑一遍
 
 node test/selfcheck.mjs         # 三个场景：装了 dsh-purge / 没装 / 默认值普适性
-node test/autodetect.mjs        # 四个本地后端 + 三个云端 provider 的路由判定
+node test/autodetect.mjs        # 四个本地后端 + 五个云端 provider（含两个「名字像本地」的公网地址）的路由判定
 node test/provision.mjs         # 探测 → 写 settings 的一步到位
 node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
 node test/client.mjs            # 真渲染 client.js（自带最小 React 替身），点「扫描本机模型」验面板不塌

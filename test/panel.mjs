@@ -114,6 +114,23 @@ await ok('没拿到 provider 名：指出是装配侧的问题', () => {
   assert.match(result.label, /没拿到 provider 名/)
 })
 
+// 地址明明是本地，配置却把自动识别关了 —— 这不是「设计如此」，是配置和预期打架，
+// 必须指出来，否则用户只会看到「未裁剪」然后去翻 dropSections（方向完全错了）。
+await ok('本地端点被配置排除：指出是 routes / autoDetectBaseURL 拦的', () => {
+  const result = summarizeTrim({
+    charsIn: 26428,
+    charsOut: 26428,
+    provider: 'local-ollama',
+    local: false,
+    reason: 'route-excluded',
+  })
+  assert.equal(result.reason, 'route-excluded')
+  assert.match(result.label, /local-ollama/)
+  assert.match(result.label, /自动识别关掉了/)
+  assert.match(result.label, /routes 留空/)
+  assert.doesNotMatch(result.label, /不在裁剪路由里（云端/)
+})
+
 await ok('promptTrim 被关掉：指出是配置关的，不是段名失效', () => {
   const result = summarizeTrim({ charsIn: 100, charsOut: 100, local: true, reason: 'trim-disabled' })
   assert.match(result.label, /promptTrim = false/)
@@ -188,6 +205,53 @@ await ok('名字带本地标记也算本地', () => {
 await ok('云端 provider 不算本地', () => {
   assert.equal(isLocalProvider('deepseek-eo', 'https://api.deepseek.com/v1'), false)
   assert.equal(isLocalProvider('anthropic', 'https://api.anthropic.com'), false)
+})
+
+// 名字里带 local/llama 的云端 provider 很多（openrouter-llama-3、together-llama…）。
+// 有地址就必须以地址为准，否则会把公网请求当成本地裁掉 —— 那比漏裁危险得多。
+await ok('有地址时以地址为准，名字不再翻案', () => {
+  assert.equal(isLocalProvider('openrouter-llama-3', 'https://openrouter.ai/api/v1'), false)
+  assert.equal(isLocalProvider('local-tunnel', 'https://my-tunnel.example.com/v1'), false)
+  assert.equal(isLocalProvider('local-tunnel', ''), true)
+})
+
+// 以前拿正则 match 整串 URL，于是「域名前缀碰巧叫 localhost」的公网地址全被误判成本地。
+await ok('域名前缀像 localhost 的公网地址不算本地', () => {
+  assert.equal(isLocalProvider('x', 'http://localhost.attacker.com/v1'), false)
+  assert.equal(isLocalProvider('x', 'http://localhost-evil.com/v1'), false)
+  assert.equal(isLocalProvider('x', 'http://127.0.0.1.attacker.com/v1'), false)
+  // userinfo 后面才是真 host：这条以前会被当成 127.0.0.1
+  assert.equal(isLocalProvider('x', 'http://localhost@attacker.com/v1'), false)
+})
+
+await ok('回环整段 / CGNAT / 链路本地都算本地', () => {
+  assert.equal(isLocalProvider('x', 'http://127.0.0.2:8090/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://127.1.2.3:8090/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://100.101.102.103:8000/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://169.254.1.5:8000/v1'), true)
+  // 172.16-31 是私有，两端外面不是
+  assert.equal(isLocalProvider('x', 'http://172.16.0.1:8000/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://172.31.255.254:8000/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://172.15.0.1:8000/v1'), false)
+  assert.equal(isLocalProvider('x', 'http://172.32.0.1:8000/v1'), false)
+})
+
+await ok('IPv6 与 mDNS / 单标签主机名也算本地', () => {
+  assert.equal(isLocalProvider('x', 'http://[::1]:11434/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://[fd00::5]:8000/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://[fe80::1]:8000/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://macbook.local:8000/v1'), true)
+  assert.equal(isLocalProvider('x', 'http://gpu-box:8000/v1'), true)
+})
+
+await ok('新后端名字也算本地', () => {
+  assert.equal(isLocalProvider('mlx-lm', ''), true)
+  assert.equal(isLocalProvider('local-llamacpp', ''), true)
+  assert.equal(isLocalProvider('localai', ''), true)
+  assert.equal(isLocalProvider('xinference', ''), true)
+  assert.equal(isLocalProvider('ktransformers', ''), true)
+  assert.equal(isLocalProvider('exo-cluster', ''), true)
+  assert.equal(isLocalProvider('oobabooga', ''), true)
 })
 
 await ok('千分位格式化', () => {

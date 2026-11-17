@@ -4,6 +4,87 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.5.6] - 2026-11-17
+
+一句话：**判「这是不是本地端点」以前是拿正则 match 整串 URL，两个方向都在错 —— 其中一个是误判。**
+
+### 误判（危险的那一侧）
+
+`LOCAL_HOST_PATTERN` 是 `^https?://(?:127\.0\.0\.1|localhost|…)`，对整串 URL 做前缀匹配。
+于是下面这些**公网地址**全被当成本地：
+
+```
+http://localhost.attacker.com/v1      → 命中 localhost
+http://localhost-evil.com/v1          → 命中 localhost
+http://127.0.0.1.attacker.com/v1      → 命中 127.0.0.1
+http://localhost@attacker.com/v1      → 真实 host 是 attacker.com
+```
+
+后果不是「少裁一点」，而是**云端请求被裁掉七成提示词**（42K→9K、169 个工具→12 个、
+schema 13.5K→10.6K），面板还高高兴兴显示「已裁剪 78%」。用户只会看到云端模型突然
+不会调工具了，完全不知道是自己某条 baseURL 的域名前缀撞上了 `localhost`。
+
+### 漏判（另一个方向）
+
+只写了 `127.0.0.1`（不是 127/8）、没有 IPv6 ULA、没有 mDNS、没有 CGNAT：
+
+| 地址 | 以前 | 现在 |
+| --- | --- | --- |
+| `127.0.0.2` / `127.1.2.3` | ✗ | ✓ |
+| `100.101.102.103`（Tailscale） | ✗ | ✓ |
+| `169.254.1.5`（链路本地） | ✗ | ✓ |
+| `[fd00::5]` / `[fe80::1]` | ✗ | ✓ |
+| `macbook.local`（mDNS） | ✗ | ✓ |
+| `gpu-box`（单标签主机名） | ✗ | ✓ |
+
+### 改法
+
+`lib/status.js` 里改成**先 `new URL()` 解析出 hostname 再判**（新增 `hostOf` /
+`looksLocalHost` / `looksLocalUrl` / `looksLocalName` 导出）：
+
+- 回环整段 `127/8`、私有 `10/8` `192.168/16` `172.16–31/12`、链路本地 `169.254/16`、
+  CGNAT `100.64/10`、`0/8`；
+- IPv6 `::1` / `::`、ULA `fc00::/7`、链路本地 `fe80::/10`、IPv4-mapped `::ffff:x`；
+- `host.docker.internal` / `host.containers.internal` / `gateway.docker.internal`；
+- `.local` / `.internal` / `.localhost` 后缀，以及单标签主机名（公网 DNS 里不存在）。
+
+`new URL()` 顺手解决 userinfo 那条：`http://localhost@attacker.com/v1` 解析出的
+hostname 是 `attacker.com`，不是 `localhost`。
+
+### 判定顺序也改了：有地址就以地址为准
+
+以前 `isLocalProvider(id, baseURL)` 是「地址命中 **或** 名字命中」。`openrouter-llama-3`
+这种云端 provider 名字里带 `llama`，会被判成本地。现在有 baseURL 就只看地址，
+名字只在没有地址时兜底。
+
+### 两份正则收敛成一份
+
+`lib/index.js` 里原本复制了一份 `LOCAL_HOST_PATTERN` / `LOCAL_NAME_PATTERN` 各自演化
+（`lm-studio` 在其中一份里写了两遍）。现在只有 `lib/status.js` 一份真值源，
+`lib/index.js` 直接 import —— 否则「面板说这是本地」和「要不要裁剪」会用两套判据。
+
+### 名字白名单补上新后端
+
+`mlx` / `llama-cpp` / `llamafile` / `localai` / `xinference` / `ktransformers` /
+`oobabooga` / `textgen` / `aphrodite` / `exo`。封闭枚举注定追不上新后端，所以地址判定
+才是主路，名字只是没有 baseURL 时的兜底。
+
+### 新成因：`route-excluded`
+
+地址明明是本地，但 `routes` 写了别的名字（或 `autoDetectBaseURL: false`）把自动识别
+关掉了。以前面板只说「未裁剪」，用户会去翻 `dropSections`（方向完全错了）。现在
+`lastSkipReason` 会区分这两种，面板文案直接告诉他「把 routes 留空就按地址自动认」。
+
+### 测试
+
+- `test/panel.mjs` +6 组（97 项）：误判四例、回环整段 / CGNAT / 链路本地、IPv6 与 mDNS、
+  新后端名字、以地址为准、`route-excluded` 文案。
+- `test/autodetect.mjs` +2 个云端 fixture（`cloud-lookalike` / `cloud-userinfo`）：
+  名字和主机名都像本地，必须原样放行。
+- 变异验证：把 `looksLocalUrl` 换回旧正则，`cloud-lookalike` / `cloud-userinfo`
+  两条立刻变红 —— 断言确实盯着这个 bug，不是假绿。
+- `npm run verify` **1253 ✓ / 0 ✗**。
+
 ## [0.5.5] - 2026-11-14
 
 一句话：**模型删了，provider 也得跟着消失 —— 以前两边根本没人在对账。**
