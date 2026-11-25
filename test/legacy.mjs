@@ -119,9 +119,40 @@ await ok('0.5.1 的 dropSections 报 0.5.1，丢掉两条死条目', async () =>
 
 console.log('\n不误伤用户自己的配置')
 
-await ok('多了一个自己加的名字 → 不是旧默认值，原样不动', async () => {
+await ok('多了一个自己加的名字 → 仍然迁移，自己加的原样保留', async () => {
+  // 这条原来是「多一个名字就整表放弃」。那是最常见的情形：0.5.1 的 19 条 + 自己
+  // 加的一个工具。整表放弃意味着 5 个 scoped 名永久残留，而宿主的 tools.restrict
+  // 会因为它们整批被拒 —— 表现成「插件死活不裁工具」，用户完全不知道原因。
   const stored = [...v051.keep, 'my_private_tool']
-  assert.equal(migrateLegacyList(stored, DEFAULT_KEEP, 'keep'), null)
+  const hit = migrateLegacyList(stored, DEFAULT_KEEP, 'keep')
+  assert.ok(hit, '应该仍然认得出是 0.5.1 的拷贝')
+  assert.equal(hit.version, '0.5.1')
+  assert.ok(hit.extra.includes('my_private_tool'), 'extra 里要报出来')
+  assert.ok(hit.next.includes('my_private_tool'), '自己加的名字不能被吞掉')
+  for (const name of ['ops_bash', 'ops_glob', 'ops_grep', 'ops_read_files', 'ops_inspect_local_file']) {
+    assert.ok(!hit.next.includes(name), `${name} 该清掉`)
+  }
+})
+
+await ok('自己加的名字排在原位置，不被打到末尾', async () => {
+  // 顺序也是用户的配置：原来无条件按默认顺序重建，把手工排过的顺序静默洗掉了。
+  const stored = ['bash', 'my_private_tool', ...v051.keep.slice(1)]
+  const hit = migrateLegacyList(stored, DEFAULT_KEEP, 'keep')
+  assert.ok(hit)
+  assert.equal(hit.next[0], 'bash')
+  assert.equal(hit.next[1], 'my_private_tool')
+})
+
+await ok('顺序被用户调过 → 迁移后保持', async () => {
+  const stored = ['read', 'bash', ...v051.keep.filter((name) => name !== 'bash' && name !== 'read')]
+  const hit = migrateLegacyList(stored, DEFAULT_KEEP, 'keep')
+  assert.ok(hit)
+  assert.deepEqual(hit.next.slice(0, 2), ['read', 'bash'])
+})
+
+await ok('用户大改（删掉八成）仍然不动 —— 那已经不是默认值拷贝', async () => {
+  // 与上一条的边界：保序不能成为「随便什么列表都当成默认值」的借口。
+  assert.equal(migrateLegacyList(['bash', 'my_private_tool', 'read'], DEFAULT_KEEP, 'keep'), null)
 })
 
 await ok('少到只剩两条 → 用户手工精简过，原样不动', async () => {

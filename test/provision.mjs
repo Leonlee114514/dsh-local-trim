@@ -124,7 +124,11 @@ const noKwargs = buildProfile({
   models: hit.models,
   chatTemplateKwargs: null,
 })
-check('可显式关掉 compat', noKwargs.compat === undefined)
+// chatTemplateKwargs:null 的语义是「保留后端自己的思考模式」—— 此时 profile 里不写
+// compat（交给后端模板）。但要覆盖一条已经写着 enable_thinking:false 的旧配置，
+// 光「不写」是清不掉的（settings.update 走 mergeLayers，缺键=不动），
+// 那一步由 lib/index.js 的 clearStaleCompat() 补，这里只钉住 buildProfile 的产出形状。
+check('传 null 时不写 compat', noKwargs.compat === undefined, JSON.stringify(noKwargs.compat))
 
 const named = buildProfile({
   provider: 'x',

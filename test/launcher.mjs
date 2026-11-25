@@ -33,6 +33,9 @@ import {
   readGgufMeta,
   decorateWithGgufMeta,
   readGgufMagic,
+  estimateKvBytes,
+  shardInfo,
+  totalShardBytes,
 } from '../lib/launcher.js'
 
 // PATH 在不同 shell 下键名不同（bash: PATH / PowerShell: Path），断言不能写死。
@@ -171,7 +174,9 @@ await ok('runDetached 传参与环境正确且不等待退出', async () => {
     captured = { command, args, options }
     return { pid: 4242, unref() {} }
   }
-  const result = runDetached({
+  // runDetached 现在是 async：spawn 的失败是异步 'error' 事件，必须等它落定，
+  // 否则未捕获的 'error' 会打死宿主（v0.5.6 及以前就是这个 bug）。
+  const result = await runDetached({
     command: 'C:/fake/ollama.exe',
     args: ['serve'],
     env: { OLLAMA_HOST: '127.0.0.1:11434' },
@@ -207,13 +212,29 @@ await ok('mergeEnv：extra 里的 undefined 不覆盖已有值', async () => {
 })
 
 await ok('spawn 抛错时不装作成功', async () => {
-  const result = runDetached({
+  const result = await runDetached({
     command: 'nope',
     spawnImpl: () => {
       throw new Error('ENOENT')
     },
   })
   assert.equal(result.ok, false)
+  assert.match(result.error, /ENOENT/)
+})
+
+await ok('spawn 异步 error 事件被抓到（不再打死宿主）', async () => {
+  const { EventEmitter } = await import('node:events')
+  const child = Object.assign(new EventEmitter(), { pid: undefined, unref() {} })
+  const result = await runDetached({
+    command: 'missing-binary',
+    spawnImpl: () => {
+      // Node 真实的 spawn 就是这样：命令找不到时同步返回 child，
+      // 在下一个 tick 才 emit('error')。同步 try/catch 抓不到。
+      setTimeout(() => child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })), 5)
+      return child
+    },
+  })
+  assert.equal(result.ok, false, '没拿到 pid 就不该报成功')
   assert.match(result.error, /ENOENT/)
 })
 
@@ -421,6 +442,82 @@ await ok('拿不到体积 → unknown，不假装通过也不假装危险', asyn
     assert.equal(fit.level, 'unknown', String(value))
     assert.equal(fit.ratio, 0)
   }
+})
+
+await ok('分片名认得出来，非分片回 null', async () => {
+  assert.deepEqual(shardInfo('Qwen3-32B-Q4_K_M-00002-of-00004.gguf'), {
+    base: 'Qwen3-32B-Q4_K_M',
+    index: 2,
+    count: 4,
+  })
+  for (const name of ['a.gguf', 'a-00001-of-00001.gguf', 'a-00002-of-00001.gguf', 'a-00000-of-00002.gguf', 'a-1-of-2.gguf', '']) {
+    assert.equal(shardInfo(name), null, name)
+  }
+})
+
+await ok('分片总体积是全部之和，不是主分片那一片', async () => {
+  const sizes = {
+    '/m/Q-00001-of-00004.gguf': 4 * GIB,
+    '/m/Q-00002-of-00004.gguf': 4 * GIB,
+    '/m/Q-00003-of-00004.gguf': 4 * GIB,
+    '/m/Q-00004-of-00004.gguf': 4 * GIB,
+    '/m/Q-00005-of-00005.gguf': 1 * GIB,
+    '/m/other.gguf': 2 * GIB,
+  }
+  const io = { listDir: (dir) => Object.keys(sizes).map((p) => p.slice(dir.length + 1)), statSize: (p) => sizes[p] ?? 0 }
+  assert.equal(totalShardBytes('/m/Q-00001-of-00004.gguf', io), 16 * GIB)
+  // 另一组分片、另一个文件都不能混进来
+  assert.equal(totalShardBytes('/m/Q-00005-of-00005.gguf', io), 1 * GIB)
+  assert.equal(totalShardBytes('/m/other.gguf', io), 2 * GIB)
+  // 目录读不成（列表为空）时退回主分片自己的大小，不能报 0
+  assert.equal(totalShardBytes('/m/Q-00001-of-00004.gguf', { listDir: () => [], statSize: (p) => sizes[p] ?? 0 }), 4 * GIB)
+})
+
+await ok('目录里只留第一片，体积按全量算（否则面板上 4 条同名各 4GB）', async () => {
+  const files = {
+    '/m/Q-00001-of-00004.gguf': 100,
+    '/m/Q-00002-of-00004.gguf': 100,
+    '/m/Q-00003-of-00004.gguf': 100,
+    '/m/Q-00004-of-00004.gguf': 100,
+  }
+  const list = scanLocalModels({
+    dirs: ['/m'],
+    depth: 1,
+    ggufMeta: false,
+    statSize: (p) => files[p] ?? 0,
+    listDir: (dir) => Object.keys(files).map((p) => p.slice(dir.length + 1)),
+    statIsDir: () => false,
+    exists: () => true,
+  })
+  assert.equal(list.length, 1, JSON.stringify(list.map((i) => i.name)))
+  assert.equal(list[0].name, 'Q-00001-of-00004.gguf')
+  assert.equal(list[0].sizeBytes, 400)
+  assert.equal(list[0].shardCount, 4)
+})
+
+await ok('KV cache：维度齐才算，缺一个就回 0（不瞎猜）', async () => {
+  // 32 层、hidden 4096、32 个 Q 头、8 个 KV 头（GQA）、上下文 8192：
+  // 2 * 32 * 8192 * (4096/32*8) * 2 字节 = 2 * 32 * 8192 * 1024 * 2 = 1073741824
+  const full = { blockCount: 32, embeddingLength: 4096, headCount: 32, headCountKv: 8, contextTokens: 8192 }
+  assert.equal(estimateKvBytes(full), 1073741824)
+  // 没有 KV 头数时按 Q 头数算（等于高估 4 倍），所以调用方要优先传 headCountKv
+  assert.equal(estimateKvBytes({ ...full, headCountKv: 0 }), 4 * 1073741824)
+  for (const key of ['blockCount', 'embeddingLength', 'headCount', 'contextTokens']) {
+    assert.equal(estimateKvBytes({ ...full, [key]: 0 }), 0, key)
+    assert.equal(estimateKvBytes({ ...full, [key]: undefined }), 0, key)
+  }
+  assert.equal(estimateKvBytes({}), 0)
+})
+
+await ok('KV cache 计入预检：同一份权重，加上 KV 就从 ok 变 warn', async () => {
+  const base = { sizeBytes: 8 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 12 * GIB, gpuBytes: 0 }
+  const plain = checkModelFit(base)
+  const withKv = checkModelFit({ ...base, kvBytes: 8 * GIB })
+  assert.equal(plain.level, 'ok', plain.label)
+  assert.equal(withKv.level, 'warn', withKv.label)
+  assert.match(withKv.label, /KV cache/)
+  assert.equal(withKv.kvBytes, 8 * GIB)
+  assert.equal(withKv.footprint, 16 * GIB)
 })
 
 await ok('--load-mode 只在显式指定时拼进参数（b11012 不认 --no-mmap）', async () => {
@@ -966,7 +1063,8 @@ await ok('GGUF 元数据：折进条目时给紧凑名，mmproj 按 general.type
   const proj = decorateWithGgufMeta({ name: 'local_model.gguf' }, {
     'general.architecture': 'clip',
     'general.type': 'mmproj',
-    'general.file_type': 32,
+    // 99 是确实没有对应名字的编号（32 起是 Q4_0_4_4 / TQ1_0 这些 repack 量化，表里有）
+    'general.file_type': 99,
   })
   assert.equal(proj.mmproj, true)
   assert.equal(proj.quantization, undefined, '量化表里没有的编号不显示')

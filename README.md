@@ -58,7 +58,7 @@ token 会被立刻加回去。
 dsh plugin add dsh-local-trim
 ```
 
-钉版本：`dsh plugin add dsh-local-trim@0.5.5`。
+钉版本：`dsh plugin add dsh-local-trim@0.5.7`。
 
 为什么要专门说「不需要 git」——因为从 `github:` 源装是另一条路，那条路上 git 是硬门槛，
 见下一节。桌面端不自带 git，新机器上这两条路的差别就是「装得上」和「装不上」。
@@ -178,7 +178,12 @@ pnpm add link:../../../path/to/dsh-local-trim
      有，模型选择器里一个都看不到**。真要校验 key 的机器（vLLM `--api-key`）才写
      `apiKeyEnv`，并且用 credentials 服务或环境变量把值备好。
 
-  不需要关思考就在 `provision` 里写 `chatTemplateKwargs: null`。
+  不需要关思考就在 `provision` 里写 `chatTemplateKwargs: null`。v0.5.7 起这是**真的会清掉**
+  上次写进去的值：以前 `null` 只是「这次不写」，而 `settings.update` 走 `mergeLayers`
+  （缺键 = 不动），于是 `compat.chatTemplateKwargs` 会永久留在 profile 里，交回后端模板的
+  动作静默无效（代码注释还把清理责任推给一个并不存在的 `clearStaleCompat()`）。现在写配置
+  前先读回 profile、`delete compat.chatTemplateKwargs`、`compat` 空了就整块删掉，再 update；
+  导入那条路径也走同一段。
 - 探测与写入失败都不会影响裁剪，把原因写进日志（默认
   `~/.dsh/local-llm/local-trim.log`，可用 `DSH_LOCAL_TRIM_LOG` 改位置）。
 
@@ -549,7 +554,9 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
   （llama.cpp 分不清「没装」和「没加载」）、**这条 provider 本来就没有模型**。
 
 `POST /api/dsh-local-trim/reconcile` 支持 `{ provider, apply: false }`：只算不改，把结论先看
-一眼再决定。
+一眼再决定。面板从 v0.5.7 起默认走这条路 —— 点一次「对账」先拿预览，只有真要删/摘的时候
+按钮变成「确认对账」，再点一次才带 `apply: true`。以前一次点击直接写配置，手指抖一下就
+删掉一条 provider。
 
 **同一个后端只该有一条 provider**（v0.5.1 起）。以前每导入一个模型就新建一条
 `local-<后端>-<模型名>`，同一个 Ollama 攒出 `local-ollama-qwen3-14b`、`local-ollama-qwen3-8b`、
@@ -563,7 +570,7 @@ gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口�
   会让人意外。
 - 端点比较会收敛回环名（`localhost` 与 `127.0.0.1` 同一个）和尾斜杠，不同端口就是不同后端。
 
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama，v0.4.6 读 GGUF 真名，v0.4.7 试跑超时可配且冷加载自动重试，v0.4.8 端口跟着文件走，v0.4.9 修面板被渲染期异常整块吞掉）—— 上一块要求你先有端点，可刚下完模型的
+**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama，v0.4.6 读 GGUF 真名，v0.4.7 试跑超时可配且冷加载自动重试，v0.4.8 端口跟着文件走，v0.4.9 修面板被渲染期异常整块吞掉，v0.5.7 端口冲突时自己找空位、模型 id 对不上不再猜一个用）—— 上一块要求你先有端点，可刚下完模型的
 时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个模型 → 一键配置并试跑**。
 
 点「扫描本机模型」后插件按 `modelRoots()` 的顺序找权重（每层最多下探两级，跳过
@@ -625,8 +632,10 @@ Ollama 的模型显示 tag 并带一个 `Ollama` 徽标和量化标签，后面�
 选中一个模型后填端口（默认 8090；**选中 Ollama 的模型时自动跟到 11434，选中普通 `.gguf`
 时改回 8090** —— 端口跟着文件走，不跟着上一次点了什么走。v0.4.8 前只做了前半段，于是
 「先点 Ollama 的模型、再点普通 `.gguf`」会把 11434 带过去，插件探到 Ollama 在应答就直接
-借它的端口，注册出一个你从没点过的模型）和上下文（默认 65536），点**一键配置并试跑**，
-一条链走完三件事：
+借它的端口，注册出一个你从没点过的模型。v0.5.7 起改口的动作会**先确认 8090 真是空的**：
+被占就顺着 8091–8099 找第一个「没人应答」或者「应答的模型正好就是你要的那个」的端口；
+十一个全被占就报错停下，不再像以前那样认定 8090 归自己、把别人的后端当成自己的复用）
+和上下文（默认 65536），点**一键配置并试跑**，一条链走完三件事：
 
 1. **先做资源预检**：算的是 **显存装不下的那部分**（`sizeBytes − gpuBytes`）比内存预算
    （`max(totalmem − 2GB, freemem)`）。为什么不拿 gguf 全长去比内存 —— gguf 走 mmap 读，
@@ -736,12 +745,19 @@ macOS `/Applications/Ollama.app/...`、Homebrew `/opt/homebrew/bin`；Linux `/us
 
 高级配置里的 **一键拉起命令** 留空就走上面的自动逻辑；填了（例如
 `C:\Users\you\AI\ollama\ollama.exe serve --verbose`）就原样执行，优先于自动探测。
+命令里带空格路径要自己加引号（v0.5.7 起插件会替你补上缺的那对）；反过来，命令里出现
+`& | < > ^ % ! "` 或换行时插件**直接拒绝执行**并说明原因 —— Windows 上这类命令必须交给
+`cmd.exe` 才能跑，而 `cmd` 没有能安全表达引号的转义序列，拼命令行等于给元字符开后门。
+要跑管道就自己写成 `.bat` / `.ps1`，把那个文件路径填进来。
 起进程用 `detached + stdio:ignore`，不挂在宿主进程的管道上，所以**关掉 DSH 不会把它带走**，
 要开机自启得自己挂（Windows 计划任务或启动项）。
 
 **停止**（v0.4.0 起）：进程起来了就得能关。provider 那一行如果在「本插件起过的端口」表里，
 就会多一个红色 **停止** 按钮，点它走 `POST /api/dsh-local-trim/stop` → `SIGTERM`，
-1.5 秒内不退再补 `SIGKILL`，还活着就如实报失败（不谎报成功）。
+1.5 秒内不退再补 `SIGKILL`，还活着就如实报失败（不谎报成功）。Windows 上杀的是**整棵进程树**
+（`taskkill /PID <pid> /T`，补 `SIGKILL` 时再加 `/F`）—— 只杀单个 pid 会留下 llama-server
+自己 fork 出来的 worker，端口照样占着，下次拉起报「端口已被占用」而你不知道是谁占的。
+`taskkill` 回「没有找到进程」按成功处理：进程本来就已经没了，不该反过来报失败。
 这张表只存在宿主内存里：**重启 DSH 之后表就空了**，此时那些进程要自己关
 （`taskkill /PID <pid> /F`，pid 在面板「已拉起」提示和启动日志里都有）。
 
@@ -762,11 +778,16 @@ smokeTimeout: 120
 **端口落在别的引擎上会改口**（v0.4.8）：普通 `.gguf` 却被填成 Ollama 的 11434 / vLLM 的
 8000 / LM Studio 的 1234 时，插件改用 8090（llama.cpp）并在结果里说明一句。只对**已知引擎
 的端口**这么办 —— 你自己填个 9999 想喂另一台 llama-server，那是你的自由，照旧不抢。
+改口之后 v0.5.7 起还会再确认一次 8090 到底空不空：被占就 8091–8099 依次试，十一个全占
+就报「8090–8099 全被占用了…别让面板去借别人的后端」并停下。v0.4.8–v0.5.6 这里直接认定
+8090 是自己的，端口冲突时连探测都不做，探到别人在应答就当「已经起好了」复用 —— 于是面板
+会对着一个不是它起的后端注册 provider。
 
-**模型 id 对不上不瞎猜**：起了服务之后要拿一个模型 id 去注册 provider。名字对不上时，
-只有列表里**恰好一个**模型才取它（单模型后端报的 id 本来就可能和文件名不同）；多个模型
-对不上就直接报错并列出实际报的 id —— 「别猜一个用 —— 先确认这个文件喂给了正确的后端」。
-v0.4.8 前这里会静默抓列表第一个，于是借错端口时会注册出一个你从没点过的模型。
+**模型 id 对不上不瞎猜**：起了服务之后要拿一个模型 id 去注册 provider。名字对不上就
+直接报错并列出实际报的 id —— 「别猜一个用 —— 先确认这个文件喂给了正确的后端」。
+v0.4.8 前这里会静默抓列表第一个；v0.4.8–v0.5.6 改成「列表里恰好只有一个模型就用它」——
+后半句看着像保守，实际是同一个毛病换了个说法：端口上跑着别人的单个模型时，照样会把你的
+文件注册成那个模型。v0.5.7 把这条兜底删了，`pickModel` 只认名字真的对上的那个。
 
 **其他按钮**：**探测本地端点**（依次打 `8090` / `11434` / `8000` / `1234`）、**看日志**
 （读 `~/.dsh/local-llm/local-trim.log` 尾部）、**重新检测**（强制刷新点灯结果）。
@@ -796,14 +817,38 @@ v0.4.8 就是这样：`portFor` 声明在 `AdoptBox` 里面，`Panel` 的 `scanM
 `node test/client.mjs` 也能复现这类作用域错误（它自带最小 React 替身，真跑渲染、真执行
 `setState` 的 updater）；`node --check` 对此完全无感，只有语法错才报。
 
-面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，十四个端点
+面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，十五个端点
 `describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test` / `launch` /
-`stop` / `models` / `adopt` / `delete` / `align`，全部只接受 POST，且只放行本机来源
+`stop` / `models` / `adopt` / `delete` / `align` / `reconcile`，全部只接受 POST，且只放行本机来源
 （`sec-fetch-site: cross-site` 直接 403，`Origin` 必须与 Host 同源）。
 
-重活路由（除 `describe` / `save` / `log` 之外）带两层节流：同一个路由上一次还没跑完时
-直接回「等它结束再来一次」，跑完之后 800ms 内再来也被挡（`bridgeThrottleMs` 可调，设 0 关掉
-间隔限制、只留并发去重）。前端连点不会在宿主机上堆叠起一堆 `llama-server`。
+重活路由（除 `describe` / `status` / `log` 之外；`save` 从 v0.5.7 起也算重活 —— 它写的是整条
+`providers` 数组，连点两下就是两次 CAS 写、两次 reload，后一次还常撞 revision 冲突）
+带两层节流：**同一个路由上一次还没跑完时，后来的请求排在它后面等结果**（问的是同一件事，拒掉纯属浪费；v0.5.7 前是回一句「等它结束
+再来一次」，面板根本不知道什么时候结束，用户只能盲点），跑完之后 800ms 内再来才被挡
+（`bridgeThrottleMs` 可调，设 0 关掉间隔限制、只留并发去重）。前端连点不会在宿主机上堆叠起
+一堆 `llama-server`。
+
+排队本身 v0.5.7 也修了：以前「排着等」的等待者被一次性全部唤醒，醒来后各自重新抢锁，
+于是同一条路由上同时跑起 N 个 —— 实测 5 个并发 `adopt` 峰值 4 个同时在跑、同时写 settings。
+现在是 FIFO 队列，锁**原地交接**给队首，中间没有任何窗口能被插进来（同一个探针峰值 1，
+五个请求在 215 / 418 / 619 / 821 / 1022 ms 依次完成）。
+
+**来源判定不是只看 Host 头。** 判「这是不是本机来的请求」一共四道，任一不过就 403：TCP 对端
+地址是回环、`sec-fetch-site` 不是 `cross-site`、`Host` 是回环名、`Origin` 是回环名（`null`
+例外，file:// 页面会给这个）。只有 Host 一道的话，一个把 DNS 指到 127.0.0.1 的公网域名就能
+借你的浏览器打这套接口 —— 浏览器的同源策略拦不住它，因为请求本身是从你自己机器发出的。
+要从前端代理（反代 / 容器 / 另一台机器上的面板）访问，两个名单都得配：
+
+```yaml
+trustedPanelHosts: ['dsh.example.com']   # 放行 Host / Origin 里的主机名
+trustedPanelPeers: ['192.168.1.20']      # 放行 TCP 对端地址（v0.5.7 新增）
+```
+
+只配前一个不够：`trustedPanelHosts` 管的是请求头里写的名字，`trustedPanelPeers` 管的是连接
+真的从哪个地址来。v0.5.6 及以前这两道都不存在 —— 那时只查了 `sec-fetch-site`，而那个头是
+浏览器自己写的，非浏览器客户端（curl / 脚本 / 另一个进程）压根不发它，于是「不是从浏览器
+来的」就被当成合法请求放行了。
 
 ### 升级后默认值不生效？（v0.5.4 起自动识别）
 
@@ -1053,8 +1098,12 @@ llama.cpp 的参数是逐版演进的：`--load-mode` 和 `--fit` 是近几版�
   短参数（`-c` / `-m` / `-t`）也一并收 —— `-c` 是 `--ctx-size` 的短写，只认长参数的话
   `-c 65536` 会被判成不支持而整条裁掉，上下文悄悄退回引擎默认值（本机就这么丢过一次）。
 - 探不出来（命令不存在、超时、输出为空）→ **不裁剪**，按旧行为全给。宁可让引擎自己报错，
-  也不要因为探测失败把好参数丢掉。
-- 结果按二进制路径缓存，同一个 `llama-server` 只跑一次 `--help`。
+  也不要因为探测失败把好参数丢掉。v0.5.7 起「探不出来」这一种结果**不写进缓存** —— 以前
+  把 `null` 也存进去，于是第一次探测时二进制还没装好（或者刚好被杀软锁着），之后整场都按
+  「它什么都不认」处理，装好了也不重探。
+- 结果按二进制路径缓存，同一个 `llama-server` 只跑一次 `--help`（只缓存**真探到**的那次）。
+  同一个 flag 的几种拼写（`--n-gpu-layers` / `--gpu-layers` / `-ngl`）先按引擎自己认的那个
+  归一，认不出任何一个才裁掉 —— 保留参数却拼错名字，比丢掉更糟。
 
 **flag 在、取值不一定在。** `--n-gpu-layers auto` 的 `auto` 是和 `--fit` 同一代加的；
 老引擎只认数字。所以拼参数时按 `--fit` 有无分两套：
@@ -1089,6 +1138,9 @@ llama.cpp 的参数是逐版演进的：`--load-mode` 和 `--fit` 是近几版�
 
 预检给系统留多少内存是 `reserveMb`（默认 2048 MiB）。桌面 Windows + 宿主 + 浏览器差不多
 要这么多；Linux 服务器可以调到 1024，内存紧张的机器调大，`0` 表示不预留（只跟 free 比）。
+取值夹在 0–262144 之间（256 GiB）：v0.5.7 前只有下限没有上限，填个 `999999999` 会把
+「可用内存」算成负数，于是每个模型都判 risky、面板硬拦着不让起，而且文案只会说
+「内存不够」—— 现在这种明显写错的数字会被夹到上限，并在预检结论里说清是预留把它吃光了。
 
 ```yaml
 reserveMb: 1024
@@ -1125,7 +1177,7 @@ reserveMb: 1024
 ## 开发
 
 ```bash
-npm run verify                  # = check + test，15 个文件语法 + 10 套单元测试 + 跨平台推演
+npm run verify                  # = check + test，24 个文件语法 + 12 套单元测试 + 跨平台推演
 npm run check                   # 只跑 node --check（lib/*.js + client.js + test/ 里带平台/渲染逻辑的那几个）
 npm test                        # 只跑测试（unit + portable + host）
 npm run test:portable           # 只跑跨平台候选表推演（linux / darwin / win32 各一遍）
@@ -1139,6 +1191,7 @@ node test/client.mjs            # 真渲染 client.js（自带最小 React 替�
 node test/client-host.mjs       # 有没有 client 宿主都要说出来：headless profile 上不许静默
 node test/publish.mjs           # 发布就绪自检（publishConfig / files / dsh 声明 / optional peer）
 node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 15 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
+node test/bridge.mjs            # 直接造路由表验节流：同路由并发必须串行、纯读不排队、配错的间隔回落 800ms、各条错误码
 node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析与 GGUF KV 真名）+ 资源预检 + 停进程（不真起进程）
 node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
 node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径

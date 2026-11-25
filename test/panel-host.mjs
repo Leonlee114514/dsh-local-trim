@@ -82,6 +82,10 @@ const CHAT = {
 }
 const fetchLog = []
 const LIVE_PORTS = new Set(['8090', '11434'])
+// 8090 上「此刻加载着哪个模型」是可变的：真 llama-server 的 /v1/models 只报它自己
+// 加载的那一个，而 adopt 现在会拿这个 id 跟文件名对账（对不上就报错，不再猜一个用）。
+// 所以「8090 上跑着 local_model」这件事得能在用例里显式摆出来。
+let modelsAt8090 = MODELS
 const fakeFetch = async (url, init) => {
   const target = String(url)
   fetchLog.push({ url: target, method: init?.method ?? 'GET' })
@@ -102,7 +106,7 @@ const fakeFetch = async (url, init) => {
     return {
       ok: true,
       status: 200,
-      text: async () => JSON.stringify(port === '11434' ? OLLAMA_MODELS : MODELS),
+      text: async () => JSON.stringify(port === '11434' ? OLLAMA_MODELS : modelsAt8090),
     }
   }
   if (target.endsWith('/v1/chat/completions')) {
@@ -219,7 +223,7 @@ apply(ctxStub, {
   selfCheck: false,
   provision: false,
   // 用例是在几毫秒内连着打同一批重活路由的，默认 800ms 间隔会把它们全挡掉。
-  // 节流本身另有用例（最后那组）单独验。
+  // 节流与 FIFO 排队本身在 test/bridge.mjs 里单独验（那边直接造路由表，能控制并发）。
   bridgeThrottleMs: 0,
 })
 await new Promise((resolve) => setTimeout(resolve, 200))
@@ -456,6 +460,9 @@ console.log('\n=== 16. adopt：mmap 装得下的 15.8GB 模型不再被误判 ri
 {
   // v0.4.1 纠正：gguf 走 mmap 落在可回收的 page cache，显存外的部分才是宿主接的量。
   // 体积显式传入，不依赖这台机器上真的有没有那个文件 —— 判定逻辑要跨平台可复现。
+  // 8090 上摆出「已经加载着 local_model」：adopt 现在会拿 /v1/models 报的 id 跟文件名
+  // 对账，对不上就报错（不再兜底猜一个）。这里要测的是预检，所以先让它对得上。
+  modelsAt8090 = { object: 'list', data: [{ id: 'local_model', meta: { n_ctx: 32768 } }] }
   const { status, body } = await callRoute('adopt', {
     modelPath: 'C:/models/local_model.gguf',
     port: 8090,
@@ -673,14 +680,16 @@ console.log('\n=== 21. align：把 models 对齐到后端真的有的那份 ==='
   const cur = () => settingsState['llm-pi-ai'].value.providers
   // 一条「声明 3 个、后端只有 1 个」的靶子（第 1 个活着，后 2 个是 ollama rm 留下的死声明）。
   // contextWindow 故意写成 12345，用来验证「活着的条目原样保留，不拿探测值覆盖用户调参」。
+  // 注意这条靶子指向 11434（Ollama）而不是 8090（llama.cpp）：
+  // 只有「一次报全部模型」的后端才允许按后端清单摘除，见下面第 21b 组。
   const zombie = 'local-align-target'
   cur()[zombie] = {
     displayName: '本地对齐靶子',
-    baseURL: 'http://127.0.0.1:8090/v1',
+    baseURL: 'http://127.0.0.1:11434/v1',
     defaultMaxTokens: 2048,
     compat: { thinkingFormat: 'chat-template' },
     models: [
-      { id: 'qwen3-4b', contextWindow: 12345, maxTokens: 777, reasoningEfforts: { off: null, low: 'low' } },
+      { id: OLLAMA_TAG, contextWindow: 12345, maxTokens: 777, reasoningEfforts: { off: null, low: 'low' } },
       { id: 'deleted-a', contextWindow: 32768 },
       { id: 'deleted-b', contextWindow: 32768 },
     ],
@@ -708,14 +717,14 @@ console.log('\n=== 21. align：把 models 对齐到后端真的有的那份 ==='
   check('对齐成功', aligned.body.ok === true, JSON.stringify(aligned.body))
   check('报告摘掉了 2 条', Array.isArray(aligned.body.removed) && aligned.body.removed.length === 2, JSON.stringify(aligned.body.removed ?? []))
   check('摘掉的是那两条死声明', JSON.stringify(aligned.body.removed ?? []) === JSON.stringify(['deleted-a', 'deleted-b']), JSON.stringify(aligned.body.removed ?? []))
-  check('活着的条目留在 kept 里', JSON.stringify(aligned.body.kept ?? []) === JSON.stringify(['qwen3-4b']), JSON.stringify(aligned.body.kept ?? []))
+  check('活着的条目留在 kept 里', JSON.stringify(aligned.body.kept ?? []) === JSON.stringify([OLLAMA_TAG]), JSON.stringify(aligned.body.kept ?? []))
   check('配置里只剩活的那条', cur()[zombie].models.length === 1, String(cur()[zombie].models.length))
-  check('留下来的还是那条活模型', cur()[zombie].models[0].id === 'qwen3-4b', String(cur()[zombie].models[0]?.id))
+  check('留下来的还是那条活模型', cur()[zombie].models[0].id === OLLAMA_TAG, String(cur()[zombie].models[0]?.id))
   // 对齐只改 models：用户的调参（contextWindow/maxTokens/reasoningEfforts）和 compat 都不许被重置。
   check('用户调参没被探测值覆盖', cur()[zombie].models[0].contextWindow === 12345 && cur()[zombie].models[0].maxTokens === 777, JSON.stringify(cur()[zombie].models[0]))
   check('reasoningEfforts 没丢', cur()[zombie].models[0].reasoningEfforts?.low === 'low', JSON.stringify(cur()[zombie].models[0].reasoningEfforts))
   check('compat 没被动', cur()[zombie].compat?.thinkingFormat === 'chat-template', JSON.stringify(cur()[zombie].compat))
-  check('baseURL 没被动', cur()[zombie].baseURL === 'http://127.0.0.1:8090/v1', String(cur()[zombie].baseURL))
+  check('baseURL 没被动', cur()[zombie].baseURL === 'http://127.0.0.1:11434/v1', String(cur()[zombie].baseURL))
   check('文案说清摘掉几条', /摘掉 2 条/.test(aligned.body.message ?? ''), aligned.body.message ?? '')
 
   // 再点一次：已经没有差值，必须报 changed:false 而不是又写一遍 settings。
@@ -759,7 +768,7 @@ console.log('\n=== 22. reconcile：后端没了的模型摘掉，全没了就删
   const cur = () => settingsState['llm-pi-ai'].value.providers
 
   // 不说哪条 → 对全部本地 provider 对账（这里只验不炸、返回 ok）。
-  const all = await callRoute('reconcile', {})
+  const all = await callRoute('reconcile', { apply: true })
   check('不带 provider 也能跑', all.body.ok === true, JSON.stringify(all.body.error ?? all.body.message))
   check('带回 actions 数组', Array.isArray(all.body.actions), typeof all.body.actions)
 
@@ -777,7 +786,7 @@ console.log('\n=== 22. reconcile：后端没了的模型摘掉，全没了就删
     baseURL: 'http://127.0.0.1:8090/v1',
     models: [{ id: 'qwen3-4b' }, { id: 'not-loaded-right-now' }],
   }
-  const skipped = await callRoute('reconcile', { provider: lcpp })
+  const skipped = await callRoute('reconcile', { provider: lcpp, apply: true })
   check('llama.cpp 跳过不摘模型', skipped.body.ok === true && skipped.body.changed === false, JSON.stringify(skipped.body))
   check('跳过理由说清是分不清没装和没加载', /分不清/.test(JSON.stringify(skipped.body.actions ?? [])), JSON.stringify(skipped.body.actions ?? []))
   check('跳过时配置一条没少', cur()[lcpp].models.length === 2, String(cur()[lcpp].models.length))
@@ -788,7 +797,7 @@ console.log('\n=== 22. reconcile：后端没了的模型摘掉，全没了就删
     baseURL: 'http://127.0.0.1:9999/v1',
     models: [{ id: 'whatever' }],
   }
-  const deadResult = await callRoute('reconcile', { provider: dead })
+  const deadResult = await callRoute('reconcile', { provider: dead, apply: true })
   check('连不上就不动配置', deadResult.body.ok === true && deadResult.body.changed === false, JSON.stringify(deadResult.body))
   check('连不上时 models 一条没少', cur()[dead].models.length === 1, String(cur()[dead].models.length))
 
@@ -805,7 +814,7 @@ console.log('\n=== 22. reconcile：后端没了的模型摘掉，全没了就删
       { id: 'qwen3:8b', contextWindow: 40960 },
     ],
   }
-  const pruned = await callRoute('reconcile', { provider: zombie })
+  const pruned = await callRoute('reconcile', { provider: zombie, apply: true })
   check('部分死：对账成功', pruned.body.ok === true && pruned.body.changed === true, JSON.stringify(pruned.body))
   check('摘掉的是那两条僵尸', JSON.stringify(pruned.body.actions?.[0]?.removed ?? []) === JSON.stringify(['qwen3:14b', 'qwen3:8b']), JSON.stringify(pruned.body.actions?.[0]?.removed ?? []))
   check('配置里只剩活的那条', cur()[zombie].models.length === 1, String(cur()[zombie].models.length))
@@ -819,7 +828,7 @@ console.log('\n=== 22. reconcile：后端没了的模型摘掉，全没了就删
     baseURL: 'http://127.0.0.1:11434/v1',
     models: [{ id: 'qwen3:14b' }, { id: 'qwen3:8b' }],
   }
-  const removed = await callRoute('reconcile', { provider: allDead })
+  const removed = await callRoute('reconcile', { provider: allDead, apply: true })
   check('全死：对账成功', removed.body.ok === true && removed.body.changed === true, JSON.stringify(removed.body))
   check('全死：整条 provider 删掉了', cur()[allDead] === undefined, JSON.stringify(cur()[allDead]))
   check('全死：走的是 mutate unset 而不是 update 写空数组', mutations.some((item) => JSON.stringify(item.ops ?? []) === JSON.stringify([{ op: 'unset', path: ['providers', allDead] }])), JSON.stringify(mutations.at(-1)?.ops ?? []))

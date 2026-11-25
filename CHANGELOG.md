@@ -4,6 +4,176 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.5.7] - 2026-11-26
+
+一句话：**对 v0.5.6 做了一轮纯逻辑复审，又挖出 3 个 P0、28 个 P1、14 个 P2 —— 它们的形状高度一致：把「我不知道」压成了「正常」，或者同一件事在两处各写一遍、只改了一处。**
+
+这一版没有新功能，全是修错。旧报告列过的 13 条 P0 逐条复核后确认已经修对（判定方式、清理时机、失败传播都对得上），
+所以下面只写这轮**新发现**的。复审报告见仓库根的 `代码审查报告-v0.5.6-逻辑复审.md`。
+
+### P0：会悄悄做错事的三处
+
+**① 面板在「不是自己那一栏」的渲染路径上白屏。** `client.js` 里 `refreshStatus` / `scanModels` /
+`runDelete` / `runAdopt` 四个 `useState` 挂在 `if (!mine) return null` **之后**。React 的规矩是
+同一次渲染里 hook 数量不能变：先渲染「有权限」那一支（hooks 全建），再渲染「没权限」那一支
+（提前 return，hook 少了）—— 报 `Rendered fewer hooks than expected`，整块面板直接消失，
+而且**只有切过一次 provider 才会触发**，所以开发时很难撞上。四个 hook 全部上移到 early return 之前。
+
+**② `provision` 的三态被压成两态。** 这个字段有三种值：`true`（自动配）、`false`（别动）、
+`{ endpoint, provider, displayName }`（照这个对象配）。面板 `applyValues` 里写的是
+`provision: values.provision !== false`，对象被转成 `true` 之后**再保存一次，用户手写的
+endpoint / provider id / 显示名就永久丢了**，而且面板上没有任何输入框能把它填回来。
+改成存原值（`provisionRaw`），`buildPatch` 里按 `=== true` 判断，对象原样写回。
+
+**③ `shell: true` 启动后端时命令拼接可被注入。** `runDetached` 在 `needsShell`（`.cmd` / `.bat`、
+或用户显式要求 shell）时把 `[command, ...args]` 交给 `cmd.exe`。这条路原来是裸拼字符串：
+路径里有空格就断，`&` `|` `^` `%` 会被当成命令分隔符执行。**这里选择拒绝而不是转义** ——
+`cmd` 没有能表达引号的转义序列，转义边界比「重写一遍命令行」更难测；所以含
+`& | < > ^ % ! "` 或换行的参数一律 `return { ok: false, error: '拒绝用 shell 启动：…' }`，
+并在非 shell 路径上给 `command` 补引号（原来只给 args 补，含空格的 `C:\Program Files\…` 会被 spawn 成 cmd.exe 的 pid，还被判成功）。
+
+### 同一件事两处实现，其中一处忘了同步
+
+这是上一轮报告 §7.2 已经点过的病根，这一轮又抓到四处：
+
+- **端口解析**：`lib/launcher.js` 与 `client.js` 各有一份 `portOfBaseURL`。`lib` 那份手写正则
+  遇到 `http://[::1]:8080/v1` 返回 0（正则首分支 `[^/:?#]+` 先赢，只吃到 `[`），遇到
+  `http://user:pw@h:8080` 返回 80。两份都改成 **WHATWG `URL`**：IPv6 字面量、userinfo、
+  非法端口三种写法一起修好。面板侧那份原来更糟 —— `String(baseURL).replace(/^.*:(\d+).*$/, '$1')`
+  会把 `http://h:11434/v1` 解析成 11434 但把 `http://h/v1` 解析成整串。
+- **删 provider 时的清理**：`deletePanel` 有 `onlineCache.delete` / `baseUrlCache.clear` /
+  `routes.delete` / `planAll` 四件事，`reconcilePanel` 的 remove 分支只有前三件 —— **漏了
+  `routes.delete`**。`dynamicRoutes` 只增不减，于是对账删掉的 id 仍然被 `isLocalRoute` 判为生效路由，
+  下一轮裁剪继续按「本地」处理一个已经不存在的 provider。
+- **`checkModelFit` 的入参**：`adoptPanel` 传 `loadMode`，`modelsPanel` 不传 ⇒ `anonymous` 恒 false，
+  列表页永远按 mmap 语义算（只 warn 不 risky），与采纳页口径不一致。`modelsPanel` 改成
+  `(input = {})` 并透传 `loadMode`，面板扫描时带上当前选中的加载方式。
+- **`bridge` 的重活表**：`save` 会写整条 `providers` 数组，却没进 `HEAVY_ROUTES`（既不参与 gap 节流也不串行）。
+  加进去；并发写原本靠 `revision` CAS 兜住，那属于「靠下游兜底」，不该当成源头不并发。
+
+### 兜底方向反了
+
+`|| 默认值` / `Number.isFinite` / `match` vs `matchAll` 这几件套，错的方向都是「宁可给个错的数，也不说没有」：
+
+- **`--help` 参数能力**：`parseHelpFlags` 的短参正则写的是 `-[a-zA-Z]`，只认一个字符 ⇒ `-ngl`（老版
+  llama.cpp 的分层数）、`-np`（并行槽）这类多字符短参**永远认不出**，`keepFlag` 判定「引擎不支持」
+  就把用户配的参数**悄悄丢掉**。正则放宽到 `-[a-zA-Z][a-zA-Z0-9-]*`，并把「同一个参数的不同拼写」
+  收进 `FLAG_ALIASES`（`--n-gpu-layers` ↔ `--gpu-layers` ↔ `-ngl`、`--ctx-size` ↔ `-c`、
+  `--n-predict` ↔ `-n`、`--parallel` ↔ `-np`），下发时用引擎自己 `--help` 里出现的那一种。
+  **保留参数却拼错名字，比丢掉更糟** —— 引擎会静默忽略，跑起来的是个默认配置。
+- **`--help` 探测失败不该进缓存**：`if (flags) helpCapsCache.set(...)` 对 `null` 也是 falsy 所以看起来没事，
+  但原代码是 `helpCapsCache.set(cacheKey, flags)` 无条件写 —— 一次超时就把「我不知道」缓存成永久结论，
+  之后这个二进制再也不会被重新探测。改成 `if (flags !== null)`。
+- **KV cache 字节数**：`estimateKvBytes` 的 `bytesPerElement` 默认 2（f16），而 `llamaCppAutoArgs` 给
+  现代引擎默认下的是 `--cache-type-k/v q8_0`（约 1.06 字节/元素）。**预检按 f16 算、启动按 q8_0 跑**，
+  两套口径差近一倍，结果是一边虚报 risky、一边漏报。新增 `KV_CACHE_BYTES` 表（f16/fp16/bf16=2、f32=4、
+  `q8_0`=34/32、`q8_1`=36/32、`q5_1`=24/32、`q5_0`=22/32、`q4_1`=20/32、`q4_0`=18/32、`iq4_nl`=18/32），
+  并把 `cacheType` 从 `planLaunch` 一路透到预检。**显式 `bytesPerElement > 0` 仍然优先，默认值仍然是 2**
+  （有测试钉着 1073741824 这个数，不能动）。
+- **AMD 多卡只算第一张**：NVIDIA 分支用 `matchAll` 累加，AMD `rocm-smi` 分支用单次 `match` —— 双卡机器上
+  显存只按一张卡算。改成 `matchAll`。
+- **数字型入参**：`Number(x) || 默认值` 挡得住 `0` 和 `NaN`，挡不住**负数**（`port: -1` 会一路传到 `fetch`）
+  和**字符串**（`Number.isFinite('1500')` 是 `false`，`waitMs: '1500'` 直接回落默认）。`port` 判 1..65535、
+  `ctx` 判 `>= 512`、`alias` 判 trim 后非空、`waitMs` 先转数字再判 `> 0`。
+
+### 「我不知道」被压成「正常」
+
+- **单模型兜底猜一个用**：`adoptPanel` 里 `pickModel(...) ?? (liveModels.length === 1 ? liveModels[0] : undefined)`。
+  端口上只跑着**别人**的模型时，`pickModel` 正确地返回了 `undefined`，然后这行兜底把 A 文件注册成 B 模型 ——
+  而同一个函数的错误文案正写着「别猜一个用 —— 先确认这个文件喂给了正确的后端」。兜底删掉。
+  顺带把「端口从哪改到哪」写进 `portNote`：改过口却没起得来时，用户需要知道它试过哪个。
+- **端口改口硬编码 8090**：`portConflict` 时直接 `port = 8090`。若 8090 上正跑着别的引擎，
+  `launchPanel` 的 `before.ok` 为 true，直接 `already: true` **复用别人的后端**。新增
+  `freePortFor(8090..8099)`：逐个探测，没人应答 → 用；应答且模型对得上 → 也用；应答但模型不对 → 跳过；
+  全占则返回 0 并报「8090–8099 全被占用了…别让面板去借别人的后端」。
+- **`killTree` 恒返回成功**：约定改成「成功 = `undefined`，失败 = 原因字符串」。原来恒返回 `''`，
+  调用方没法区分「没发过信号」和「发了并且成功」。Windows 分支把 `taskkill` 的
+  `/not found|没有找到|找不到|no running instance/` 视为成功（进程本来就不在了，不算失败）。
+- **GGUF 截断不挂标记**：读到一半抛异常时 `kv` 里已经有前面解析出来的键，catch 里直接 `return kv` ⇒
+  一个**半截**的 GGUF 头被当成完整结果用（真名、量化、上下文窗口全是前几项的）。改成挂一个
+  `partial: true`（不可枚举，不影响 JSON）。
+- **缺片的分片组整组消失**：`scanLocalModels` 原来无条件 `if (index > 1) continue`，只要第一片丢了
+  （下载中断、只下了后几片）整个模型就从列表里**消失**，用户看到的是「磁盘上什么都没有」。新增
+  `scanShardGroup` 返回 `{ lowest, present }`，从最低的那片开始认，并给模型挂 `shardMissing: true`。
+  同时「这一组算多大」从「有 count 片就报全量」改成「1..count 全在才报全量，否则只报自己那片」——
+  **低估只报一片会让人去查目录，高估报全量会让人以为装得下**。
+- **`raceWithDeadline` 的同步抛逃逸**：`raceWithDeadline(input.probe(), left)` 在调用**之前**就求值了
+  `probe()`，它同步抛出的异常直接冒到外层，超时机制完全没参与。首参改成 thunk，在 `try` 里求值。
+
+### 面板：说假话的地方
+
+- **停止被渲染成「已拉起」**：`launch` 与 `stop` 共用 `setLaunchResult`，而文案写死「已拉起」。
+  新增 `actionResultText(result)`，按 `result.action` 选文案，catch 分支也带 `action`。
+- **失败原因被吞**：`attempts` 渲染的是 `item.error`，服务端塞的字段叫 `reason` ⇒ 每一行都是空的。
+  改成 `${item.reason ?? item.error ?? ''}`。
+- **「已保存」被自己抹掉**：`save()` 里 `await load()`，而 `load()` 末尾 `setMessage(null)` ——
+  保存成功的提示活不过一个 await。`load` 加 `{ keepMessage: true }` 选项。
+- **重扫覆盖用户草稿**：`runImport` 成功后无条件 `applyValues` 回填，用户正在改的东西被冲掉。
+  抽出 `normalizeDraft` / `draftSignature`，导入后比对签名，dirty 时只 `refreshStatus` 并提示
+  「面板上有没保存的改动，没敢覆盖你的草稿」。
+- **对账一点就删**：`reconcile` 现在两段式 —— 先 `apply: false` 拿 actions 预览，有 remove/prune 时
+  按钮变「确认对账」，第二次点击才 `apply: true`。删配置这种事不该一次点击完成。
+- **`align` / `test` / `reconcile` 的结果画在页面另一头**：原来全塞进 `importResult`，渲染在导入区下方。
+  新增独立的 `providerResult` 状态，渲染在 provider 表正下方。
+- **重活请求没有超时**：`call()` 用 `fetch` 裸等，一次 `import` 卡住就永远转圈。加 `AbortController`：
+  `HEAVY_ROUTES`（与 `lib/bridge.js` 同名同步）10 分钟，其余 30 秒，超时抛 `error.timeout = true` 并提示
+  「N 秒没有回应，已放弃等待（…重活可再点一次，别连点）」。
+- **删除的确认态永不过期**：`ProviderList` 的 `pending` 只有真删时才清空，几分钟后再点同一个「删除」
+  直接删掉。进入确认态起 4 秒 `setTimeout` 复位，unmount 时 `clearTimeout`。
+- **测试占位画成绿色**：`test()` 的「正在发一条真实请求…」用 `ok: true`，先绿后红来回闪。
+  占位改 `ok: undefined`，渲染层走 `S.hint`。
+- **keep 清空的语义被反转**：文本域清空 → 服务端 `keep.length === 0` 回落 `DEFAULT_KEEP`。
+  也就是说「清空 = 一个都不保留」实际是「用默认白名单」。hint 改成明说，服务端注释同步。
+- **删掉的模型还留在采纳框里**：重扫后 `modelPath` 保持不变（`if (prev.modelPath !== '') return prev`），
+  `chosen` 变 `undefined` 但按钮 `disabled` 只看 `form.modelPath === ''` 仍可点，点下去发一个不存在的路径，
+  服务端回「这个文件不是 GGUF，也不是 Ollama 的模型」—— 完全误导。重扫后核一遍路径还在不在。
+- **端点 / provider id / 显示名只能在 yml 里手写**：对象形态的 `provision` 面板上没有入口，
+  P0-B 那个丢数据的 bug 对普通用户就是不可恢复的。补三个可选输入（留空 = 自动）。
+
+### P2：边界与体验（14 条）
+
+这一档不改变正常路径的行为，但都会在边缘上误导人：
+
+- **`unknown` 不吭声**：`fit.level === 'risky'` 只拦 risky，内存/显存探测全失败时（CI、容器、`totalmem` 返回 0）
+  直接放行且**一个字都不说**。保留放行（unknown 不该阻塞），但面板加一行灰字「没能探测内存，这次不做预检」。
+- **`localhost.` 尾点**：`http://localhost.:11434/v1` 判 `false`，而 `http://127.0.0.1.:11434/v1` 因为 `URL`
+  自己归一成 `127.0.0.1` 判 `true` —— 同一类写法两种结论。`hostname.replace(/\.$/, '')` 后再判。
+- **`whichOnPath` 不读 `PATHEXT`、不试 cwd**：写死 `['', '.exe', '.cmd', '.bat']`，`.com` / `.ps1` / 自定义后缀
+  找不到；只看 `PATH`，当前目录里的 `llama-server.exe` 也找不到。改成读 `PATHEXT` 并追加 `process.cwd()`。
+- **`trustedPeers` 是恒空集**：`isBridgeRequestAllowed` 里「非回环对端也放行」那条分支永远走不到，
+  而只配 `trustedPanelHosts` 在局域网里也不够（Host 放行了，TCP 对端还是 192.168.x.x，第 ① 道闸照样拒）。
+  新增 `trustedPanelPeers` 配置项（默认空 = 只认回环）。
+- **「交回后端模板」静默无效**：`buildProfile({ chatTemplateKwargs: null })` 只是**不写** `compat`，
+  而 `settings.update` 走 `mergeLayers`（缺键 = 不动）⇒ 上次写的 `compat.chatTemplateKwargs` 永久残留。
+  注释还把清理责任推给一个**不存在**的 `clearStaleCompat()`（全项目只有两处注释提到它）。现在真写了：
+  读回 profile、`delete compat.chatTemplateKwargs`、空了就 `delete compat`，再 `update`；import 路径同样调用。
+- **`reserveMb` 只有下限没有上限**：配成 `999999999` → 预留量算成 1e15 字节 → 之后每个模型都判 risky。
+  夹到 256 GiB（`RESERVE_MB_CAP`），与 `launchTimeout` / `smokeTimeout` 的夹法一致。
+- **挑模型没有解释**：全目录按体积最大挑（`[pick-largest]`，`local_model.gguf` 优先）。同一个目录里放了多个模型时，
+  选中哪个完全取决于体积，而且**没有任何地方说「我挑了哪个、为什么」**。`planLaunch` 的返回带上
+  `picked: { path, reason }`，面板显示出来。
+- 另有 4 条同类（`pickModel` 报错文案不带用户写的 `wanted`、`keep` 提示、重扫重置、`test` 占位色），
+  修法同上，不再逐条列。
+
+### 测试
+
+- `test/launcher.mjs` +104 行：shell 元字符拒绝、`command` 引号、`FLAG_ALIASES` 四种拼写、
+  `KV_CACHE_BYTES` 逐类型、`matchAll` 双卡、缺片回落、`killTree` 返回值、`waitMs` 字符串、`PATHEXT`、`localhost.`。
+- `test/panel.mjs` +62、`test/panel-host.mjs` +31、`test/legacy.mjs` +35、`test/provision.mjs` +6：
+  端口解析 IPv6/userinfo/非法端口、`freePortFor` 三档、对账的 `routes` 集合、`clearStaleCompat`、
+  重扫重置、keep 清空文案。
+- 新增 `test/bridge.mjs`（**此前节流一行测试都没有** —— `test/panel-host.mjs:226` 的注释写着
+  「节流本身另有用例单独验」，而那个用例从来没存在过，P1-17 的 FIFO 修复只在临时探针里验过）。
+  它直接造 `makeBridgeRoutes()` 而不走 `apply()`，因为要验的正是「同一把锁上的并发」：
+  5 个并发 `probe` 峰值必须是 1 且各拿各的结果（修前峰值 4）、`describe` 这类纯读不许排队、
+  `minGapMs` 填 -5 / NaN / '800' / null 一律回落到 800ms、填 0 只关间隔不关排队。
+  顺带把 `bridge.js` 里只有集成测试顺带碰到的语义钉住：GET 405、跨站 403、DNS rebinding 的
+  Host 403、非回环对端 403、坏 JSON 400 / 超 256KB 413 各自带稳定 code、路由抛异常回 500
+  且**不把异常原文回给客户端**、异常之后锁还得还回去。
+- 变异验证：把 `portOfBaseURL` 换回手写正则、把 `FLAG_ALIASES` 拆掉、把 `routes.delete` 删掉、
+  把 `releaseLock` 换回「一次唤醒所有等待者」，对应的用例立刻变红 —— 断言确实盯着这些 bug。
+- `npm run verify` **1309 ✓ / 0 ✗**（0.5.6 是 1253）。
+
 ## [0.5.6] - 2026-11-17
 
 一句话：**判「这是不是本地端点」以前是拿正则 match 整串 URL，两个方向都在错 —— 其中一个是误判。**

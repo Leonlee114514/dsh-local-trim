@@ -224,11 +224,13 @@ await ok('域名前缀像 localhost 的公网地址不算本地', () => {
   assert.equal(isLocalProvider('x', 'http://localhost@attacker.com/v1'), false)
 })
 
-await ok('回环整段 / CGNAT / 链路本地都算本地', () => {
+await ok('回环整段 / CGNAT 算本地，APIPA 不算', () => {
   assert.equal(isLocalProvider('x', 'http://127.0.0.2:8090/v1'), true)
   assert.equal(isLocalProvider('x', 'http://127.1.2.3:8090/v1'), true)
   assert.equal(isLocalProvider('x', 'http://100.101.102.103:8000/v1'), true)
-  assert.equal(isLocalProvider('x', 'http://169.254.1.5:8000/v1'), true)
+  // 169.254/16 是 APIPA（DHCP 没拿到地址时自己编的），上面没人跑推理服务。
+  // 算本地只会让一条本来就通不了的配置照样被裁 —— 掩盖真正的问题。
+  assert.equal(isLocalProvider('x', 'http://169.254.1.5:8000/v1'), false)
   // 172.16-31 是私有，两端外面不是
   assert.equal(isLocalProvider('x', 'http://172.16.0.1:8000/v1'), true)
   assert.equal(isLocalProvider('x', 'http://172.31.255.254:8000/v1'), true)
@@ -292,7 +294,9 @@ await ok('面板主视图把三件事拼齐', () => {
   assert.equal(status.flags.schemaTrim, false)
   assert.equal(status.counts.total, 2)
   assert.equal(status.counts.local, 1)
-  assert.equal(status.counts.online, 1)
+  // online 数的是**整张表**里后端够得着的（和 stale / staleModels 同一口径），
+  // 云端那条 deepseek-eo 也是 ok:true，所以是 2 —— 它跟「本地 N 个」不是同集合。
+  assert.equal(status.counts.online, 2)
   assert.equal(status.providers[0].state.tone, 'good')
   assert.match(status.providers[0].state.label, /12ms/)
   assert.equal(status.revision, 7)
@@ -400,7 +404,10 @@ await ok('探测没回模型清单（live 未知）时保持绿：不知道 ≠ 
   })
   const row = status.providers[0]
   assert.equal(row.state.tone, 'good')
-  assert.match(row.state.label, /^在线 · 10ms$/)
+  // 仍然是绿灯（端口确实通），但必须说清「没核对」—— 否则和「核对过、全都在」
+  // 长得一模一样，用户会以为已经对过账了。
+  assert.match(row.state.label, /^在线 · 10ms/)
+  assert.match(row.state.label, /没核对/)
   assert.deepEqual(row.missingModels, [])
 })
 
@@ -700,19 +707,29 @@ await ok('认出同端点的通用 provider', () => {
   assert.equal(found?.id, 'local-ollama')
 })
 
-await ok('不把用户自己起名的条目当复用目标', () => {
+await ok('同端点有多条时优先通用名那条', () => {
   // `local-ollama-qwen3-14b` 是用户有意分开配的（可能调过 ctx / compat），
-  // 往里塞新模型会让人意外。
+  // 通用名那条存在时不该往它里面塞。
   const found = findReusableProvider(existing, 'http://127.0.0.1:11434', 'ollama')
   assert.notEqual(found?.id, 'local-ollama-qwen3-14b')
-  const onlyNamed = findReusableProvider([existing[1]], 'http://127.0.0.1:11434', 'ollama')
-  assert.equal(onlyNamed, undefined)
 })
 
-await ok('不同端口/不同后端就是不重用', () => {
+await ok('同端点只有一条（哪怕是自定义名）就复用它', () => {
+  // 这条规则是「导入两次长出两条 provider」的解药：判据从「id 等于 genericProviderId」
+  // 改成「baseURL 相同」。同一个端点再新建一条永远比往里追加模型更糟 ——
+  // 面板上会多出一整条 provider、模型选择器里同一个后端出现两遍。
+  // 追加只动 models 数组，不碰用户调过的 contextWindow / compat。
+  const onlyNamed = findReusableProvider([existing[1]], 'http://127.0.0.1:11434', 'ollama')
+  assert.equal(onlyNamed?.id, 'local-ollama-qwen3-14b')
+})
+
+await ok('不同端点就是不重用', () => {
   assert.equal(findReusableProvider(existing, 'http://127.0.0.1:8090', 'llamacpp'), undefined)
-  // 端点对但后端名对不上（比如用户在 11434 上跑的不是 ollama）→ 也不猜
-  assert.equal(findReusableProvider(existing, 'http://127.0.0.1:11434', 'vllm'), undefined)
+  // backend 只是「按端口猜后端名」的提示，用来挑通用名那条；判据本身是 baseURL。
+  // 同一个 URL 只可能是同一个服务 —— 端口对得上名字对不上，也是同一条，
+  // 这时候宁可复用（否则又长出一条同地址的 provider），不要凭空新建。
+  const sameUrl = findReusableProvider(existing, 'http://127.0.0.1:11434', 'vllm')
+  assert.equal(sameUrl?.id, 'local-ollama')
 })
 
 await ok('localhost 与 127.0.0.1 算同一个后端', () => {
@@ -825,12 +842,27 @@ await ok('后端一个模型都没有：拒绝，不给空 models', () => {
   assert.equal(plan.models, undefined)
 })
 
-await ok('探测回来没有上下文长度：退回兜底，不写 0', () => {
-  // contextWindow: 0 在 llm-pi-ai 里等于「窗口是 0」，请求全会被截断 —— 宁可保守也不能写 0。
-  const plan = planAlign({ declared: [], live: [{ id: 'x' }], fallbackMaxTokens: 8192 })
+await ok('探测回来没有上下文长度：不写 contextWindow，也不拿 maxTokens 顶', () => {
+  // contextWindow: 0 在 llm-pi-ai 里等于「窗口是 0」，请求全会被截断 —— 宁可缺字段也不能写 0。
+  // 而且 fallbackMaxTokens 是**输出预算**，跟上下文窗口是两个量纲：
+  // 拿 8192 当 contextWindow 会把一个 40K 窗口的模型写小五倍。
+  const plan = planAlign({ declared: [{ id: 'x' }], live: [{ id: 'x' }], fallbackMaxTokens: 8192 })
   assert.equal(plan.ok, true)
-  assert.equal(plan.models[0].contextWindow, 8192)
-  assert.equal(plan.models[0].maxTokens, 8192)
+  // 活着的条目原样保留：用户自己配的 maxTokens 不会被探测值改写，缺的也不补。
+  assert.deepEqual(plan.models, [{ id: 'x' }])
+  assert.equal('contextWindow' in plan.models[0], false)
+})
+
+await ok('新补进来的模型没有上下文信息时只写 maxTokens', () => {
+  const plan = planAlign({ declared: [{ id: 'a' }], live: [{ id: 'a' }, { id: 'b' }], fallbackMaxTokens: 4096 })
+  assert.equal(plan.ok, true)
+  assert.deepEqual(plan.added, ['b'])
+  const added = plan.models.find((model) => model.id === 'b')
+  assert.equal(added.maxTokens, 4096)
+  assert.equal('contextWindow' in added, false)
+  // 探测真给了就照写
+  const withCtx = planAlign({ declared: [{ id: 'a' }], live: [{ id: 'a' }, { id: 'c', contextWindow: 32768 }] })
+  assert.equal(withCtx.models.find((model) => model.id === 'c').contextWindow, 32768)
 })
 
 console.log('import: 对账（planReconcile，只做减法）')
