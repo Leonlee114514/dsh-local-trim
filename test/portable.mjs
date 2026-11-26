@@ -81,6 +81,49 @@ await ok('joinPath：丢空段、去首尾斜杠、不给 undefined', async () =
   assert.equal(joinPath(process.env.__NOPE_NOT_SET__, 'models'), 'models')
 })
 
+// [L5-2026-11-26] `..` 不能把根弹掉。原来没有「根」的概念，'..' 一律 pop，
+// 于是 joinPath('C:/models', '..', '..') 把 models 和 C: 各弹一次 → 返回 ''，
+// 一个绝对路径被归一成了空串（Windows 上 '' 表示当前目录，任何 subsequent
+// readFileSync 都会去错地方）。POSIX 侧同理：'/a' + '..' 原来也会退成 ''。
+await ok('joinPath：.. 到根就停，绝对路径不会被归一成空串', async () => {
+  // POSIX 根
+  assert.equal(joinPath('/a/b', '..'), '/a')
+  assert.equal(joinPath('/a', '..'), '/')
+  assert.equal(joinPath('/a', '..', '..'), '/')
+  assert.equal(joinPath('/a', '..', '..', '..'), '/')
+  // 相对路径没有根，.. 退到空就停（保持原行为，不许出 '..'）
+  assert.equal(joinPath('a', '..'), '')
+  assert.equal(joinPath('a', '..', '..'), '')
+  // Windows 盘符根：C: 是根，退到头补一个斜杠（'C:' 单独在 Windows 上指「C 盘当前目录」）
+  assert.equal(joinPath('C:/models', '..'), 'C:/')
+  assert.equal(joinPath('C:/models', '..', '..'), 'C:/')
+  assert.equal(joinPath('C:/models/llama', '..', '..'), 'C:/')
+  // 只有第一段算盘符：a/C:/b 里的 C: 只是名字带冒号的目录，照旧可弹
+  assert.equal(joinPath('a/C:/b', '..'), 'a/C:')
+  // 正常下降不受影响
+  assert.equal(joinPath('C:/models', 'qwen', '..', 'llama.gguf'), 'C:/models/llama.gguf')
+})
+
+// [L5b-2026-11-26] UNC 路径（\\NAS\share\models，toSlash 之后是 //NAS/share/models）的
+// 前两段是「服务器 / 共享名」，它们才是根。原来只留一个前导斜杠，// 被压成
+// /NAS/share/models —— 变成当前盘根下的路径，扫描结果就是「一个模型都没有」且不报错；
+// 而 README 里给的用法正是「用环境变量指自己放 gguf 的目录」（网络盘很常见）。
+await ok('joinPath：UNC 路径保留 \\\\server\\share 根，.. 不越过共享名', async () => {
+  const bs = String.fromCharCode(92)
+  // 双斜杠与 Windows 反斜杠两种写法归一后是同一个路径
+  assert.equal(joinPath('//NAS/models', 'files'), '//NAS/models/files')
+  assert.equal(joinPath(bs + bs + 'NAS' + bs + 'models', 'files'), '//NAS/models/files')
+  // 共享名是根：.. 只能退到 //NAS/share
+  assert.equal(joinPath('//NAS/share/models', '..', 'files'), '//NAS/share/files')
+  assert.equal(joinPath('//NAS/share/models', '..', '..'), '//NAS/share')
+  assert.equal(joinPath('//NAS/share/models', '..', '..', '..'), '//NAS/share')
+  assert.equal(joinPath('//NAS/share', '..'), '//NAS/share')
+  // 根本身不再往下退，也不会被当成普通目录名弹掉
+  assert.equal(joinPath('//NAS/share'), '//NAS/share')
+  // 正常下降不受影响
+  assert.equal(joinPath('//NAS/share', 'models', 'qwen.gguf'), '//NAS/share/models/qwen.gguf')
+})
+
 await ok('exeName：Windows 补 .exe，其它平台不补', async () => {
   const name = exeName('llama-server')
   if (process.platform === 'win32') assert.equal(name, 'llama-server.exe')

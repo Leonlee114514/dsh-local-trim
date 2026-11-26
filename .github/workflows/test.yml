@@ -63,6 +63,16 @@ jobs:
         run: node test/client-host.mjs
       - name: Control panel bridge routes (apply + fake settings/backend)
         run: node test/panel-host.mjs
+      # 下面三套以前不在 CI 里，等于没有回归网：
+      # bridge.mjs 钉串行/节流/错误语义（并发性质只有直接打 handler 才测得到）；
+      # client.mjs 钉渲染期作用域错误 —— v0.4.8 就是这么漏出去的（面板整块消失）；
+      # legacy.mjs 钉旧默认值迁移，改默认值的提交最容易悄悄改坏它。
+      - name: Bridge concurrency, throttling and error semantics
+        run: node test/bridge.mjs
+      - name: Client panel render and action gating
+        run: node test/client.mjs
+      - name: Legacy default detection and migration
+        run: node test/legacy.mjs
       - name: One-click backend launch (plan + wait, no real spawn)
         run: node test/launcher.mjs
       - name: Cross-platform paths, GPU detection, --help capability probing
@@ -133,3 +143,9 @@ jobs:
         run: node test/launcher.mjs
       - name: Control panel bridge routes
         run: node test/panel-host.mjs
+      # 这两套在真机平台上跑才有意义：launcher 的 stopProcess 走真 taskkill（Windows）
+      # 或真 SIGTERM（macOS），client.mjs 走真的 window 全局替身。
+      - name: Bridge concurrency, throttling and error semantics
+        run: node test/bridge.mjs
+      - name: Client panel render and action gating
+        run: node test/client.mjs

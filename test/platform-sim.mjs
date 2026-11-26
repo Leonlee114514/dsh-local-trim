@@ -29,6 +29,21 @@ if (target === 'win32') {
 const m = await import('../lib/launcher.js')
 
 const bad = []
+
+// ── 先验「模拟本身有没有生效」 ──────────────────────────────────────────────
+// 这一套的全部结论都建立在「launcher.js 里的 WIN 常量按目标平台展开」之上。
+// 如果 defineProperty 没生效（Node 改行为、--import 顺序变了、被别的 loader 覆盖），
+// 后面的候选表断言会全部按**本机**平台通过 —— 一片绿，什么也没验证。
+// exeName() 直接读那个常量，是这里唯一可靠的探针。
+if (process.platform !== target) {
+  bad.push('模拟没生效：process.platform 应该是 ' + target + '，实际 ' + process.platform)
+}
+const exeProbe = m.exeName('probe')
+const exeWant = target === 'win32' ? 'probe.exe' : 'probe'
+if (exeProbe !== exeWant) {
+  bad.push('模拟没生效：exeName(probe) 应该是 ' + exeWant + '，实际 ' + exeProbe)
+  show('exeName', exeProbe)
+}
 function show(label, value) {
   console.log(LF + '[' + label + '] ' + value)
 }

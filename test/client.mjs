@@ -18,6 +18,25 @@ import { readFileSync } from 'node:fs'
 
 const SOURCE = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 
+// ── 定时器台账 ─────────────────────────────────────────────────────────────
+// client.js 的每一次 call() 都挂一个「重活 10 分钟超时」的 setTimeout。用例里
+// options.pending 故意让某条请求永不返回，那个定时器就一直活着 —— 断言早就跑完，
+// 进程要等满十分钟才退（第一版实测就是这么挂住的）。
+// 把 setTimeout 记一笔，收摊时统一清掉。全局只包一次：多个 mount 之间重复包会套娃。
+const timers = new Map()   // 定时器 id → 发起它的 mount 实例（null = 还没人认领）
+const realSetTimeout = globalThis.setTimeout
+const realClearTimeout = globalThis.clearTimeout
+let timerOwner = null      // 最近一次 mount 的实例；用例是顺序 await 的，同一时刻只有一个在跑
+globalThis.setTimeout = (fn, ms, ...rest) => {
+  const id = realSetTimeout(fn, ms, ...rest)
+  timers.set(id, timerOwner)
+  return id
+}
+globalThis.clearTimeout = (id) => {
+  timers.delete(id)
+  return realClearTimeout(id)
+}
+
 const SUBJECT = {
   kind: 'bundle',
   pkg: {
@@ -118,6 +137,8 @@ function mount(options) {
   const updates = []
   const calls = []
   let current = null
+  const owned = new Set()   // 认领定时器用：mount 之后 call() 里挂的超时都算这一个实例的
+  timerOwner = owned
 
   const bagOf = (type) => {
     let bag = bags.get(type)
@@ -161,9 +182,11 @@ function mount(options) {
   }
 
   // ── 假 fetch ───────────────────────────────────────────────────────────
+  // options.pending 里列出的路由永不 settle：用来模拟「这条动作还在跑」。
   globalThis.fetch = async (url) => {
     const name = String(url).replace(/^.*\/api\/dsh-local-trim\//, '')
     calls.push(name)
+    if (options.pending?.includes(name)) return await new Promise(() => {})
     const body = options.bodies[name]
     if (body === undefined) return { ok: true, status: 200, json: async () => ({ ok: true }) }
     if (body instanceof Error) throw body
@@ -194,6 +217,8 @@ function mount(options) {
   // ── 递归渲染 ───────────────────────────────────────────────────────────
   const texts = []
   const buttons = []
+  // 输入框也收：草稿是否被重载冲掉，只能从「输入框里还是不是我改的那个值」看出来。
+  const fields = []
   const visited = new Set()
 
   const walk = (node) => {
@@ -219,6 +244,7 @@ function mount(options) {
     }
     if (typeof type === 'string') {
       if (type === 'button' && typeof props.onClick === 'function') buttons.push(props)
+      if (type === 'input' || type === 'textarea') fields.push(props)
       if (props.children !== undefined) walk(props.children)
     }
   }
@@ -231,6 +257,7 @@ function mount(options) {
     }
     texts.length = 0
     buttons.length = 0
+    fields.length = 0
     visited.clear()
     walk(element(Panel, options.props ?? { subject: SUBJECT }))
     return texts.join(' ')
@@ -243,7 +270,17 @@ function mount(options) {
     for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0))
   }
 
-  return { commit, flushEffects, calls, buttons, texts }
+  /** 收摊：清掉本实例留下的定时器（pending 那条的超时计时器就是它）。 */
+  const dispose = () => {
+    for (const [id, owner] of timers) {
+      if (owner !== owned && owner !== null) continue
+      realClearTimeout(id)
+      timers.delete(id)
+    }
+    timerOwner = null
+  }
+
+  return { commit, flushEffects, calls, buttons, fields, texts, dispose }
 }
 
 let passed = 0
@@ -342,6 +379,150 @@ await ok('只扫到 Ollama 模型时，端口跟到 11434 并按 tag 取名', as
   const text = panel.commit()
   assert.match(text, /模型名取 tag/)
   assert.match(text, /11434/)
+})
+
+// ── C1：忙锁按域隔离 ──────────────────────────────────────────────────────
+// 老版本是一个全局 busy 字符串，所有按钮都 `disabled: busy !== ''`：拉起一个后端要
+// 十几秒，这十几秒里连「看日志」「刷新」都点不动，用户只能干等。
+
+const STATUS_LAUNCHED = {
+  ...STATUS,
+  status: { ...STATUS.status, launched: [{ port: 11434, label: 'ollama serve', pid: 4242 }] },
+}
+
+const buttonByText = (panel, text) =>
+  panel.buttons.find((props) => String(props.children) === text)
+
+await ok('一个动作在跑时，只有同域的按钮灰掉，别的域照旧能点', async () => {
+  const panel = mount({ bodies: { status: STATUS_LAUNCHED }, pending: ['launch'] })
+  panel.commit()
+  await panel.flushEffects()
+  panel.commit()
+
+  const launch = buttonByText(panel, '拉起')
+  assert.ok(launch !== undefined, '没找到「拉起」按钮')
+  assert.notEqual(launch.disabled, true)
+
+  // 不 await：pending 里的路由永不返回，await 会把测试挂死。
+  void launch.onClick()
+  panel.commit()
+
+  // 进程域：拉起自己也灰了（文案换成进行中），同一个域里的停止也灰
+  const launching = buttonByText(panel, '拉起中…')
+  assert.ok(launching !== undefined, '拉起之后按钮没进入「拉起中…」')
+  assert.equal(launching.disabled, true)
+  const stop = buttonByText(panel, '停止')
+  assert.ok(stop !== undefined, '没找到「停止」按钮（status.launched 没生效？）')
+  assert.equal(stop.disabled, true, '同一域里的停止应该灰掉：两个动作会抢同一个 pid')
+
+  // 别的域：试跑（provider:xxx）、刷新（config）都该还能点
+  const test = buttonByText(panel, '试跑')
+  assert.ok(test !== undefined, '没找到「试跑」按钮')
+  assert.notEqual(test.disabled, true, '试跑跟拉起不是同一份资源，不该被连坐')
+  const reload = buttonByText(panel, '刷新')
+  assert.ok(reload !== undefined, '没找到「刷新」按钮')
+  assert.notEqual(reload.disabled, true, '刷新只是重读配置，任何动作在跑都该能用')
+
+  panel.dispose()   // 扔掉那条永不返回的请求留下的超时定时器
+})
+
+await ok('看日志永远不被挡住（它是纯读，不该进任何一把锁）', async () => {
+  const panel = mount({ bodies: { status: STATUS_LAUNCHED }, pending: ['launch'] })
+  panel.commit()
+  await panel.flushEffects()
+  panel.commit()
+  void buttonByText(panel, '拉起').onClick()
+  panel.commit()
+
+  const log = buttonByText(panel, '看日志')
+  assert.ok(log !== undefined, '没找到「看日志」按钮')
+  assert.notEqual(log.disabled, true, '拉起后端在跑时也应该能看日志 —— 不然卡住时没处查')
+  await log.onClick()
+  assert.ok(panel.calls.includes('log'))
+  panel.dispose()
+})
+
+// ── C2：一键配置成功后不冲掉草稿 ──────────────────────────────────────────
+// 老版本 `if (result.ok === true) await load()`：配置区里正改到一半的东西会被服务端
+// 的旧值整体覆盖回去，用户只看到自己刚填的字段变回原样。
+
+/** 扫一遍模型，让 adopt 表单拿到 modelPath（否则按钮是灰的）。 */
+const scanForAdopt = async (panel) => {
+  panel.commit()
+  await panel.flushEffects()
+  panel.commit()
+  await buttonByText(panel, '扫描本机模型').onClick()
+  panel.commit()
+}
+
+/** 「一键拉起命令」那个输入框 —— 草稿有没有被覆盖，看它的 value。 */
+const launchCommandField = (panel) =>
+  panel.fields.find((props) => props.placeholder === '留空 = 自动找')
+
+await ok('草稿有改动时，一键配置成功也不覆盖它，并说明原因', async () => {
+  const panel = mount({ bodies: { status: STATUS, models: SCAN, adopt: { ok: true } } })
+  await scanForAdopt(panel)
+
+  const field = launchCommandField(panel)
+  assert.ok(field !== undefined, '没找到「一键拉起命令」输入框')
+  field.onChange({ target: { value: 'ollama serve --numa' } })
+  panel.commit()
+  assert.equal(launchCommandField(panel).value, 'ollama serve --numa')
+
+  await buttonByText(panel, '一键配置并试跑').onClick()
+  const text = panel.commit()
+
+  assert.equal(launchCommandField(panel).value, 'ollama serve --numa', '草稿被服务端旧值冲掉了')
+  assert.match(text, /没敢覆盖你的草稿/)
+})
+
+await ok('草稿没有改动时，一键配置成功照常重载（revision 要跟上）', async () => {
+  const panel = mount({ bodies: { status: STATUS, models: SCAN, adopt: { ok: true } } })
+  await scanForAdopt(panel)
+  const statusBefore = panel.calls.filter((name) => name === 'status').length
+
+  await buttonByText(panel, '一键配置并试跑').onClick()
+  const text = panel.commit()
+
+  const statusAfter = panel.calls.filter((name) => name === 'status').length
+  assert.equal(statusAfter, statusBefore + 1, '干净草稿该重载一次，否则保存时的 revision 是旧的')
+  assert.doesNotMatch(text, /没敢覆盖你的草稿/)
+})
+
+// ── C5：只读配置下不让改 ──────────────────────────────────────────────────
+// 宿主没把本插件登记成可写条目时（state.writable === false），老版本只在顶上挂一句
+// 提示，输入框照旧能改：改满一屏、点保存才吃到一条错误，改的东西全丢。
+
+await ok('只读态下输入框和保存按钮全是灰的（改不动就不会白改）', async () => {
+  const panel = mount({ bodies: { status: { ...STATUS, writable: false }, models: SCAN } })
+  await scanForAdopt(panel)
+
+  const text = panel.commit()
+  assert.match(text, /设置只读/)
+  assert.match(text, /只能看不能改/)
+
+  assert.ok(panel.fields.length > 0, '只读态下一个输入框都没渲染出来')
+  const editable = panel.fields.filter((props) => props.disabled !== true)
+  assert.equal(editable.length, 0, '只读态下还有 ' + editable.length + ' 个输入框能改')
+
+  const save = buttonByText(panel, '保存')
+  assert.ok(save !== undefined, '没找到「保存」按钮')
+  assert.equal(save.disabled, true, '只读态下「保存」应该直接灰掉')
+
+  const writes = panel.buttons.filter((props) => /一键配置|装不下/.test(String(props.children)))
+  assert.ok(writes.length > 0, '没找到「一键配置并试跑」按钮')
+  for (const props of writes) {
+    assert.equal(props.disabled, true, '只读态下「' + String(props.children) + '」应该灰掉')
+  }
+})
+
+await ok('可写态下这些控件照旧能改（只读压得太狠也是 bug）', async () => {
+  const panel = mount({ bodies: { status: STATUS, models: SCAN } })
+  await scanForAdopt(panel)
+
+  const disabled = panel.fields.filter((props) => props.disabled === true)
+  assert.equal(disabled.length, 0, '可写态下有 ' + disabled.length + ' 个输入框被误灰')
+  assert.notEqual(buttonByText(panel, '保存').disabled, true, '可写态下「保存」不该灰')
 })
 
 console.log('\n' + passed + ' 项通过')

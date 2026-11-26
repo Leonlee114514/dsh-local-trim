@@ -8,6 +8,7 @@
 import assert from 'node:assert/strict'
 
 import {
+  DEFAULT_KV_CACHE_TYPE,
   KNOWN_LAUNCHERS,
   LOAD_MODES,
   checkModelFit,
@@ -238,6 +239,46 @@ await ok('spawn 异步 error 事件被抓到（不再打死宿主）', async () 
   assert.match(result.error, /ENOENT/)
 })
 
+// [L3-2026-11-26] .cmd / .bat 只能经 cmd.exe 启动，而 cmd.exe 起得来不代表脚本跑得起来。
+// 这两条守的是「别把 cmd.exe 的 pid 当成后端起来了」。
+await ok('shell 模式下脚本不存在就不启动（不再报假 pid）', async () => {
+  let spawned = 0
+  const result = await runDetached({
+    command: 'C:/tools/llama-server.cmd',
+    args: ['--port', '8080'],
+    platform: 'win32',
+    exists: () => false,
+    spawnImpl: () => {
+      spawned += 1
+      return { pid: 40424, unref() {} }
+    },
+  })
+  assert.equal(result.ok, false, '脚本不存在还报成功，面板就会显示一个连不上的后端')
+  assert.match(result.error, /不存在/)
+  assert.equal(spawned, 0, '压根不该 spawn，cmd.exe 会起得来然后立刻退出')
+})
+
+await ok('shell 模式下 cmd.exe 起来了也不算成功', async () => {
+  // 脚本存在，但 spawn 只给了 cmd.exe 的 pid、没有任何事件 —— 旧代码在 setImmediate
+  // 里看到 pid > 0 就 return ok:true，用户拿到的 pid 是 cmd.exe 的，脚本本身早退了。
+  // 兜底计时器是 unref 的（不能让插件因为等它而活着），所以测试里得自己撑住事件循环，
+  // 否则进程在计时器跑之前就退了，await 永远不落定。
+  const keepAlive = setTimeout(() => {}, 3_000)
+  try {
+    const result = await runDetached({
+      command: 'C:/tools/llama-server.cmd',
+      args: ['--port', '8080'],
+      platform: 'win32',
+      exists: () => true,
+      spawnImpl: () => ({ pid: 40424, unref() {} }),
+    })
+    assert.equal(result.ok, false)
+    assert.match(result.error, /2000ms|没 ready/)
+  } finally {
+    clearTimeout(keepAlive)
+  }
+})
+
 await ok('waitForEndpoint 等到应答就返回耗时', async () => {
   let clock = 0
   let calls = 0
@@ -326,6 +367,39 @@ await ok('确实没有模型文件时才回「不替你猜」', async () => {
   })
   assert.equal(plan.ok, false)
   assert.match(plan.error, /需要模型文件/)
+})
+
+// [L8-2026-11-26] build 目录里同时躺着 b9999 和 b11012 时必须挑新的那个。
+// 原来是无比较器的 sort()（按 UTF-16 码位），'b9999' > 'b11012' —— 用户升级了
+// 二进制，插件却还在用旧的起服务，版本越新越选不中，且完全不报错。
+await ok('WorkBuddy 有多个 build 时按数值挑最新，不是按字典序', async () => {
+  const root = workbuddyRoot()
+  const newer = root + '/bin/b11012/' + exeName('llama-server')
+  const older = root + '/bin/b9999/' + exeName('llama-server')
+  const plan = planLaunch({
+    port: 8090,
+    listDir: (dir) => {
+      if (dir === root + '/bin') return ['b9999', 'b11012']
+      if (dir === root + '/files') return ['local_model.gguf']
+      return []
+    },
+    // 两个 build 的二进制都在，只有「挑哪个」能决定结果
+    existsSync: (p) => p === newer || p === older,
+  })
+  assert.equal(plan.ok, true)
+  assert.equal(plan.command, newer)
+  // 顺带把反方向也钉住：只留旧的就得挑旧的，不能因为「没有新的」就报找不到
+  const onlyOld = planLaunch({
+    port: 8090,
+    listDir: (dir) => {
+      if (dir === root + '/bin') return ['b9999']
+      if (dir === root + '/files') return ['local_model.gguf']
+      return []
+    },
+    existsSync: (p) => p === older,
+  })
+  assert.equal(onlyOld.ok, true)
+  assert.equal(onlyOld.command, older)
 })
 
 await ok('扫本机 gguf：跳过 mmproj、按大小降序', async () => {
@@ -509,6 +583,43 @@ await ok('KV cache：维度齐才算，缺一个就回 0（不瞎猜）', async 
   assert.equal(estimateKvBytes({}), 0)
 })
 
+// [D1-2026-11-26] 预检必须按「实际下发的 KV 类型」算，不能一律按 f16。
+// 这台机器的 35B：64 层 / hidden 5120 / 40 Q 头 / 8 KV 头 / 65536 上下文。
+// 按 f16 是 16384 MiB，按 q8_0 是 8704 MiB —— 差 1.88×，足够把一个装得下的模型
+// 拦在「确认要起」前面。
+await ok('KV cache：给了 cacheTypeK/V 就按它算，不再一律按 f16 高估', async () => {
+  const shape = { blockCount: 64, embeddingLength: 5120, headCount: 40, headCountKv: 8, contextTokens: 65536 }
+  const f16 = estimateKvBytes(shape)
+  assert.equal(f16, 17179869184)
+  const q8 = estimateKvBytes({ ...shape, cacheTypeK: 'q8_0', cacheTypeV: 'q8_0' })
+  assert.equal(q8, 9126805504)
+  assert.ok(q8 < f16, 'q8_0 必须比 f16 小')
+  // 乱填的类型不认，退回 f16 —— 宁可高估也不猜。
+  assert.equal(estimateKvBytes({ ...shape, cacheTypeK: 'q3_k', cacheTypeV: 'q3_k' }), f16)
+})
+
+await ok('KV cache：只给一侧类型时，另一侧按 f16 补，不跟着一起压缩', async () => {
+  // 引擎默认 V 是 f16；K 给了 q8_0 却把 V 也当 q8_0 算，就是低估 ——
+  // 低估会让用户以为装得下，起的时候才 OOM。
+  const shape = { blockCount: 1, embeddingLength: 32, headCount: 1, headCountKv: 1, contextTokens: 1024 }
+  const onlyK = estimateKvBytes({ ...shape, cacheTypeK: 'q8_0' })
+  const f16 = estimateKvBytes(shape)
+  assert.ok(onlyK > f16 * 0.5, '不能把没见过的那侧也按 q8_0 算：' + onlyK)
+  assert.ok(onlyK < f16, 'K 侧压了就得比全 f16 小：' + onlyK)
+  // (34/32 + 2) / 2 = 1.53125 字节/元素
+  assert.equal(onlyK, Math.round((f16 / 2) * ((34 / 32 + 2) / 2)))
+})
+
+await ok('默认 KV 类型常量与实际下发的参数同源', async () => {
+  // D1 的根：值只活在 llamaCppAutoArgs 里，面板预检拿不到。现在两处引用同一个常量。
+  const plan = llamaCppAutoArgs({ modelPath: 'C:/m/a.gguf', exists: () => true, caps: new Set(['--fit', '--cache-type-k']) })
+  assert.equal(plan.ok, true, plan.error)
+  assert.equal(plan.cacheType, DEFAULT_KV_CACHE_TYPE)
+  const at = plan.args.indexOf('--cache-type-k')
+  assert.ok(at >= 0, '现代引擎要下发 --cache-type-k')
+  assert.equal(plan.args[at + 1], DEFAULT_KV_CACHE_TYPE)
+})
+
 await ok('KV cache 计入预检：同一份权重，加上 KV 就从 ok 变 warn', async () => {
   const base = { sizeBytes: 8 * GIB, totalMemBytes: 16 * GIB, freeMemBytes: 12 * GIB, gpuBytes: 0 }
   const plain = checkModelFit(base)
@@ -667,6 +778,232 @@ await ok('stopProcess：杀完还活着就报失败，不谎报成功', async ()
   })
   assert.equal(result.ok, false)
   assert.match(result.error, /还在/)
+})
+
+// [L1-2026-11-26] Windows 的 taskkill 分支以前一条测试都没有 —— 它只在真 Windows 上
+// 跑，而 CI 是 Linux，于是「不带 /F 必然失败 + 失败就 return」这个 P0 组合一路活到发版。
+// 这里用注入的 platform + execFileImpl 把整条路径搬到进程内。
+
+// 造一个假的 taskkill：按调用次序返回预设的 (code, stdout, stderr)，并记录参数。
+const fakeTaskkill = (steps, onCall) => {
+  const calls = []
+  const exec = (file, args, options, callback) => {
+    calls.push({ file, args: [...args] })
+    const step = steps[calls.length - 1] ?? {}
+    if (typeof onCall === 'function') onCall(calls.length, args)
+    // execFile 的回调约定：成功时 error 是 null（退出码 0 不算 error）。
+    if (step.code === undefined || step.code === null || step.code === 0) {
+      setImmediate(() => callback(null, step.stdout ?? '', step.stderr ?? ''))
+      return
+    }
+    const error = new Error(step.message ?? 'taskkill failed')
+    error.code = step.code
+    setImmediate(() => callback(error, step.stdout ?? '', step.stderr ?? ''))
+  }
+  return { calls, exec }
+}
+
+// taskkill 的输出走系统代码页（中文 Windows 是 GBK），Node 按 UTF-8 解码后全是 U+FFFD。
+// 用真实的乱码样本，别用编的中文，否则测不出「文本不可信」这条分支。
+const GBK_GARBLED = '\uFFFD\uFFFD\uFFFD\uFFFD PID 4242 \uFFFD\uFFFD\uFFFD\uFFFD\uFFFD\uFFFD'
+
+await ok('stopProcess（Windows）：taskkill 一律带 /F，第一刀失败也要补 SIGKILL', async () => {
+  let aliveFlag = true
+  const taskkill = fakeTaskkill(
+    // 第 1 刀：真机上不带 /F 就是这个结果（exit 255 + 乱码）；这里连 /F 都失败一次，
+    // 用来确认「失败不等于结束」。
+    [{ code: 255, stderr: GBK_GARBLED }, { code: 0, stdout: 'SUCCESS' }],
+    (round, args) => {
+      if (args.includes('/F') && round === 2) aliveFlag = false
+    },
+  )
+  const result = await stopProcess({
+    pid: 4242,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    alive: () => aliveFlag,
+    sleep: noSleep,
+    waitMs: 150,
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(result.signal, 'SIGKILL')
+  assert.equal(taskkill.calls.length, 2, '第一刀失败后必须继续补第二刀')
+  for (const call of taskkill.calls) {
+    assert.equal(call.file, 'taskkill')
+    assert.ok(call.args.includes('/F'), '每一刀都要带 /F：不带 /F 的 taskkill 杀不掉 console 子进程')
+    assert.ok(call.args.includes('/T'), '要连进程树一起杀')
+  }
+})
+
+await ok('stopProcess（Windows）：taskkill 退出码 128 当「进程已经没了」', async () => {
+  // 128 = 没有找到进程（本机 win-arm64 实测）。原来只靠 /没有找到/ 匹配 stderr，
+  // 而中文 Windows 的 stderr 全是 U+FFFD，这条永远不命中 → 已消失被当成失败。
+  const taskkill = fakeTaskkill([{ code: 128, stderr: GBK_GARBLED }])
+  const result = await stopProcess({
+    pid: 4243,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    alive: () => false,
+    sleep: noSleep,
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(result.already, true)
+})
+
+await ok('stopProcess（Windows）：taskkill 真失败时报退出码，不把乱码原文丢给用户', async () => {
+  const taskkill = fakeTaskkill([{ code: 255, stderr: GBK_GARBLED }, { code: 255, stderr: GBK_GARBLED }])
+  const result = await stopProcess({
+    pid: 4244,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    alive: () => true,
+    sleep: noSleep,
+    waitMs: 150,
+  })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /SIGKILL 失败/)
+  assert.match(result.error, /255/)
+  assert.match(result.error, /SIGTERM 阶段也失败过/, '终态要把第一刀的原因一并报出来')
+  assert.doesNotMatch(result.error, /\uFFFD/, '别把 U+FFFD 乱码直接甩给用户')
+})
+
+// [L12-2026-11-26] Windows 上原来一律跳过 pid 复用核对（只认注入的 readCommand），
+// 于是 pid 被复用一个完全不相干的进程时，taskkill /T 会把别人的整棵进程树杀掉。
+// 现在改成读 tasklist 的映像名，只认「像不像同一个可执行文件」。
+const fakeTasklist = (stdout) => {
+  const calls = []
+  const exec = (file, args) => {
+    calls.push({ file, args: [...args] })
+    return stdout
+  }
+  return { calls, exec }
+}
+
+await ok('stopProcess（Windows）：读不到映像名时不做 pid 复用核对', async () => {
+  // 非管理员 / tasklist 被裁掉 / 进程刚消失 —— 读不到就当「不知道」，核对跳过；
+  // 这里确认跳过不等于报错，也不等于乱杀。
+  let aliveFlag = true
+  const taskkill = fakeTaskkill([{ code: 0 }], () => {
+    aliveFlag = false
+  })
+  const tasklist = fakeTasklist('INFO: No tasks are running which match the specified criteria.')
+  const result = await stopProcess({
+    pid: 4245,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    execFileSync: tasklist.exec,
+    expectedCommand: 'llama-server',
+    alive: () => aliveFlag,
+    sleep: noSleep,
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(taskkill.calls.length, 1)
+  assert.equal(tasklist.calls.length, 1, '应该去问了一次 tasklist')
+  assert.deepEqual(tasklist.calls[0].args, ['/FI', 'PID eq 4245', '/FO', 'CSV', '/NH'])
+})
+
+await ok('stopProcess（Windows）：pid 被复用了别的程序时，一个字节都不动它', async () => {
+  let killed = false
+  const taskkill = fakeTaskkill([{ code: 0 }], () => {
+    killed = true
+  })
+  const tasklist = fakeTasklist('"chrome.exe","9911","Console","1","300,000 K"')
+  const result = await stopProcess({
+    pid: 9911,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    execFileSync: tasklist.exec,
+    expectedCommand: 'C:/Users/Lyonl/.workbuddy/local-llm/bin/b11012/llama-server.exe',
+    alive: () => true,
+    sleep: noSleep,
+  })
+  assert.equal(result.ok, false, 'pid 上跑的是 chrome，不该当成自己的后端')
+  assert.equal(killed, false, '不能对别人的进程树发 taskkill')
+  assert.match(result.error, /chrome.exe/)
+  assert.match(result.error, /pid 被复用了/)
+})
+
+await ok('stopProcess（Windows）：映像名对得上就照常杀（带路径也认）', async () => {
+  let aliveFlag = true
+  const taskkill = fakeTaskkill([{ code: 0 }], () => {
+    aliveFlag = false
+  })
+  const tasklist = fakeTasklist('"llama-server.exe","4246","Console","1","12,000,000 K"')
+  const result = await stopProcess({
+    pid: 4246,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    execFileSync: tasklist.exec,
+    expectedCommand: 'C:/Users/Lyonl/.workbuddy/local-llm/bin/b11012/llama-server.exe',
+    alive: () => aliveFlag,
+    sleep: noSleep,
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(taskkill.calls.length, 1)
+})
+
+// [L12b-2026-11-26] .cmd / .bat 走的是 shell:true（runDetached 的 needsShell），真正被
+// spawn 的是 cmd.exe，pid 也是 cmd.exe 的。原来拿「pnpm.cmd」跟 tasklist 报的「cmd.exe」
+// 比必然不等 → 每次点「停止」都报「pid 被复用了，不动它」，后端根本杀不掉：
+// 第一轮的 P0（停不掉后端）会以另一种形式复活，而且只在 .cmd 用户身上出现。
+await ok('stopProcess（Windows）：.cmd 包装器起来的是 cmd.exe，仍然停得掉', async () => {
+  let aliveFlag = true
+  const taskkill = fakeTaskkill([{ code: 0 }], () => {
+    aliveFlag = false
+  })
+  const tasklist = fakeTasklist('"cmd.exe","4247","Console","1","12,000 K"')
+  const result = await stopProcess({
+    pid: 4247,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    execFileSync: tasklist.exec,
+    expectedCommand: 'C:/Program Files/nodejs/pnpm.cmd',
+    alive: () => aliveFlag,
+    sleep: noSleep,
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(taskkill.calls.length, 1, '.cmd 用户必须能停下自己的后端')
+})
+
+await ok('stopProcess（Windows）：.bat 包装器同理', async () => {
+  let aliveFlag = true
+  const taskkill = fakeTaskkill([{ code: 0 }], () => {
+    aliveFlag = false
+  })
+  const tasklist = fakeTasklist('"cmd.exe","4248","Console","1","12,000 K"')
+  const result = await stopProcess({
+    pid: 4248,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    execFileSync: tasklist.exec,
+    expectedCommand: 'D:/tools/start-llama.bat',
+    alive: () => aliveFlag,
+    sleep: noSleep,
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(taskkill.calls.length, 1)
+})
+
+await ok('stopProcess（Windows）：.cmd 放行不许放宽到 exe 期望值', async () => {
+  // 反向：期望 llama-server.exe、pid 上却是 cmd.exe —— 那可能是用户的 cmd 窗口，
+  // 不能因为「cmd.exe 也算包装器」就一律放行。
+  let killed = false
+  const taskkill = fakeTaskkill([{ code: 0 }], () => {
+    killed = true
+  })
+  const tasklist = fakeTasklist('"cmd.exe","4249","Console","1","12,000 K"')
+  const result = await stopProcess({
+    pid: 4249,
+    platform: 'win32',
+    execFileImpl: taskkill.exec,
+    execFileSync: tasklist.exec,
+    expectedCommand: 'C:/Users/Lyonl/.workbuddy/local-llm/bin/b11012/llama-server.exe',
+    alive: () => true,
+    sleep: noSleep,
+  })
+  assert.equal(result.ok, false, 'exe 期望值遇到 cmd.exe 必须继续拦')
+  assert.equal(killed, false)
+  assert.match(result.error, /pid 被复用了/)
 })
 
 await ok('isProcessAlive：EPERM 也算活着', async () => {

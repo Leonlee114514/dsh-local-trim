@@ -1,305 +1,194 @@
 # dsh-local-trim
 
-给本地小模型一套**轻量 harness**：让 llama.cpp / Ollama / vLLM / LM Studio 这类本地端点也能在
-[DeepSeek Harness](https://github.com/deepseek-ai) 里顺畅干活，而云端 provider 一个字节都不动。
+给本地小模型用的 DSH 裁剪插件。命中本地 provider 时收窄上下文，其余一律原样放行。
 
-**它做什么**：把工具面、系统提示词、工具 schema 三个面同时收窄，并把注入的整份系统提示词
-换成一页纸。本地模型工具调用能力实测未退化（`bash` / `glob` / `read` 两步串行都正确）。
+DSH 的默认设定是按云端大模型配的：几十个工具、上万字系统提示词。本地模型的窗口通常只有 16K–64K，装不下就报 `CONTEXT_WINDOW_EXCEEDED`。而 DSH 没有「按模型裁工具」的开关 —— `dsh-tools` 的 Config 只有 `mode` / `maxParallel`，agent preset 只能声明插件，唯一的原语 `tools.restrict({ allow })` 也只影响当前 agent 及其子 agent。
 
-> 这里不给具体的请求体数值。绝对值由你自己的 harness 决定 —— 装了多少插件、注册了多少工具、
-> 系统提示词有哪几段，每个人的基线不同，裁剪空间也就不同。想知道自己省了多少，
-> 用文末「验证裁剪真的生效了」那段，在装与不装之间各抓一次请求来对比。
+这个插件补的就是这一层：
 
----
+| 面 | 做什么 | 实现 |
+|---|---|---|
+| 工具面 | 只留白名单里的工具（默认 15 个核心工具） | `tools.restrict({ allow })`，allow = 实际可见名 ∩ 白名单 |
+| 提示词面 | 丢掉本地用不上的段落（goal / ralph / mindmap / 图像生成 …） | `system-prompt/assemble` 按段名过滤 `sections` / `contexts` |
+| 注入面 | 整份系统提示词换成一页纸 | 替换注入段正文，保留头 80 / 尾 96 字符 |
+| schema 面 | 截短工具描述与参数说明 | 递归截 `description`，`type` / `properties` / `required` 不动 |
 
-## 为什么需要它
+云端 provider 一个字节都不改：未命中路由时 `release(agent)` 撤销全部限制，`restrict` 调用次数为 0，装配阶段直接返回下游结果（同一对象引用）。本地与云端交替使用互不影响。
 
-DSH 默认面向云端大模型：一个装满插件的 profile 打开就是几十上百项工具，加一整份长篇系统
-提示词。本地模型常见窗口是 16K–64K，装得多一点就 `CONTEXT_WINDOW_EXCEEDED`；就算窗口够，
-小模型被上百个工具描述和几万字规则围着，调用正确率也会掉。
-
-具体多大取决于你装了什么 —— 这正是下面要做按 provider 裁剪的原因。
-
-DSH 没有「按模型裁工具」的开关：
-
-- `dsh-tools` 的 Config 只有 `mode` / `maxParallel`；
-- agent-preset 只能声明插件，不列 ≠ 不注册；
-- 提示词类插件（比如 `dsh-purge`）也没有工具过滤字段。
-
-唯一原语是 `tools.restrict({ allow })`，它把限制追加到调用者所在 scope 的层，**只影响该 agent
-及其子 agent** —— 正好满足「只给本地模型精简」。本插件就是把这个原语和三个提示词层面的
-裁剪组合起来。
-
----
-
-## 四层裁剪
-
-| 层 | 做什么 | 手段 |
-| --- | --- | --- |
-| 1. 工具面 | 只留本地真用得上的工具 | `tools.restrict({ allow })`，allow = 实际可见名 ∩ 白名单 |
-| 2. 提示词面 | 丢掉本地用不到的大段 | `system-prompt/assemble` 里按段名过滤 `sections` / `contexts` |
-| 3. 注入面 | 整份系统提示词换成一页纸 | 替换注入段正文，保留头 80 / 尾 96 字符 |
-| 4. schema 面 | 截断工具描述 | 递归截 `description`，`type` / `properties` / `required` 一字不动 |
-
-第 3 层有个关键细节：宿主 `dsh-agent-loop` 在渲染完 prompt 后会检查
-`globalThis.__dshPurgeHungPrompt()` 返回的原文的**前 80 字符和后 96 字符**是否都还在渲染结果里；
-只要缺一个，就把整份原文再前置一遍。所以替换注入时必须原样保留这两段取样，否则省下的
-token 会被立刻加回去。
-
----
-
-## 安装
-
-### 方式一：npm（推荐，v0.5.2 起）
-
-包已发布到 npm，**这条路不需要 git**，也不需要自己装 pnpm（宿主自带）：
+实测裁剪后本地模型的工具调用能力没有退化：`bash` → `glob` → `read` 两步串行依然正确。
 
 ```bash
 dsh plugin add dsh-local-trim
 ```
 
-钉版本：`dsh plugin add dsh-local-trim@0.5.7`。
+装完就是开着的：端点自动识别，第一次探测到的本地后端会被写进 profile，不用重启。
 
-为什么要专门说「不需要 git」——因为从 `github:` 源装是另一条路，那条路上 git 是硬门槛，
-见下一节。桌面端不自带 git，新机器上这两条路的差别就是「装得上」和「装不上」。
+---
 
-### 方式二：`github:` 源 + `dsh plugin add`（v0.1.1 起，需要 git）
+## 支持的后端
 
-包已声明 `dsh.bundle`，装完自动生效，默认开启自动识别（`routes: []`）：
+llama.cpp / Ollama / vLLM / LM Studio，本机或局域网都行。端点探测、模型扫描、拉起与停止都按这四家做了适配。
+
+## 安装
+
+### 1. npm（推荐，v0.5.2 起不需要 git）
+
+```bash
+dsh plugin add dsh-local-trim
+dsh plugin add dsh-local-trim@0.5.8   # 钉版本
+```
+
+### 2. 从 GitHub 装（需要机器上有 git）
 
 ```bash
 dsh plugin add github:Leonlee114514/dsh-local-trim
 ```
 
-不想要自动识别就改自己 profile 的 `cordis.patch.yml`，把 `local-tool-trim` 的 `routes` 写死：
+宿主会先跑 `git -c credential.helper= ls-remote -- <repo> HEAD`。没装 git 时两侧报错都指错方向（命令行说 allowBuilds、市场说 pnpm 退出码 9009），DSH 桌面端不自带 git。绕法：固定 40 位 commit sha，走 codeload tarball，pnpm 不需要 git。
 
-```yaml
-- id: local-tool-trim
-  config:
-    routes: [my-local-provider]   # 只裁这一个 provider
-```
-
-#### 这条路的前置条件：机器上得有 `git`
-
-宿主在真正跑 pnpm 之前会先执行一次 `git -c credential.helper= ls-remote -- <repo> HEAD`
-探连通性。**没有 git 就直接失败**，而且两侧的报错都指错方向：
-
-- 命令行 `dsh plugin add github:...` 会说「add the exact key under `allowBuilds`」（其实不是 build 被拦）
-- 市场会说「找不到能用的 pnpm…退出码 9009」（其实是那句中文的「不是内部或外部命令」被误当成 pnpm 故障）
-
-先确认一下：
+### 3. link: 本地调试
 
 ```bash
-git --version        # 报「不是内部或外部命令」/ command not found 就先装 git
-```
-
-Windows 装 [Git for Windows](https://git-scm.com/download/win)，macOS 跑 `xcode-select --install`，
-Debian/Ubuntu 跑 `apt install git`。DSH 桌面端**不自带** git（安装树里没有任何 git 二进制），
-所以这是新机器的常见坑。**能装 npm 那条路就别走这条**（见方式一）。
-
-**不想装 git 的绕法**：把源固定到某个 commit —— 这种形式走 codeload tarball，pnpm 不需要 git：
-
-```bash
-dsh plugin add "github:Leonlee114514/dsh-local-trim#<40 位 commit sha>"
-```
-
-（sha 从仓库页面的 commit 列表里复制。宿主那条 `git ls-remote` 检查仍会跑一次并失败，
-但失败的分类是 `unknown` 而不会中止安装，pnpm 随后用 tarball 装成功 —— 这是实测过的路径。）
-
-### 方式三：本地源码 + `link:`
-
-适合改代码调试。
-
-```bash
-# 1) 进你的 DSH profile 目录
-cd ~/.dsh/profiles/desktop          # Windows: %USERPROFILE%\.dsh\profiles\desktop
-
-# 2) 作为本地依赖登记（用 link: 指向源码目录，改完即时生效）
-#    路径必须是相对 profile 目录的正确层数，写错会得到一个指向空目录的 junction
+cd ~/.dsh/profiles/desktop
 pnpm add link:../../../path/to/dsh-local-trim
-
-# 3) 在 cordis.patch.yml 末尾 insert 插件（见下方配置）
 ```
 
-> **踩过的坑**：手工把插件拷进 `node_modules/` 而不写进 `package.json`，任何一次
-> `pnpm install` 都会把它当无主残留隔离删除（日志在 `.dsh-market/log.ndjson`）。一定要用
-> `pnpm add link:...` 或写进 `dependencies`。
+然后在 `cordis.patch.yml` 末尾 insert。手工拷进 `node_modules` 会被下一次 `pnpm install` 当成无主残留隔离删除。
 
-### 一步到位（v0.2.0 起）
+## 快速开始
 
-不想手写 `llm-pi-ai` 的 baseURL / 窗口 / 模型列表：插件启动时会自己探测本地端点，
-探到能连上的就把 provider 写进你的 `cordis.patch.yml`（持久化，重启还在），
-新 provider 立刻可选用，不需要重启 DSH。
+装好插件后，配置里两行就能开始裁剪：
 
 ```yaml
-- insert:
-    - id: local-tool-trim
-      name: dsh-local-trim
-      inject: [ tools, systemPrompt ]
-      config:
-        provision: true     # 或写成对象，见下
-```
-
-`provision` 三态：
-
-| 写法 | 行为 |
-| --- | --- |
-| `false` | 完全不探测，插件只做裁剪 |
-| `true`（或不写） | 按顺序探 `8090`(llama.cpp) → `11434`(Ollama) → `8000`(vLLM) → `1234`(LM Studio)，命中第一个可用的 |
-| `{ endpoint: 'http://host:port/v1' }` | 只探这一个地址 |
-| `{ endpoints: [...], provider: 'my-local', overwrite: true }` | 自定义列表 / 名字 / 是否覆盖同名配置 |
-
-行为约定：
-
-- **已有可用的本地 provider 就完全不写入** —— 你手写的 `local-qwen` 不会被覆盖。
-- provider id 按端口推断：`8090 → local-llamacpp`、`11434 → local-ollama`、
-  `8000 → local-vllm`、`1234 → local-lmstudio`；可用 `provider:` 指定。
-- 窗口 / 输出长度从后端的 `/v1/models` 的 `meta.n_ctx`、`meta.n_predict` 读；
-  读不到就退回保守值。
-- 自动生成的 profile 带三样东西，少一样都可能拿不到回答：
-  1. `compat.thinkingFormat: 'chat-template'` +
-     `compat.chatTemplateKwargs.enable_thinking: false` —— 本地 chat template
-     默认开思考模式，`max_tokens` 会全花在 `reasoning_content` 上、`content`
-     返回空串。但 pi-ai 只在 `thinkingFormat` 是 `chat-template` 一类的分支里
-     才把 `chatTemplateKwargs` 翻成请求体的 `chat_template_kwargs`；默认的
-     `openai` 分支不翻，写了也发不出去。（`qwen` 分支发的是顶层
-     `enable_thinking`，llama.cpp 不认。）
-  2. 模型上的 `reasoningEfforts: { off: null, low: low }` —— 上面那个分支的前提
-     是 `model.reasoning === true`，而它由这个字段推出来。
-  3. `headers: { Authorization: 'Bearer local' }` —— 本地端点不校验 key，但 pi-ai
-     的 OpenAI 兼容实现要求「有 key 或有 `Authorization` 头」二者之一，都没有就在
-     发请求前抛 `No API key for provider`；而 provider 没有 credential 声明时它自己
-     不会加这个头，llama.cpp 则会**静默返回空 completion**（不是 401，非常难查）。
-     所以插件写 profile 时默认带一个占位头。
-
-     **不要为了「随便填个值」去写 `apiKeyEnv`**：宿主的语义是「声明了引用就必须能
-     解析到值」，解析不到会抛 `MISSING_CREDENTIAL`，然后 `listModels` 把这条
-     provider 吞成空模型列表，宿主的模型目录再把空组过滤掉 —— 结果就是**配置里明明
-     有，模型选择器里一个都看不到**。真要校验 key 的机器（vLLM `--api-key`）才写
-     `apiKeyEnv`，并且用 credentials 服务或环境变量把值备好。
-
-  不需要关思考就在 `provision` 里写 `chatTemplateKwargs: null`。v0.5.7 起这是**真的会清掉**
-  上次写进去的值：以前 `null` 只是「这次不写」，而 `settings.update` 走 `mergeLayers`
-  （缺键 = 不动），于是 `compat.chatTemplateKwargs` 会永久留在 profile 里，交回后端模板的
-  动作静默无效（代码注释还把清理责任推给一个并不存在的 `clearStaleCompat()`）。现在写配置
-  前先读回 profile、`delete compat.chatTemplateKwargs`、`compat` 空了就整块删掉，再 update；
-  导入那条路径也走同一段。
-- 探测与写入失败都不会影响裁剪，把原因写进日志（默认
-  `~/.dsh/local-llm/local-trim.log`，可用 `DSH_LOCAL_TRIM_LOG` 改位置）。
-
-> 插件**热重载**期间写配置会被 HMR 事务拒绝（`HMR transactions cannot be nested`）。
-> 这时插件会记下待办，等下一个真实请求（`agent/created`）再写 —— 不需要你做什么。
-> 冷启动（装完插件重启 DSH）时第一次就成功。
-
-### 最小配置
-
-```yaml
-- insert:
-    - id: local-tool-trim
-      name: dsh-local-trim
-      inject: [ tools, systemPrompt ]
-      config:
-        enabled: true
-        routes: []          # 空数组 = 自动识别本地端点
+plugins:
+  local-tool-trim:
+    config:
+      enabled: true
+      routes: []      # [] = 自动识别本地端点
 ```
 
 `routes` 三态：
 
 | 写法 | 含义 |
-| --- | --- |
-| 不写 | 早期默认：只认 `local-qwen` 这一个名字（建议显式写 `[]` 或写具体名字） |
-| `[]` | **自动识别**：provider 的 baseURL 指向回环/私有网段；没有 baseURL 时才退回看名字（local/ollama/vllm/lmstudio 等标记） |
-| `[my-provider, ollama]` | 只认写出来的名字（精确匹配，`my-provider-turbo` 不会命中） |
+|---|---|
+| 不写 | 只认早期默认的 `local-qwen` |
+| `[]` | 自动识别（推荐） |
+| `[local-ollama, local-llamacpp]` | 只认列出的 provider 名 |
 
-自动识别的 baseURL 特征是**先解析 hostname 再判**（v0.5.6 起），不是拿正则 match 整串 URL：
+自动识别先解析 hostname：`127.0.0.0/8`、`localhost`、`0.0.0.0`、`[::1]`、`10.x` / `192.168.x` / `172.16–31.x`、`169.254.x`、`100.64–127.x`、IPv6 ULA `fc00::/7`、`fe80::/10`、`::ffff:127.0.0.1`、`host.docker.internal` 一类容器别名、`.local` / `.internal` / `.localhost` 后缀、单标签主机名。`http://localhost.attacker.com/v1` 不算本地；provider 有 `baseURL` 时以地址为准，名字不作数。
 
-- 回环整段 `127.0.0.0/8`（不止 `127.0.0.1`）、`localhost`、`0.0.0.0`、`[::1]`
-- 私有网段 `10.x` / `192.168.x` / `172.16–31.x`、链路本地 `169.254.x`、CGNAT `100.64–127.x`（Tailscale 之类）
-- IPv6：ULA `fc00::/7`、链路本地 `fe80::/10`、IPv4-mapped `::ffff:127.0.0.1`
-- 容器内主机名 `host.docker.internal` / `host.containers.internal` / `gateway.docker.internal`
-- `.local`（mDNS）、`.internal`、`.localhost` 后缀，以及**单标签主机名**（`gpu-box`，公网 DNS 里不存在）
+### 确认裁剪真的生效
 
-反过来，`http://localhost.attacker.com/v1` 这种「域名前缀碰巧叫 localhost」的公网地址
-**不算本地**——以前用正则 match 整串会把它当本地，于是云端请求被裁掉大半提示词。
-有 baseURL 时一律以地址为准，名字不再翻案（`openrouter-llama-3` 不算本地）。
+让 llama-server 把 prompt 落盘：
 
----
+```bash
+llama-server -m model.gguf --port 8090 --jinja -c 65536 \
+  --log-prompts-dir ~/.dsh/local-llm/prompts
+```
 
-## 四种本地后端的接入
+跑一轮对话后取最新文件：
 
-先把模型挂进 DSH 的 `llm-pi-ai` provider，本插件负责裁剪。四种后端都走 OpenAI 兼容接口，
-差别只在 baseURL 和要不要 API key。
+```bash
+f=$(ls -t ~/.dsh/local-llm/prompts/*.txt | head -1)
+grep -c 'LOCAL LIGHT' "$f"       # 期望 1
+grep -c 'PRIME DIRECTIVE' "$f"   # 期望 0
+grep -c 'Mindmap editing' "$f"   # 期望 0
+```
 
-### llama.cpp（`llama-server`）
+如果 `PRIME DIRECTIVE` 还是 1，按两步排查：
+
+1. 看自检日志里的 `assemble 接管` 一行。理想值是 `accessor+purge-slot`；显示 `already` 说明外层套着别的实例的包装器。
+2. 临时开 `debugWrap: true`，日志里会出现成对的「包装器进入: N 段 / X 字符」与「包装器返回: M 段 / Y 字符」。
+
+## 一步到位
+
+`provision` 让插件自己找端点并写好 provider，不用手写 yaml。
+
+| 值 | 行为 |
+|---|---|
+| `false` | 不探测 |
+| `true`（默认） | 依次探 8090 llama.cpp → 11434 Ollama → 8000 vLLM → 1234 LM Studio |
+| `{ endpoint: ... }` | 只探指定端点 |
+| `{ endpoints: [...], provider, overwrite }` | 全量控制 |
+
+- 已有可用的本地 provider 时完全不写入。
+- provider id 按端口推断：`local-llamacpp` / `local-ollama` / `local-vllm` / `local-lmstudio`。
+- 窗口从 `/v1/models` 的 `meta.n_ctx`、`meta.n_predict` 读，读不到用保守值。
+
+自动写入的 profile 里有三样东西是必须的，手写时别漏：
+
+1. `compat.thinkingFormat: chat-template` + `chatTemplateKwargs.enable_thinking: false` —— 否则 `max_tokens` 全花在 `reasoning_content` 上，`content` 是空串。
+2. `models[].reasoningEfforts: { off: null, low: low }` —— `model.reasoning === true` 的前提。
+3. `headers.Authorization: Bearer local` —— pi-ai 要求有 key 或头，否则抛 `No API key for provider`；llama.cpp 更安静，直接返回空 completion。
+
+不要为了「随便填个值」写 `apiKeyEnv`：环境变量缺失会 `MISSING_CREDENTIAL` → `listModels` 空 → 模型选择器里一个模型都看不到。`chatTemplateKwargs: null` 在 v0.5.7 起会真的清掉旧值。
+
+## 接入四种后端
+
+### llama.cpp
 
 ```bash
 llama-server -m model.gguf --mmproj mmproj.gguf \
-  --host 127.0.0.1 --port 8090 --alias my-local \
-  --jinja -c 65536 --n-predict 8192 \
+  --host 127.0.0.1 --port 8090 --alias my-local --jinja \
+  -c 65536 --n-predict 8192 \
   --cache-type-k q8_0 --cache-type-v q8_0
 ```
 
 ```yaml
-# cordis.patch.yml
-- id: llm-pi-ai
-  config:
-    providers:
-      my-local:                       # provider id 自己定，带 local 标记会被自动识别
-        displayName: 本地 llama.cpp
-        headers:                        # 见上文第 3 点：不加这个头 pi-ai 直接抛
-          Authorization: Bearer local
-        api: openai-completions
-        baseURL: http://127.0.0.1:8090/v1
-        defaultContextWindow: 65536     # 必须和 -c 一致
-        defaultMaxTokens: 8192          # 必须和 --n-predict 一致
-        timeoutMs: 1800000
-        streamIdleTimeoutMs: 600000
-        compat:
-          supportsUsageInStreaming: true
-          maxTokensField: max_tokens
-          thinkingFormat: chat-template   # 见上文第 1 点：不写这一行，下面白写
-          chatTemplateKwargs:
-            enable_thinking: false
-        models:
-          - id: my-local
-            reasoningEfforts: { off: null, low: low }   # 见上文第 2 点
-            contextWindow: 65536
-            maxTokens: 8192
-            input: [ text ]
-            reasoningEfforts: false
+providers:
+  local-llamacpp:
+    displayName: llama.cpp (local)
+    api: openai-completions
+    baseURL: http://127.0.0.1:8090/v1
+    headers:
+      Authorization: Bearer local
+    defaultContextWindow: 65536      # 必须和 -c 一致
+    defaultMaxTokens: 8192           # 必须和 --n-predict 一致
+    timeoutMs: 1800000
+    streamIdleTimeoutMs: 600000
+    compat:
+      supportsUsageInStreaming: true
+      maxTokensField: max_tokens
+      thinkingFormat: chat-template
+      chatTemplateKwargs:
+        enable_thinking: false
+    models:
+      - id: my-local
+        name: My Local
+        contextWindow: 65536
+        maxTokens: 8192
+        input: [text]
+        reasoningEfforts: { off: null, low: low }
 ```
 
-`defaultContextWindow` 只在 provider 重新解析时生效 —— **改完必须重启 DSH 实例**，
-HMR 不覆盖 llm-pi-ai。
+`defaultContextWindow` 只在 provider 重新解析时生效 —— 改完必须重启 DSH。
 
 ### Ollama
 
 ```bash
-ollama serve                      # 默认 127.0.0.1:11434
+ollama serve            # 默认 127.0.0.1:11434
 ollama pull qwen2.5-coder:7b
 ```
 
 ```yaml
 providers:
-  ollama:
+  local-ollama:
     displayName: Ollama
     api: openai-completions
     baseURL: http://localhost:11434/v1
     headers:
-      Authorization: Bearer local    # Ollama 不校验，但 pi-ai 要这个头
+      Authorization: Bearer local
     defaultContextWindow: 32768
     defaultMaxTokens: 4096
 ```
 
-Ollama 的 `num_ctx` 由模型 Modelfile 决定，得和这里的 `defaultContextWindow` 对齐；
-`ollama show <model>` 能看到实际值。provider 名带 `ollama` 前缀，自动识别直接命中。
+Ollama 的 `num_ctx` 由模型 Modelfile 决定，得和这里的 `defaultContextWindow` 对齐；`ollama show <model>` 能看到实际值。provider 名带 `ollama` 前缀，自动识别直接命中。
 
 ### vLLM
 
 ```bash
 vllm serve Qwen/Qwen2.5-Coder-7B-Instruct \
-  --host 0.0.0.0 --port 8000 \
-  --max-model-len 32768
+  --host 0.0.0.0 --port 8000 --max-model-len 32768
 ```
 
 ```yaml
@@ -307,8 +196,8 @@ providers:
   vllm:
     displayName: vLLM
     api: openai-completions
-    baseURL: http://192.168.1.9:8000/v1   # 局域网机器也自动识别（192.168.x）
-    apiKeyEnv: VLLM_API_KEY               # 只有开了 --api-key 才需要；值要真配上
+    baseURL: http://192.168.1.9:8000/v1   # 局域网机器也自动识别
+    apiKeyEnv: VLLM_API_KEY               # 只有开了 --api-key 才需要，值要真配上
     defaultContextWindow: 32768
     defaultMaxTokens: 4096
     compat:
@@ -317,8 +206,7 @@ providers:
 
 ### LM Studio
 
-GUI 里打开 **Developer → Start Server**（默认 `127.0.0.1:1234`），Context Length 在
-模型加载设置里改。
+GUI 里打开 **Developer → Start Server**（默认 `127.0.0.1:1234`），Context Length 在模型加载设置里改。
 
 ```yaml
 providers:
@@ -327,957 +215,159 @@ providers:
     api: openai-completions
     baseURL: http://127.0.0.1:1234/v1
     headers:
-      Authorization: Bearer local    # LM Studio 不校验
+      Authorization: Bearer local      # LM Studio 不校验
     defaultContextWindow: 16384
     defaultMaxTokens: 4096
 ```
 
----
-
-## 完整配置
+## 配置参考
 
 ```yaml
-- insert:
-    - id: local-tool-trim
-      name: dsh-local-trim
-      inject: [ tools, systemPrompt ]
-      config:
-        enabled: true
-        routes: []
-        promptTrim: true
-        provision: true      # 探测本地端点并自动写 provider；false 关闭
-
-        # 本地模型用不到的段。名字取自各插件的 systemPrompt.section({ name })。
-        # 这份清单是「默认值」——装了什么插件就命中什么，名字对不上的段会被静默忽略，
-        # 不会报错。想更省就按自己装的东西加，不用整套照抄。
-        # 前 7 条是官方包里的段名（装了就有），后面是常见第三方插件的段名。
-        dropSections:
-          # 官方
-          - ui:deliverable-file-references
-          - app:web-surface
-          - tool:goal
-          - tool:ralph
-          - tool:session-query
-          - tool:pty
-          - harness:source
-          # 第三方（装了才有）
-          - tool:mindmap
-          - free-search:engines
-          - dshpg-capabilities
-          - mnemon:routing
-          - plugin:dsh-imagegen
-          - dsh-excel-chat:interaction
-          - dsh-ops:repository-tooling:mode-standard
-          - dsh-ops:repository-tooling:mode-ptc
-          - dsh-ops:repository-tooling:mode-cordis
-
-        dropContexts:
-          - mnemon:memory-view
-          - mnemon:runtime-memory
-
-        # 白名单**只写全局工具名**。scoped 注册的工具（dsh-ops 的 ops_bash /
-        # ops_read_files 之类）写进来会让 tools.restrict({ allow }) 整批校验失败：
-        # 宿主原话是「Restrictions intersect; scoped registrations remain visible.」，
-        # 也就是 scoped 工具本来就不受限制，写进来既没用又会把整次 restrict 打回。
-        # 名字全部来自官方 dsh-base 的 dsh-tool-* 注册名。
-        keep:
-          - bash
-          - pwsh
-          - read
-          - write
-          - edit
-          - apply_patch
-          - glob
-          - grep
-          - working_directory
-          - job_output
-          - job_list
-          - job_kill
-          - todo_write
-          - present
-          - read_image
-
-        # 描述截断长度。再往下会把 "Omit or leave empty when using" 这类半句留下，
-        # 反而降低调用正确率 —— 半句话比长话更容易误导模型调用。
-        # 设 0 表示该面不截断（保留原文）。
-        toolDescLimit: 140
-        toolParamDescLimit: 90
+plugins:
+  local-tool-trim:
+    config:
+      enabled: true
+      routes: []                  # [] = 自动识别
+      promptTrim: true            # 提示词面 + 注入面
+      schemaTrim: true            # schema 面
+      provision: true             # 一步到位：探端点并写 provider
+      autoDetectBaseURL: true
+      selfCheck: true
+      debugWrap: false
+      toolDescLimit: 140          # 0 = 不截断
+      toolParamDescLimit: 90      # 0 = 不截断
+      launchCommand: ''           # 面板「拉起」用的命令
+      launchTimeout: 20           # 拉起后等端口，3–600 秒
+      smokeTimeout: 60            # 试跑超时，5–600 秒
+      bridgeThrottleMs: 800       # 面板请求最小间隔，0 = 关掉间隔限制
+      injectText: ''              # 留空则读 light-inject.md，再退到内置一页纸
+      modelDirs: []               # 额外的模型目录，支持 ~
+      trustedPanelHosts: []       # 额外放行的 Host 头
+      trustedPanelPeers: []       # 额外放行的 TCP 对端地址
+      keep: [bash, pwsh, read, write, edit, apply_patch, glob, grep,
+             working_directory, job_output, job_list, job_kill,
+             todo_write, present, read_image]
+      dropSections: [ui:deliverable-file-references, app:web-surface,
+                     tool:goal, tool:ralph, tool:session-query, tool:pty,
+                     harness:source, tool:mindmap, free-search:engines,
+                     dshpg-capabilities, mnemon:routing, plugin:dsh-imagegen,
+                     dsh-excel-chat:interaction,
+                     dsh-ops:repository-tooling:mode-standard,
+                     dsh-ops:repository-tooling:mode-ptc,
+                     dsh-ops:repository-tooling:mode-cordis]
+      dropContexts: [mnemon:memory-view, mnemon:runtime-memory]
 ```
 
----
+两个注意点：
 
-## 换成自己的轻量注入
+- `keep` 只写**全局工具名**。带上插件命名空间的 scoped 名会让 `tools.restrict` 整批失败。
+- `toolDescLimit` / `toolParamDescLimit` 再往下截会留下半句话，反而降低调用正确率；140 / 90 是实测的平衡点，`0` 表示不截断。
 
-三层优先级：`config.injectText` > `~/.dsh/local-llm/light-inject.md` > 内置默认。
+### 换成自己的轻量注入
 
-写个文件就行：
+三层优先级，前面的赢：
 
-```bash
-mkdir -p ~/.dsh/local-llm
-cat > ~/.dsh/local-llm/light-inject.md <<'EOF'
-[SYSTEM]
-你是本地运行的编码助手。工具集已裁剪，上下文有限。
-- 直接执行，不要反问，缺参数用占位符
-- 中文回复，代码原文
-EOF
-```
+1. 配置项 `injectText`
+2. `~/.dsh/local-llm/light-inject.md`
+3. 内置 `DEFAULT_INJECT`（一页纸：身份 + 5 条准则 + 工具速查 + 输出格式）
 
-内置默认（`DEFAULT_INJECT`）是一页纸的版本：身份 + 5 条行为准则 + 工具速查 + 输出格式。
-正文多长不影响正确性，只影响省下的量 —— 想更省就写更短，但别把工具用法删到模型认不出。
+段名：装了 dsh-purge 就沿用它的段名 `dsh-purge`，没装则写 `local-trim:inject`。读取时两个名字都认，前缀也照旧识别。
 
-注入正文写进哪个段由机器决定，不用你配：装了 `dsh-purge` 就沿用它的段名 `dsh-purge`
-（它按精确名认段，宿主也被它的补丁改成只留 `name.startsWith('dsh-purge')` 的段）；没装就写进
-`local-trim:inject`。读的时候两个名字都认，热装/热卸不会漏。段名变了也能认出来 ——
-`dsh-purge` 升级成 `dsh-purge:v2` 之类的前缀仍会被当成注入段替换掉。
+## 控制面板
 
----
+面板在**插件详情页**，读写 `cordis.patch.yml` 里的 `local-tool-trim.config`，保存即生效。
 
-## 云端隔离
+| 区域 | 内容 |
+|---|---|
+| 状态带 | 接管方式（`accessor+purge-slot` / `accessor-native`）、注入正文字符数与来源、一步到位、提示词裁剪 / schema 瘦身、设置是否可写 |
+| 裁剪收益 | 最近一次装配的 进→出 字符、省下的百分比、段数、provider、时间；云端显示「未裁剪」 |
+| 模型表 | 端点指示灯、试跑、拉起、停止、删除、后端实况、对齐、对账 |
+| 本机模型 | 扫 `modelRoots`、认 GGUF 魔数 / Ollama blob、VRAM 预检、端口跟文件走、试跑冷加载重试 |
+| 高级配置 | 开关、阈值、三个名单、注入正文、拉起命令、各种超时 |
 
-三重保证，`test/autodetect.mjs` 和 `test/selfcheck.mjs` 都覆盖了：
+模型表里的几个动作值得说明：
 
-1. **工具面**：未命中路由时 `release(agent)` 撤销该 agent 的全部限制（`restrict 调用次数: 0`）。
-2. **提示词面**：`trimAssembly` 未命中时直接 `return assembly` —— **同一个对象引用**，
-   不新建、不原地改。
-3. **注入面**：接管后的 `assembleWithLocalTrim` 里 provider 判定不命中就直接返回下游结果。
-4. 唯一的全局副作用是重新定义了 `prompt.assemble` 的访问器，但它的行为对非本地 provider
-   完全等价于原函数。
+- **点灯**：`GET /v1/models`，15 秒缓存，并发不串行。
+- **试跑**：发一条「只回一个字：好」的真实请求，回毫秒数与回复。
+- **停止**：`SIGTERM` → 1.5 秒不退 `SIGKILL`；Windows 走 `taskkill /PID /T /F` 杀整棵树。只停自己 spawn 且登记在内存表里的 pid，重启后表是空的。
+- **删除**：走 `settings.mutate` unset，不是 update。继承来的 provider 删不掉，会回读确认并说明原因。
+- **「N 模型」**：读后端实况，四态 —— 一致 / 后端还有没注册的 / 配置里有已消失的 / 全都不在了。
+- **对齐**：把 `models:` 改成后端真有的那份，活着条目原样保留，连不上就不写，不会对齐成 0 个。
+- **对账**：唯一会自动写配置的动作，只做减法，绝不补模型；启动时跑一次，`provision.reconcile: false` 可关。
 
-实测：同一个会话里交替切云端 provider 和本地 provider，云端返回正常、本地工具调用正常，
-两边的工具面互不影响。
+### 面板的三个常见问题
 
----
+**升级后默认值不生效。** `keep` / `dropSections` / `dropContexts` 只要被保存过，就以用户配置的身份固化了。v0.5.4 起会自动识别「这是不是某个旧默认值的变体」，按当前默认值解释：橙色提示 + 一行日志，配置文件一个字节不动。判据三条 —— 出现旧默认值没有的名字就不动、删减超过两成就不动、保留你自己的删减。
 
-## 控制面板（v0.3.0 起，v0.4.0 改版）
+**保存报「被 home patch 覆盖」。** 整段写在 profile 的 `cordis.patch.yml` 里时，`settings.update` 要求合成结果与写入值完全一致。改文件，或删掉 `config:` 段。
 
-插件在 DSH Web 的**插件详情页**里挂了一块面板：左侧栏进「插件」，列表里点开
-`dsh-local-trim`，详情页底部就是它。面板直接读写这份 profile 的
-`cordis.patch.yml` 里 `local-tool-trim.config` 那一节，改完点保存即生效，不用重启。
-
-v0.4.0 起版面按「先看状态，再动手」重排，从上到下五块：
-
-**① 状态带** —— 一行徽章，每枚带颜色灯：
-
-| 徽章 | 含义 |
-| --- | --- |
-| 接管 prompt.assemble | 生效方式（叠在既有访问器外层 / 接管原生），失败时直接把原因写在这里 |
-| 注入正文 | 一页纸注入有多少字符、来源是 `config` / `light-inject.md` / 内置 |
-| 一步到位 | 自动注册 provider 的结果 |
-| 提示词裁剪 / schema 瘦身 | 两层各自的开关状态 |
-| 设置可写 | 宿主有没有把本插件登记成可写设置条目 |
-
-**② 裁剪收益条** —— 最近一次装配的进→出字符数、省了百分之几、段数变化、命中的 provider
-和时间。走云端 provider 时这里会显示「未裁剪」，那是正常的：云端一个字节都不动。
-
-**③ 模型 provider 表** —— 列出 settings 里所有 provider，本地的一个个点灯
-（`GET /v1/models`，15 秒内复用结果，多路并发不串行），显示在线耗时或错误原文；每个本地
-provider 后面有 **试跑** 按钮，发一条「只回一个字：好」的真实请求，回来显示毫秒数与回复内容。
-**拉起** 按钮会在这台机器上找后端并起一个脱离宿主的进程；如果那个端口上确实有本插件
-拉起的进程，还会多一个 **停止** 按钮（`SIGTERM` → 赖着不走再 `SIGKILL`）。
-别人的 `ollama serve` 不会被这里点掉 —— 服务端只肯停自己 `spawn` 过、且登记在内存表里的 pid。
-
-每个 provider 后面还有一个 **删除**（v0.4.4 起）——**删的是这条 provider 配置，不是磁盘上的
-gguf**。想清掉的就是那种僵尸：指向一个从没起来过的端口、或者同一个端口注册了两遍、或者你
-早就删了模型文件的那几条。
-
-- 第一次点只进入「确认删除？」态，再点才真删；点别的行会撤回确认。
-- 走 `settings.mutate(ns, [{ op: 'unset', path: ['providers', id] }], revision)` ——
-  **不是** `update`。`update` 走的是 `mergeLayers`，往 `providers[id]` 里写 `null` 只会留下
-  一个 `null` 的 provider 键，`llm-pi-ai` 的 loader 见到会当成配置错误而不是「没有这一条」。
-  只有 `mutate` 的 `unset` 内部是 `Reflect.deleteProperty`，才是真删。
-- **继承来的删不掉**：如果这条 provider 来自下层（profile 的 `cordis.patch.yml` 或 home
-  patch），`mutate` 的 `unset` 会把下层的值原样 set 回来 —— 表现出来就是「调用成功了但配置
-  还在」。所以删完会**回读一次**确认，还在就直说「这条来自下层配置，得改那个文件」，不谎报
-  成功。
-- 老版本 DSH 的 `settings` 服务没有 `mutate()` 时也会明说，而不是假装删掉了。
-- 删成功会清掉在线缓存与 baseURL 缓存，然后重新拉一次状态；**磁盘上的模型文件一个字节都不
-  动**，随时可以重新导入。
-
-**「N 模型」这个数字读的是后端实况，不是配置**（v0.5.1 起）。
-
-以前那列写的是配置里 `models:` 数组的长度，于是 `ollama rm qwen3:14b` 之后面板照旧写「5 模型」，
-你没法从面板看出有两条早就跑不起来了。现在点灯时顺手把 `/v1/models` 报回来的 id 记下来
-（15 秒缓存），和配置里声明的一条条对，四种结果分开说：
-
-| 面板显示 | 含义 | 该做什么 |
-| --- | --- | --- |
-| `3 模型` | 声明的都在，后端也没多出别的 | 什么都不用做 |
-| `3 模型 · 后端还有 1 个没注册` | 后端多出一个能用的，配置里没写 | 想用就去下面「导入」它 |
-| `1 模型 · 2 个已不在后端`（黄） | 部分声明落空 | 点这一行的 **对齐** |
-| `0 模型 · 配置里的 2 个全不在了`（红） | 整条 provider 都是僵尸 | 点 **对账**（会整条删掉），别对齐 |
-
-判活用的是「归一化后相等的 id」：`nomic-embed-text` 与 `nomic-embed-text:latest` 算同一条
-（Ollama 的 `/api/tags` 永远给带 tag 的全名，不归一化会全表飘红），但 `models/qwen.gguf`
-这种文件式 id 不会被补 `:latest` 去误伤 llama.cpp。
-
-**右边那枚徽章跟这个数字是同一套判据**（v0.5.4 起）。以前它只看「端口答没答 200」，于是会
-出现「3 模型 · 2 个已不在后端」配一枚绿色「在线 · 45ms」—— 端口活着，点进去每个模型都 404：
-
-| 情况 | 徽章 | 文案 |
-| --- | --- | --- |
-| 声明的模型后端全在 | 绿 | `在线 · 45ms` |
-| 部分不在 | 黄 | `在线 · 45ms · 2 个模型不在后端` |
-| 全都不在 | 红 | `端口通，但配置里的 5 个模型后端全没有 · 45ms` |
-| 端口不通 | 红 | `连不上：ECONNREFUSED` |
-| 探测没回模型清单 | 绿 | `在线 · 45ms`（**不知道 ≠ 没有**，这种情况不降级） |
-
-表头那个「在线 N 个」也是同一套判据：全都不在的 provider 不算在线。
-
-**对齐按钮**（v0.5.1 起）就是「把这条 provider 的 `models:` 改成后端此刻真的有的那份」：
-
-- 摘掉已不在后端的，补上后端有但没注册的，**活着的条目原样保留** —— 你调过的
-  `contextWindow` / `maxTokens` / `reasoningEfforts` 不会被探测值覆盖。
-- `baseURL`、`displayName`、`compat` 一律不动。
-- **后端连不上时一个字节都不写**。探测失败和「后端一个模型都没有」是两回事，混在一起会把
-  整条 provider 的模型清空 —— 那是数据丢失，不是对齐。
-- **不会对齐成 0 个模型**。全都不在了就明确让你去删 provider：空 `models` 在 `llm-pi-ai` 里
-  是配置错误，不是「停用」。
-- 没有差值时返回「跟后端一致，没动」，不写 settings。
-- 走 `settings.update` 整条 profile 重写（`mergeLayers` 对数组是整体替换，所以新的 `models`
-  会原样覆盖旧的），写前带 `revision` 做乐观锁。
-
-面板**不会因为点灯就改配置** —— 定时探测只更新徽章，不写 settings。误把「后端没起来」
-当成「模型被删了」然后自动清空，比让你多点一次糟糕得多。
-
-**对账**（v0.5.5 起）是唯一会自动写配置的动作，因为「模型没了、provider 还挂着」是纯粹的
-垃圾状态：留着它只会让模型选择器里全是点进去 404 的条目。
-
-- 面板右上角 **对账** 按钮 —— 把所有本地 provider 跟后端对一次账；
-- 启动时自动跑一次（配置里 `provision.reconcile: false` 可以关掉）；
-- **只做减法**：后端已经没有的模型从 `models:` 里摘掉；一条 provider 声明的模型**全都没了**
-  就整条删掉，而不是留一个空 `models:` —— 那在 `llm-pi-ai` 里是配置错误，不是「停用」；
-- 活着的条目原样保留（`contextWindow` / `maxTokens` / `reasoningEfforts` 一个字节不动），
-  `baseURL` / `displayName` / `compat` 也不动；
-- **绝不补模型**。这是它跟「对齐」的分界：对齐是你点按钮说「我要跟后端一模一样」，对账是
-  后台维护 —— 补模型会把同一端点上另一条 provider 的模型塞进来，那是替你做决定；
-- 三种情况一律不动：**后端连不上**（探测失败 ≠ 模型没了）、**后端只报当前加载的模型**
-  （llama.cpp 分不清「没装」和「没加载」）、**这条 provider 本来就没有模型**。
-
-`POST /api/dsh-local-trim/reconcile` 支持 `{ provider, apply: false }`：只算不改，把结论先看
-一眼再决定。面板从 v0.5.7 起默认走这条路 —— 点一次「对账」先拿预览，只有真要删/摘的时候
-按钮变成「确认对账」，再点一次才带 `apply: true`。以前一次点击直接写配置，手指抖一下就
-删掉一条 provider。
-
-**同一个后端只该有一条 provider**（v0.5.1 起）。以前每导入一个模型就新建一条
-`local-<后端>-<模型名>`，同一个 Ollama 攒出 `local-ollama-qwen3-14b`、`local-ollama-qwen3-8b`、
-`local-ollama-gemma4-12b`……每条只挂一个模型，删模型还得记着删对应那条。现在导入时先看这个
-端点是不是已经有一条**通用名**条目（`local-ollama` / `local-llamacpp` 这种）：
-
-- 有 → 把模型**追加**进去（已存在就不重复加，也不报错），返回里带 `reused` 说清是复用。
-- 没有 → 照旧新建一条。
-- **你手填了 provider id 就不复用** —— 那是你主动指定的，插件不去猜你的意思。自己起名的条目
-  （`local-ollama-qwen3-14b`）也不会被当成复用目标：分开配的往往调过 ctx / compat，塞新模型
-  会让人意外。
-- 端点比较会收敛回环名（`localhost` 与 `127.0.0.1` 同一个）和尾斜杠，不同端口就是不同后端。
-
-**④ 本机模型 · 一键配置**（v0.3.9 起，v0.4.0 加资源预检，v0.4.1 改判据，v0.4.5 认 Ollama，v0.4.6 读 GGUF 真名，v0.4.7 试跑超时可配且冷加载自动重试，v0.4.8 端口跟着文件走，v0.4.9 修面板被渲染期异常整块吞掉，v0.5.7 端口冲突时自己找空位、模型 id 对不上不再猜一个用）—— 上一块要求你先有端点，可刚下完模型的
-时候服务还不存在。这一块把顺序倒过来：**扫描本机 → 选一个模型 → 一键配置并试跑**。
-
-点「扫描本机模型」后插件按 `modelRoots()` 的顺序找权重（每层最多下探两级，跳过
-`.mmproj.` 视觉投影，按文件大小降序，大的排前面）。**认权重不只看后缀**：`.gguf` 直接算，
-没有后缀的较大文件（默认 ≥8MB，最多读 600 个）再读前 4 个字节验 `GGUF` 魔数 —— Ollama
-把权重存成 `blobs/sha256-<64 位哈希>`，只看后缀永远扫不到它：
-
-```
-$DSH_LOCAL_MODELS_DIR                ← 你自己指定的目录，排最前
-~/models/files
-~/llama.cpp/models
-~/.cache/llama.cpp
-~/.lmstudio/models
-<dataDir>/LM-Studio/models           ← Win: %LOCALAPPDATA% / mac: ~/Library/Application Support
-~/.workbuddy/local-models/files      ← WorkBuddy 下载目录（兼容保留，排在通用位置之后）
-~/models                             ← llama.cpp 惯例：权重直接摊在目录里，不套 files/
-~/AI/models                          ← 目录约定，不是官方安装位置，所以垫后
-~/Downloads                          ← 只扫一层
-```
-
-「目录约定」和「官方位置」是分开排的：`~/AI/models`、`~/.workbuddy/...` 这类只是某些人的
-习惯布局，换台机器就不存在，所以都排在 `~/models`、`~/llama.cpp/models`、LM Studio 数据目录
-之后 —— 否则一个人的私人习惯会压过所有人共有的标准布局。
-
-**另外单独走一趟 Ollama 存储**（`scanOllamaModels`）：`OLLAMA_MODELS` 环境变量排最前，
-然后是 `~/.ollama/models`、`%LOCALAPPDATA%\ollama\models`（Windows）、`~/AI/models/ollama`
-（目录约定，垫后），macOS `~/.ollama/models`、`/usr/share/ollama/.ollama/models`，Linux 再加
-`/usr/lib/ollama/models`、`/opt/ollama/models`。不是去 `blobs` 里猜哪些文件是权重 ——
-**读 `manifests/` 与 `manifests-v2/`，只取 `mediaType` 为 `application/vnd.ollama.image.model`
-的那一层**，再拿它的 digest 指回 `blobs/sha256-…`。这样得到的名字是人话：
-路径 `<host>/<ns>/<name>/<tag>` 还原成 `qwen3:14b`（`latest` 不加冒号），一个 blob 被多个
-tag 引用时合并成一条、`tags` 列出全部；`<root>/metadata/sha256-….json` 的 kv 再补上
-`general.name`、`general.file_type`（→ 量化标签，按 ggml 枚举原值，15 = `Q4_K_M`）和
-`context_length`。同一份文件被硬链接/同一个 inode 命中两次时按 inode 去重，谁有名字留谁。
-
-扫出来的不是一个下拉框，而是一张表：每个模型一行，点名字选中。
-
-**名字来自文件本身，不是文件名**（v0.4.6）：有些工具（WorkBuddy、部分下载脚本）会把任何
-权重都存成一个固定的通用名，同一台机器换个模型还是那个名字，光看文件分不出是哪个、也看不
-出量化。所以扫描时还会**读一遍 GGUF 头部的 KV 区**（按体积降序取前 40 个文件，跳过视觉投
-影），从中取出真名，面板上的显示名优先级是：Ollama 的 tag → `general.basename` +
-`general.size_label` 拼出来的紧凑名 → `general.name` 整串 → 文件名；整串（发行方常常在里
-面塞版本号、迭代号这类内部编号）放进悬停详情。同时带出量化标签（`general.file_type`，按
-ggml 枚举原值算）和 `context_length`。
-
-读这块 KV 区不能整块读头部：`tokenizer.ggml.tokens`（24.8 万条字符串）和
-`tokenizer.chat_template` 会把窗口占满，把后面的 `general.file_type` 截掉。做法是
-**读与跳分账** —— 键名与类型必读，超过 256KB 的字符串值、字符串数组只走位（不复制 token
-文本），游标越界立刻停（越界说明游标已经错了），半途超预算就返回已经拿到的键。注意 GGUF 的
-字符串数组是**交错存储**（每条 `u64 长度 + 载荷`），按「长度表」连续跳会把载荷首字节当成
-下一条长度，算出天文数字 —— 那不是文件太大，是游标错了。
-
-Ollama 的模型显示 tag 并带一个 `Ollama` 徽标和量化标签，后面是它的体积，超过可用预算的会标红「偏大」。
-**这里没有删除键** —— 权重文件是磁盘上的既有文件，插件不
-替你删（想清盘自己删，或用 `DSH_LOCAL_MODELS_DIR` 把它移出扫描范围）。
-
-> 视觉投影 `mmproj` 也列出来，但点它不会选中、也不能当主模型起服务。
-
-选中一个模型后填端口（默认 8090；**选中 Ollama 的模型时自动跟到 11434，选中普通 `.gguf`
-时改回 8090** —— 端口跟着文件走，不跟着上一次点了什么走。v0.4.8 前只做了前半段，于是
-「先点 Ollama 的模型、再点普通 `.gguf`」会把 11434 带过去，插件探到 Ollama 在应答就直接
-借它的端口，注册出一个你从没点过的模型。v0.5.7 起改口的动作会**先确认 8090 真是空的**：
-被占就顺着 8091–8099 找第一个「没人应答」或者「应答的模型正好就是你要的那个」的端口；
-十一个全被占就报错停下，不再像以前那样认定 8090 归自己、把别人的后端当成自己的复用）
-和上下文（默认 65536），点**一键配置并试跑**，一条链走完三件事：
-
-1. **先做资源预检**：算的是 **显存装不下的那部分**（`sizeBytes − gpuBytes`）比内存预算
-   （`max(totalmem − 2GB, freemem)`）。为什么不拿 gguf 全长去比内存 —— gguf 走 mmap 读，
-   落在**可回收的 file-backed page cache** 里，不是常驻匿名内存。这台机器实测就说明了这点：
-   16.9GB 的 gguf 跑着，进程 WorkingSet 才 285–691MB，显存 14289/14848MiB 打满，
-   系统还剩 2.2GB 可用，任务管理器不爆、不换页。
-   - **显存 + 内存都装不下** → `risky`，唯一的硬拦。那不是慢，是必然加载失败；
-   - 显存外的部分超过内存预算但走 mmap → `warn`，照起。只是开头一段明显慢
-     （专家按需从盘里换进来）；
-   - 同样装不下但用了 `--load-mode none` / `mlock`（不走 mmap，要真驻留 RAM）→ `risky`，
-     这时候才可能换页卡死；
-   - 拿不到体积 → `unknown`，不假装通过也不假装危险。
-2. **分两条路**：
-   - 选中的是 **Ollama 的模型**（在 manifest 里认出了 tag）→ **不去起 `llama-server`**。
-     那个 blob 虽然本身是合法 GGUF，但把它硬喂给 llama.cpp 等于绕过 Ollama 再吃一遍内存，
-     而且丢掉 `ollama run` 的全部上下文。插件只做一件事：确认 `11434` 有 ollama 在应答
-     （没有就按已知后端起 `ollama serve`），然后把 **tag 当模型 id** 交给下一步；
-   - 选中的是普通 `.gguf` → 用这个文件起 `llama-server`（自动找 `~/.workbuddy/local-models/bin/`
-     下最新的 build，参数带 `--n-gpu-layers auto --fit on --jinja --cache-type-k/v q8_0`）；
-     端口上已经有服务在应答就跳过拉起，不重复起；
-3. 等 `GET /v1/models` 真应答，**以它报的模型 id 为准**（不是文件名 —— 端口 11434 上报的是
-   `qwen3:14b` 这种 tag，拿 blob 的 `sha256-…` 去匹配永远匹配不上）；
-4. 复用「导入」的注册逻辑写进 `llm-pi-ai`（Ollama 那条会注册成 `local-ollama-<slug>`），
-   然后发一条真实请求试跑。
-
-选完模型后「保留思考模式」旁边还有一个 **加载方式** 下拉（`--load-mode`），默认留空：
-
-| 值 | 含义 | 什么时候选 |
-| --- | --- | --- |
-| 留空 | 交给 llama.cpp 自己决定（auto） | 默认。它会挑最合适的方式 |
-| `mmap` | 分页读盘，权重落在可回收的 page cache | 内存不宽裕时最稳 |
-| `none` | 全量读进匿名内存 | 内存富余、不想让盘参与 |
-| `mlock` | 锁页，不许换出 | 要求时序稳定、且内存确定够 |
-| `mmap+mlock` | 分页读 + 锁页 | 少数场景，一般不用 |
-
-注意 `--no-mmap` 这个参数 b11012 **不认**（`error: invalid argument`），所以插件从不拼它。
-
-失败时面板会说卡在哪一步：`precheck`（资源预检拦住）/ `launch`（起不来，带查过的路径）/
-`probe`（起来了但没报模型）/ `register`（写 settings 被拒）。拉起后端口超时不应答的话，
-插件会**把刚起的进程回收掉**，不留孤儿。别自己猜。
-
-> **别把 MoE 的冷启动当成卡死。** 27.2B MoE（8/192 专家激活）在这台机器上实测：
-> 前 1000–2000 token 是预热期（20 → 28 → 36 tok/s），之后**恒定 76 tok/s**
-> （prose 75.5 / 计数 76.2 / 代码 71.9），prefill 3215 token 跑到 674 tok/s，
-> 预热完 IO Read 归零。所以「17GB 就该卡」是错的判断 —— 判断依据是显存装不装得下，
-> 不是文件大小。
->
-> v0.4.0 曾拿 gguf 全长比内存，把这台机器判成 `risky` 并自动加 `--no-mmap`；
-> 而 b11012 根本不认这个参数（`error: invalid argument: --no-mmap`），
-> 等于一点「一键配置」必然起不来。v0.4.1 全部改成 `--load-mode auto|none|mmap|mlock|mmap+mlock`。
-
-**⑤ 导入本地模型** —— 填端点（例如 `http://127.0.0.1:8090`，`/v1` 可省）→ **探测** →
-下拉里选一个模型 → **导入并试跑**。导入做四件事：
-
-1. `GET /v1/models`（不通用时退 `/api/tags`）拿到模型列表；
-2. 按端口猜后端名，生成 provider id（`local-llamacpp-qwen3-4b` 这种），也可以自己填；
-3. 写进 `llm-pi-ai` 的 `providers`，模型选好后在「模型」选择器里立刻能选到；
-4. 立刻发一条真实请求，把端到端耗时、回复内容、token 数（或后端原文错误）贴在面板上。
-
-试跑失败不会回收配置 —— 配置已经落地，把后端拉起或改好端点后点「试跑」即可，不用重新导入。
-默认会关掉 chat template 的思考模式（`enable_thinking: false`）：本地小模型开了思考会把
-`max_tokens` 全花在 reasoning 上、`content` 直接空字符串。需要思考的模型勾上「保留思考模式」。
-
-原来那些字段（开关、阈值、三个名单、注入正文、一步到位）都在最下面折叠的
-**高级配置** 里，位置变了，能力没变。
-
-**⑥ 一键拉起（v0.3.4 起，v0.3.7 会自己捡模型，v0.4.0 能停，v0.4.1 认 --load-mode）** —— provider 表里每个**本地 provider**
-后面都多一个 **拉起** 按钮。点它就按这个 provider 的端口去找后端并起起来，然后轮询等它应答：
-
-| 端口 | 后端 | 怎么起 |
-| --- | --- | --- |
-| 11434 | Ollama | 找到 `ollama(.exe)` 后 `serve`，并带上 `OLLAMA_HOST=127.0.0.1:11434` |
-| 8090 | llama.cpp | 先找 `llama-server`，再按 `modelRoots()` 的顺序捡现成的 gguf，**参数自己拼** |
-| 8000 | vLLM | 要 `--model`（HF 目录或仓库 id），插件不猜 —— 高级配置里填完整命令 |
-| 1234 | LM Studio | `lms server start --port 1234`（不需要先指定模型，模型是运行时按请求加载的） |
-
-llama.cpp 这一条是 v0.3.7 的重点：模型已经下好了就别让人再下一次 20GB。插件按这个顺序找
-
-1. `llama-server`（Windows 补 `.exe`）：`LLAMA_SERVER_BIN` → 平台标准位置（Windows
-   `%LOCALAPPDATA%\llama.cpp\`、`~/AI/llama.cpp/`；macOS Homebrew 与 `/usr/local/bin`；Linux
-   `/usr/local/bin`、`/usr/bin`）→ `~/.workbuddy/local-models/bin/<build>/`（WorkBuddy 的布局，
-   取最新 build，垫后）→ PATH；
-2. 权重：按 `modelRoots()` 的顺序找（`DSH_LOCAL_MODELS_DIR` → `~/models` → `~/llama.cpp/models`
-   → `~/.cache/llama.cpp` → `~/.lmstudio/models` → `<dataDir>/LM-Studio/models` →
-   `~/.workbuddy/local-models/files` → `~/AI/models` → `~/Downloads`），第一个含权重的目录胜出；
-   认权重同样看后缀**或**文件头魔数（Ollama 的 `sha256-…` blob 就是靠魔数认的）；
-   同一目录里优先 `local_model.gguf`，跳过 `.mmproj.`（那是视觉投影）；
-   这里**只按文件名挑**，不读 GGUF 里的真名（面板那条④才会读，见上文）；
-   要指定自己的目录用 `DSH_LOCAL_MODELS_DIR` 或配置项 `modelDirs`；
-   **注意这条只给「llama.cpp 自己捡模型」用。Ollama 的权重不走这里** —— 端口 11434 上
-   该跑的是 `ollama serve`，模型名由 ollama 自己按 tag 提供（见④那条链的第 2 步）。
-3. 拼参数（**新版 llama.cpp**）：`-m <gguf> --host 127.0.0.1 --port 8090 --alias <provider 的模型 id>
-   --n-gpu-layers auto --fit on --parallel 1 --jinja --cache-type-k q8_0 --cache-type-v q8_0
-   -c 65536 --n-predict 8192`。老版本（没有 `--fit`）会自动换一套：`--n-gpu-layers 99`，
-   不下发 KV 量化，见「参数能力靠 `--help` 探测」一节。
-
-这套参数是按 32GB 统一内存实测出来的：权重 17GB 上卡，q8_0 KV 单 slot 才压得住 64K 上下文。
-**两个组件都找到才自动拼**；缺模型文件才回「需要模型文件才能起」，缺可执行文件才回「本机没找到」，
-错误里带着查过的路径。
-
-顺序是：**先探测**，端口本来就在应答就直接告诉你「没有重复拉起」；没应答才找可执行文件
-（`OLLAMA_BIN` 环境变量 → 平台默认安装位置：Windows `%LOCALAPPDATA%\Programs\Ollama\ollama.exe`、
-`C:\Program Files\Ollama\ollama.exe`、`~/AI/ollama/ollama.exe`（目录约定，垫后）；
-macOS `/Applications/Ollama.app/...`、Homebrew `/opt/homebrew/bin`；Linux `/usr/local/bin`、
-`/usr/bin`、`/snap/bin` → PATH），拉起后按 `拉起后等端口（秒）` 轮询
-`/v1/models`，成功后顺手把点灯缓存清掉。
-
-高级配置里的 **一键拉起命令** 留空就走上面的自动逻辑；填了（例如
-`C:\Users\you\AI\ollama\ollama.exe serve --verbose`）就原样执行，优先于自动探测。
-命令里带空格路径要自己加引号（v0.5.7 起插件会替你补上缺的那对）；反过来，命令里出现
-`& | < > ^ % ! "` 或换行时插件**直接拒绝执行**并说明原因 —— Windows 上这类命令必须交给
-`cmd.exe` 才能跑，而 `cmd` 没有能安全表达引号的转义序列，拼命令行等于给元字符开后门。
-要跑管道就自己写成 `.bat` / `.ps1`，把那个文件路径填进来。
-起进程用 `detached + stdio:ignore`，不挂在宿主进程的管道上，所以**关掉 DSH 不会把它带走**，
-要开机自启得自己挂（Windows 计划任务或启动项）。
-
-**停止**（v0.4.0 起）：进程起来了就得能关。provider 那一行如果在「本插件起过的端口」表里，
-就会多一个红色 **停止** 按钮，点它走 `POST /api/dsh-local-trim/stop` → `SIGTERM`，
-1.5 秒内不退再补 `SIGKILL`，还活着就如实报失败（不谎报成功）。Windows 上杀的是**整棵进程树**
-（`taskkill /PID <pid> /T`，补 `SIGKILL` 时再加 `/F`）—— 只杀单个 pid 会留下 llama-server
-自己 fork 出来的 worker，端口照样占着，下次拉起报「端口已被占用」而你不知道是谁占的。
-`taskkill` 回「没有找到进程」按成功处理：进程本来就已经没了，不该反过来报失败。
-这张表只存在宿主内存里：**重启 DSH 之后表就空了**，此时那些进程要自己关
-（`taskkill /PID <pid> /F`，pid 在面板「已拉起」提示和启动日志里都有）。
-
-拉起后等端口的上限是 `拉起后等端口（秒）`，默认 20 秒，可设范围 3–600 秒 —— 超出会被夹回去。
-17GB 权重冷加载实测 11.6 秒，接近默认上限；更慢的机器记得调大。
-**超时不会留孤儿**：插件会把刚 spawn 的那个 pid 回收掉再报错。
-
-端口通了不等于能出字：**第一次请求常常还在把权重读进内存**，比之后每次都慢得多。
-「试跑」一轮请求的超时是 `试跑超时（秒）`，默认 60 秒，可设范围 5–600 秒（超出夹回）。
-**超时不是直接报错**：会先用同一份请求自动再来一轮（冷加载第一次超时几乎总是这个原因），
-两轮都超时才报错 —— 此时文案会说清「已自动重试一次」并指向这个配置项。
-连不上、HTTP 报错这类非超时错误不重试，早点把原因给人看。
-
-```yaml
-smokeTimeout: 120
-```
-
-**端口落在别的引擎上会改口**（v0.4.8）：普通 `.gguf` 却被填成 Ollama 的 11434 / vLLM 的
-8000 / LM Studio 的 1234 时，插件改用 8090（llama.cpp）并在结果里说明一句。只对**已知引擎
-的端口**这么办 —— 你自己填个 9999 想喂另一台 llama-server，那是你的自由，照旧不抢。
-改口之后 v0.5.7 起还会再确认一次 8090 到底空不空：被占就 8091–8099 依次试，十一个全占
-就报「8090–8099 全被占用了…别让面板去借别人的后端」并停下。v0.4.8–v0.5.6 这里直接认定
-8090 是自己的，端口冲突时连探测都不做，探到别人在应答就当「已经起好了」复用 —— 于是面板
-会对着一个不是它起的后端注册 provider。
-
-**模型 id 对不上不瞎猜**：起了服务之后要拿一个模型 id 去注册 provider。名字对不上就
-直接报错并列出实际报的 id —— 「别猜一个用 —— 先确认这个文件喂给了正确的后端」。
-v0.4.8 前这里会静默抓列表第一个；v0.4.8–v0.5.6 改成「列表里恰好只有一个模型就用它」——
-后半句看着像保守，实际是同一个毛病换了个说法：端口上跑着别人的单个模型时，照样会把你的
-文件注册成那个模型。v0.5.7 把这条兜底删了，`pickModel` 只认名字真的对上的那个。
-
-**其他按钮**：**探测本地端点**（依次打 `8090` / `11434` / `8000` / `1234`）、**看日志**
-（读 `~/.dsh/local-llm/local-trim.log` 尾部）、**重新检测**（强制刷新点灯结果）。
-右上角显示当前 `revision`；这份配置在别处被改过时，保存会提示冲突并自动重新读取。
-
-宿主里跑的还是旧代码时（只有 describe / save / probe / log 四条路由，没有 `status`），
-面板不会整块报错：它自动退回 `describe` 视图，并在顶部提示「重启一次 DSH 就能看到点灯、
-收益条和模型导入」。
-
-**改了 `client.js` 只重载插件不够，必须完整重启 DSH。** 这不是保守说法，是宿主的实现决定
-的：`@deepseek-ai/dsh-client-modules` 在插件激活时就把 `client.js` 的字节读进内存并算出版本号
-（`initialBundleSnapshot` 里 `readFileSync` + `artifactRevision` 取 `mtimeMs`/`ctimeMs`/`size`
-做 sha1），之后每次对账（`reconcilePackage`）先比 `sourceKey` —— 那是 `baseUrl + '\0' +
-loaderName`，**文件内容变了它也不变** —— 相等就直接 `return false`，既不重读字节也不刷新版本号。
-所以热重载能让服务端 `lib/*.js` 生效，但浏览器那边拿到的仍是旧的面板代码。判断宿主当前在跑哪
-一份：`POST /api/dsh-local-trim/status` 的 `revision` 是配置版本，不是代码版本；要看代码版本，
-比对 `client.js` 的 `wc -c` 与你改动前后的大小，或直接在浏览器控制台里看有没有预期的日志。
-
-**面板整块不见、页面上只剩空白，宿主却一切正常**（v0.4.9 修的就是这个）：这说明面板在渲染
-期抛了异常，被宿主的插槽错误边界就地接管了。宿主给每个 `plugins.detail.section` 条目包了
-`SlotErrorBoundary`（`@deepseek-ai/dsh-client-ui-renderer`），`getDerivedStateFromError` 一旦
-捕获就把整块换成一个空的 `<div data-slot-error="plugins.detail.section">` —— 不崩进程、不写
-crash 日志，只往浏览器控制台打一行 `slot entry crashed in 'plugins.detail.section'`。
-v0.4.8 就是这样：`portFor` 声明在 `AdoptBox` 里面，`Panel` 的 `scanModels` 却引用了它，点一次
-「扫描本机模型」就在渲染期报 `ReferenceError`，整块面板当场消失。
-**排查办法**：打开浏览器开发者工具的控制台，看有没有 `slot entry crashed in ...`；本地跑
-`node test/client.mjs` 也能复现这类作用域错误（它自带最小 React 替身，真跑渲染、真执行
-`setState` 的 updater）；`node --check` 对此完全无感，只有语法错才报。
-
-面板走的是插件自建的 HTTP bridge，前缀 `/api/dsh-local-trim`，十五个端点
-`describe` / `save` / `probe` / `log` / `status` / `check` / `import` / `test` / `launch` /
-`stop` / `models` / `adopt` / `delete` / `align` / `reconcile`，全部只接受 POST，且只放行本机来源
-（`sec-fetch-site: cross-site` 直接 403，`Origin` 必须与 Host 同源）。
-
-重活路由（除 `describe` / `status` / `log` 之外；`save` 从 v0.5.7 起也算重活 —— 它写的是整条
-`providers` 数组，连点两下就是两次 CAS 写、两次 reload，后一次还常撞 revision 冲突）
-带两层节流：**同一个路由上一次还没跑完时，后来的请求排在它后面等结果**（问的是同一件事，拒掉纯属浪费；v0.5.7 前是回一句「等它结束
-再来一次」，面板根本不知道什么时候结束，用户只能盲点），跑完之后 800ms 内再来才被挡
-（`bridgeThrottleMs` 可调，设 0 关掉间隔限制、只留并发去重）。前端连点不会在宿主机上堆叠起
-一堆 `llama-server`。
-
-排队本身 v0.5.7 也修了：以前「排着等」的等待者被一次性全部唤醒，醒来后各自重新抢锁，
-于是同一条路由上同时跑起 N 个 —— 实测 5 个并发 `adopt` 峰值 4 个同时在跑、同时写 settings。
-现在是 FIFO 队列，锁**原地交接**给队首，中间没有任何窗口能被插进来（同一个探针峰值 1，
-五个请求在 215 / 418 / 619 / 821 / 1022 ms 依次完成）。
-
-**来源判定不是只看 Host 头。** 判「这是不是本机来的请求」一共四道，任一不过就 403：TCP 对端
-地址是回环、`sec-fetch-site` 不是 `cross-site`、`Host` 是回环名、`Origin` 是回环名（`null`
-例外，file:// 页面会给这个）。只有 Host 一道的话，一个把 DNS 指到 127.0.0.1 的公网域名就能
-借你的浏览器打这套接口 —— 浏览器的同源策略拦不住它，因为请求本身是从你自己机器发出的。
-要从前端代理（反代 / 容器 / 另一台机器上的面板）访问，两个名单都得配：
-
-```yaml
-trustedPanelHosts: ['dsh.example.com']   # 放行 Host / Origin 里的主机名
-trustedPanelPeers: ['192.168.1.20']      # 放行 TCP 对端地址（v0.5.7 新增）
-```
-
-只配前一个不够：`trustedPanelHosts` 管的是请求头里写的名字，`trustedPanelPeers` 管的是连接
-真的从哪个地址来。v0.5.6 及以前这两道都不存在 —— 那时只查了 `sec-fetch-site`，而那个头是
-浏览器自己写的，非浏览器客户端（curl / 脚本 / 另一个进程）压根不发它，于是「不是从浏览器
-来的」就被当成合法请求放行了。
-
-### 升级后默认值不生效？（v0.5.4 起自动识别）
-
-`keep` / `dropSections` / `dropContexts` 这三个字段一旦被保存过一次，就会以「用户显式配置」
-的身份永久留在 `cordis.patch.yml` 里。插件读到的是一串名字，**分不清那是你真想要的、还是
-上一版默认值被固化下来的** —— 于是新版本的默认值对升级上来的机器一个字都不生效，而且没有
-任何地方会说这件事。
-
-v0.5.4 起读到配置时会判断「这串名字是不是某个旧默认值的变体」，是就按当前默认值解释：
-
-- 面板上多一行橙色提示：`配置是 0.5.1 的默认值，已按当前默认值解释（点保存可以固化；改这两个框就按你写的算）`，
-  悬停能看到逐字段明细（补了哪些、丢了哪些）。
-- 日志里写一行 `配置迁移：keep 仍是 0.5.1 的旧默认值，已按当前默认值解释（…）`。
-- **配置文件本身一个字节都不动**，只在读取时翻译。
-
-判据三条，是为了不误伤真正自定义过的配置：
-
-1. 出现了旧默认值里没有的名字 → 那是你自己加的，**不动**；
-2. 删减超过两成 → 那是你手工精简的，**不动**（只删几条的仍认作旧默认值）；
-3. 翻译时**保留你的删减** —— 你删掉的名字不会被新默认值加回来。
-
-想固化：面板点一次保存。想保留原来那套：直接改那两个文本框。
-
-### 保存报「被 home patch 覆盖」怎么办
-
-如果这个插件的配置整段写在 profile 的 `cordis.patch.yml` 里（很多人是手写进去的），
-`settings.update` 会要求「合成后的 config 与要写的完全一致」，而那段 patch 里还有
-`routes` / `dropSections` 这些面板不负责的键 —— 于是整段写入被拒，面板会提示
-`这份配置整段来自 profile 的 cordis.patch.yml（home patch 层），面板不能整段覆盖`。
-
-两条路：① 直接改那个文件里 `local-tool-trim.config` 的对应键；② 把 patch 里这个插件的
-`config:` 段删掉（只留 `id` / `name` / `inject`），重启后配置归 settings 管，面板就能改。
-面板的**只读视图**（状态带、收益条、点灯、试跑、拉起）在两种情况下都能用。
-
-
-### 面板不出现怎么办
-
-**先确认你的 profile 有没有面板这个位置。** 控制面板挂在 `plugins.detail.section` 槽位上，
-这个槽位由 `@deepseek-ai/dsh-client-ui-plugin-manager` 声明，而它只被 `dsh-web-app` 依赖。
-所以：
-
-| profile 模板 | bundles 里有 `dsh-web-app` | 面板 |
-| --- | --- | --- |
-| `web`（桌面端 / `dsh web`） | 有 | 能画 |
-| `headless` / `sdk` / `sdk-minimal` / `acp` | 没有 | **画不出来** |
-
-headless 这类 profile 上，宿主根本不提供 `clientModules` 服务，插件的 client 半边没有地方可挂 ——
-这不是插件坏了，**裁剪、注入、schema 瘦身、一步到位全都照常生效**，只是没有那块界面。
-启动自检和日志第一行会明说这件事：
-
-```
-client 半边没有宿主 —— 这个 profile 没有 client-modules 服务，面板不会出现（裁剪照常生效）。…
-（profile 的 bundle 清单里没有 dsh-web-app）
-```
-
-要看面板就换 `web` profile，或者在浏览器里打开 DSH Web。判定方式是读 profile 自己的
-`package.json` 里 `dsh.profile.bundles`，不经服务注册，所以进程活多久都能算出来。
-
-在 `web` profile 里还是不出现，再按下面两条查：
-
-先看日志末行是「控制面板 UI 已进入 client 条目表」还是「需要完整重启一次 DSH」。
-宿主的 `dsh-client-modules` 会把每个包第一次扫描的结果缓存起来（`pkgMeta`），
-插件热重载不会清这个缓存 —— 所以如果**先装插件、后补 `dsh.client` 声明**，只重载插件
-不够，必须完整重启一次 DSH。插件自己会在装载时清掉本包那一项并触发重扫，正常情况下
-一次重载就够；日志里说还需要重启时，重启即可。
-
----
+**面板不出现。** 槽位 `plugins.detail.section` 由 `@deepseek-ai/dsh-client-ui-plugin-manager` 声明，只被 `dsh-web-app` 依赖。headless / sdk / acp profile 画不出面板，但裁剪照常生效。
 
 ## 启动自检
-插件装载时往 `~/.dsh/local-llm/local-trim.log` 写 11 项检查。下面是形态示例，数字取自
-某一份具体配置（你的会不一样，`<…>` 处随配置变化）：
 
-```
-✓ tools 服务          可 restrict
-✓ systemPrompt 服务   可用
-✓ dsh-purge（可选）  已装 → 注入段沿用它的段名，本插件在其外层收尾
-✓ assemble 接管       accessor+purge-slot
-✓ 轻量注入正文        <字符数>，来源 ~/.dsh/local-llm/light-inject.md
-✓ 工具白名单          <keep 项数> 项
-✓ 裁剪段落            <dropSections 项数> 段 + <dropContexts 项数> 个 context
-✓ 生效路由            自动识别（baseURL 解析出的 hostname 是回环/私有网段；没有 baseURL 时才看名字）
-✓ schema 瘦身         description 140 / 参数 90
-✓ 一步到位            <探测结果，如「已有配置好的 local-llamacpp」>
-✓ client 半边         有宿主（面板可用）
-控制面板 bridge 已挂载：/api/dsh-local-trim/{describe,save,probe,log,status,check,import,test,launch,stop,models,adopt,delete,align,reconcile}
-控制面板 UI 已进入 client 条目表（刷新页面即可在插件详情页看到）
-就绪：仅对 本地端点（自动识别） 生效，其它 provider 原样放行
-```
+启动时自检 11 项，写 `~/.dsh/local-llm/local-trim.log`：tools / systemPrompt / dsh-purge（可选）/ assemble 接管 / 轻量注入正文 / 工具白名单 / 裁剪段落 / 生效路由 / schema 瘦身 / 一步到位 / client 半边。
 
-最后一行 `client 半边` 有三种形态，都不是故障：
-
-| 标记 | 含义 |
-| --- | --- |
-| `✓ 有宿主（面板可用）` | profile 里有 `dsh-web-app`，面板能画 |
-| `· 没有宿主（面板不会出现，裁剪照常生效）` | headless / sdk / acp profile，面板无处可挂；用 `·` 而不是 ✗，因为这不是错 |
-| `… 待探测（1.5 秒后自动判定并写一行日志）` | 还没探测到；web profile 上会在一秒内变成「有宿主」 |
-
-想关掉：`config.selfCheck: false`。
-
-**这两行说的是「启动那一刻」，不一定是最终结果。** `installTakeover()` 后面还有
-`[800, 2500, 6000]` ms 三次重试（dsh-purge 也可能比本插件晚就绪），所以启动时写
-`accessor-native` / `此刻未装` 是实况，不是失败。6500ms 后会复核一次，结论变了才补一行：
-
-```
-复核：assemble 接管已生效（accessor+purge-slot，启动时是 accessor-native）
-复核：dsh-purge 已就绪 → 注入段从下一次 assemble 起沿用它的段名（已装）
-```
-
-**没变就一个字都不说** —— 日志里多一行「还是老样子」只会让人以为出了什么事。
-
----
-
-## 验证裁剪真的生效了
-
-llama.cpp 加 `--log-prompts-dir` 会把每次请求落盘：
-
-```bash
-llama-server ... --log-prompts-dir ~/.dsh/local-llm/prompts
-```
-
-```bash
-cd ~/.dsh/local-llm/prompts
-f=$(ls -t *.txt | head -1)
-echo "SIZE=$(stat -c%s $f)"
-for k in "LOCAL LIGHT" "PRIME DIRECTIVE" "Mindmap editing"; do
-  printf "%-20s %s\n" "$k:" "$(grep -c "$k" $f)"
-done
-```
-
-期望：`LOCAL LIGHT: 1`、`PRIME DIRECTIVE: 0`、`Mindmap editing: 0`。`SIZE` 跟你自己的
-配置有关，不看绝对值，看的是「注入换成了轻量版、那些大段不再出现」。
-
-如果 `PRIME DIRECTIVE: 1`，说明结果被某一层重写覆盖了。两步排查：
-
-1. 看 `local-trim.log` 里最新的 `assemble 接管` 行。理想值是 `accessor+purge-slot`；
-   出现 `already` 意味着外层是别的实例留下的包装器（见坑位 6）。
-2. 在配置里临时打开 `debugWrap: true`，重载后再发一次请求，日志会多出成对的
-   `包装器进入: N 段 / X 字符` 与 `包装器返回: M 段 / Y 字符`。如果「返回」的体积没有变小，
-   是 `trimAssembly` 判定这条请求不属于本地 provider（看 `routes` / baseURL 是否被识别）；
-   如果「进入」的体积本身就很小而请求很大，说明别的层在我们之后又灌了内容进来。
-
----
+- 结论只写变化：`[800, 2500, 6000]` ms 三次重试 + 6500 ms 复核，结论变了才补一行，没变一个字都不说。
+- client 半边三态：`✓` 有宿主 / `·` 没有宿主（用 `·` 不用 `✗`，headless profile 属正常）/ `…` 待探测。
+- 关掉：`selfCheck: false`。
+- bridge 路由挂在 `/api/dsh-local-trim/{describe,save,probe,log,status,check,import,test,launch,stop,models,adopt,delete,align,reconcile}`。
 
 ## 七个踩过的坑
 
-1. **`tools.restrict({ allow })` 只认全局工具名。** scoped 注册名（如 `dsh-ops` 的 `ops_glob`）
-   混进 allow 会让**整批**校验失败，一条限制都装不上。本插件从错误消息里把被拒的名字抠出来
-   记住，下一轮跳过 —— 比依赖 `view()` 私有字段跨版本安全。
+1. `tools.restrict` 只认全局工具名。传 scoped 名会让整批失败，得从错误消息里抠出被拒的名字、下一轮跳过。
+2. waterfall 的 `next()` 不收参数。裁剪要在 `await next()` 之后对返回值做。
+3. 别跟 dsh-purge 的 400 ms 心跳抢 `slot.rewrite`。要转发 `Symbol.for('dsh-purge.assembleGuard')`。
+4. 注入段必须 `interpolate: false`，且保留头 80 / 尾 96 字符。宿主 `dsh-agent-loop` 会检查 `globalThis.__dshPurgeHungPrompt()` 的头尾是否还在，缺一个就把整份原文再前置一遍。
+5. `llm-pi-ai` 改 `defaultContextWindow` 要重启实例才生效。
+6. 热重载会留下上一实例的包装器，必须叠加而不是跳过 —— 用每次 `apply` 不同的实例 token，不能靠全局布尔。
+7. `.volatile()` 字段是活引用，必须每次现读（`resolveConfig(config)` 逐键 `.get()`）。
 
-2. **cordis 的 waterfall `next()` 不收参数。** 下游拿到的是最初那份 `args`，所以裁剪必须在
-   `await next()` 之后对返回值做。
+## 跨平台
 
-3. **别和 dsh-purge 的 400ms 心跳抢 `slot.rewrite`。** 它每 400ms 用 `bindSlot` 覆盖一次，
-   反向重挂永远输在时序上。正确做法是接管 `prompt.assemble` 访问器并在 getter 上**转发**
-   `Symbol.for('dsh-purge.assembleGuard')`，让它只刷自己的 slot、不重装访问器覆盖你。
+CI 跑 ubuntu-latest（Node 20 / 22 / 24）+ windows-latest + macos-latest（Node 22）。
 
-4. **注入段必须 `interpolate: false`，并且保留头 80 / 尾 96 字符。** 否则
-   `renderPrompt` 会用变量改写正文，破坏宿主取样判定，整份原文立刻被重新前置。
-
-5. **`llm-pi-ai` 改 `defaultContextWindow` 要重启实例。** HMR 不覆盖 provider 解析，
-   改了不重启的话 bili / 代理层拿到的还是旧窗口。
-
-6. **热重载会留下上一实例的包装器，不能看到标记就跳过。** 重载后旧实例的
-   `prompt.assemble` 包装器还在最外层，但它的 `ctx` 已失效 —— provider 判断失效 → 它自己
-   原样放行，而它内层仍会调 `dsh-purge` 把整份原文灌回去。所以接管时不能用全局布尔标记
-   判断「已经装过」，要带一个 **每次 `apply` 都不同的实例 token**；发现外层是别人的包装器时
-   **叠加**一层自己的，而不是放弃。进程重启后旧包装器自然消失，叠加的层数也就回到一。
-
-7. **`.volatile()` 的配置字段不是值，是活引用。** 加上 `volatile()` 之后宿主传进
-   `apply(ctx, config)` 的每个字段都是 `{ get(): T }`，`config.enabled !== false` 会永远为真
-   （对象 !== false），裁剪开关直接失效。必须统一走一个 `resolveConfig(config)` 逐键 `.get()`，
-   而且不能一次性解构成常量 —— 面板改了要能立刻生效，每次用时现读。
-
----
-
-## 跨平台（v0.4.2 起）
-
-v0.4.1 及以前这个插件只在本机（Windows ARM64 + 一张 N 卡 + WorkBuddy 的 llama.cpp 布局）
-上验证过，代码里到处是 `C:/Users/<USER>/...` 这种硬编码。换台机器大概率表现为
-「扫不到模型 / 找不到二进制 / 一拉起就报参数错」。v0.4.2 把这些都换成了可推导的规则。
-
-### 支持矩阵
-
-CI 在 `ubuntu-latest`（Node 20/22/24）、`windows-latest`、`macos-latest` 上各跑一遍，
-所以这张表不是声明，是每次提交都在验的东西。
-
-| 能力 | Windows | macOS | Linux |
-| --- | --- | --- | --- |
+| | Windows | macOS | Linux |
+|---|---|---|---|
 | 用户目录 / 数据目录 | `%USERPROFILE%` / `%LOCALAPPDATA%` | `~` / `~/Library/Application Support` | `~` / `$XDG_DATA_HOME` |
-| 找 ollama | `%LOCALAPPDATA%\Programs\Ollama` + `Program Files` + `~/AI/ollama`（约定，垫后）+ PATH | `.app` 包内 + Homebrew + PATH | `/usr/local/bin`、`/usr/bin`、`/snap/bin` + PATH |
-| 找 llama-server | `%LOCALAPPDATA%\llama.cpp` + `~/AI/llama.cpp` + WorkBuddy build（约定，垫后）+ PATH（补 `.exe`） | Homebrew + `/usr/local/bin` + PATH | 同 macOS |
-| 找 vLLM / LM Studio | `LM-Studio/lms.exe`、`Program Files` + PATH | `.app` 包内 + PATH | `/usr/local/bin` + PATH |
-| 扫权重 | `~/models`、`~/llama.cpp/models`、`~/AI/models`（约定，垫后）、`~/Downloads`… + Ollama 存储（含 `%LOCALAPPDATA%\ollama\models`） | `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`… + `~/.ollama/models`、`/usr/share/ollama/.ollama/models` | 同 macOS，另加 LM Studio 数据目录、`/usr/lib/ollama/models`、`/opt/ollama/models` |
-| 显存探测 | `nvidia-smi`（在 system32，靠 PATH） | `nvidia-smi` / `rocm-smi` / `sysctl hw.memsize` | `nvidia-smi` / `rocm-smi` |
-| 拉起 / 停止进程 | 支持（`spawn` + signal 0 探测） | 支持 | 支持 |
+| 找 ollama | `%LOCALAPPDATA%\Programs\Ollama`、`Program Files`、`~/AI/ollama`、PATH | `.app` 包内、Homebrew、PATH | `/usr/local/bin`、`/usr/bin`、`/snap/bin`、PATH |
+| 找 llama-server | `%LOCALAPPDATA%\llama.cpp`、`~/AI/llama.cpp`、WorkBuddy build、PATH | Homebrew、`/usr/local/bin`、PATH | 同 macOS |
+| 找 vLLM / LM Studio | `LM-Studio\lms.exe`、`Program Files`、PATH | `.app` 包内、PATH | `/usr/local/bin`、PATH |
+| 扫权重 | `~/models`、`~/llama.cpp/models`、`~/AI/models`、`~/Downloads`、`%LOCALAPPDATA%\ollama\models` | `~/models`、`~/llama.cpp/models`、`~/.cache/llama.cpp`、`~/.ollama/models`、LM Studio 数据目录 | `~/models`、`~/.ollama/models`、`/usr/share/ollama/.ollama/models`、`/usr/lib/ollama/models`、`/opt/ollama/models` |
+| 显存探测 | `nvidia-smi`（system32，靠 PATH） | `nvidia-smi` / `rocm-smi` / `sysctl hw.memsize` | `nvidia-smi` / `rocm-smi` |
+| 拉起 / 停止 | spawn + `taskkill /T /F` | spawn + 信号 | spawn + 信号 |
 
-### 认自己的模型目录
+只有真机才验得了的三样：`stopProcess` 的 Windows 分支走真 `taskkill`、`runDetached` 的 `.cmd` 分支走真 `cmd.exe`、`client.js` 走真 `window` 替身。所以 `bridge.mjs` 与 `client.mjs` 在 win / macos 上另跑一遍；`launcher.mjs` 的 Windows 分支靠 `input.platform` / `input.execFile` 注入，在 Linux 上也能覆盖。
 
-内建目录覆盖三平台的常规位置（完整清单用面板上的「扫描本机模型」看，接口返回的 `dirs`
-就是实际扫过的路径）。模型不在常规位置时，两条路：
-
-1. 环境变量（优先级最高，排在最前）：
-
-   ```bash
-   # bash / zsh
-   export DSH_LOCAL_MODELS_DIR=/mnt/weights/gguf
-   ```
-
-   ```powershell
-   # PowerShell（用户级，永久）
-   [Environment]::SetEnvironmentVariable('DSH_LOCAL_MODELS_DIR', 'D:\models', 'User')
-   ```
-
-2. 配置项 `modelDirs`（数组，支持 `~`），和上面那个环境变量同时存在时都会扫：
-
-   ```yaml
-   modelDirs:
-     - ~/gguf
-     - /data/weights
-   ```
-
-3. Ollama 的存储单独一条环境变量：`OLLAMA_MODELS`。装了 ollama 的人经常把它指到大盘
-   （`D:\ollama-models` 这类），插件读它并**排到 Ollama 候选最前**，指哪儿扫哪儿；没设就
-   按上表那些标准位置挨个试。判定标准是「这个目录长得像 ollama 库吗」—— 底下必须有
-   `manifests` / `manifests-v2` / `blobs`，只是一个普通同名目录不会被当成库。
-
-### 认自己的后端二进制
-
-四个后端各有一个覆盖变量，指定后直接排到候选表最前，不再猜：
+### 环境变量
 
 | 变量 | 作用 |
-| --- | --- |
-| `OLLAMA_BIN` | `ollama` 可执行文件的完整路径 |
-| `LLAMA_SERVER_BIN` | `llama-server` 的完整路径（自编译 / 非标准位置） |
-| `VLLM_BIN` | `vllm` 的完整路径（conda / venv 里的那个） |
-| `LMSTUDIO_BIN` | `lms` CLI 的完整路径 |
+|---|---|
+| `DSH_LOCAL_MODELS_DIR` | 自己的模型目录，优先级最高。网络盘也认：`DSH_LOCAL_MODELS_DIR=\\NAS\share\models` |
+| `OLLAMA_MODELS` | 排到 Ollama 候选最前（目录须含 `manifests` / `manifests-v2` / `blobs`） |
+| `OLLAMA_BIN` | 自己的 ollama 二进制 |
+| `LLAMA_SERVER_BIN` | 自己的 llama-server 二进制 |
 
-### 参数能力靠 `--help` 探测，不靠版本号猜
-
-llama.cpp 的参数是逐版演进的：`--load-mode` 和 `--fit` 是近几版才有的，老版本没有；
-反过来 `--no-mmap` 在新版本里已经被 `--load-mode` 取代（传进去直接
-`error: invalid argument`）。所以插件在拼命令行之前会先跑一次
-`llama-server --help`，把输出里出现的 `--flag` 全抠出来，只拼它真认的那几个：
-
-- 探到了 → 只留白名单里的；被裁掉的参数名会出现在 `planLaunch` 返回的 `dropped` 数组里，
-  面板会告诉你「你的 llama.cpp 不认 `--fit`，已跳过」。
-  短参数（`-c` / `-m` / `-t`）也一并收 —— `-c` 是 `--ctx-size` 的短写，只认长参数的话
-  `-c 65536` 会被判成不支持而整条裁掉，上下文悄悄退回引擎默认值（本机就这么丢过一次）。
-- 探不出来（命令不存在、超时、输出为空）→ **不裁剪**，按旧行为全给。宁可让引擎自己报错，
-  也不要因为探测失败把好参数丢掉。v0.5.7 起「探不出来」这一种结果**不写进缓存** —— 以前
-  把 `null` 也存进去，于是第一次探测时二进制还没装好（或者刚好被杀软锁着），之后整场都按
-  「它什么都不认」处理，装好了也不重探。
-- 结果按二进制路径缓存，同一个 `llama-server` 只跑一次 `--help`（只缓存**真探到**的那次）。
-  同一个 flag 的几种拼写（`--n-gpu-layers` / `--gpu-layers` / `-ngl`）先按引擎自己认的那个
-  归一，认不出任何一个才裁掉 —— 保留参数却拼错名字，比丢掉更糟。
-
-**flag 在、取值不一定在。** `--n-gpu-layers auto` 的 `auto` 是和 `--fit` 同一代加的；
-老引擎只认数字。所以拼参数时按 `--fit` 有无分两套：
-
-| 能力 | 有 `--fit`（新引擎） | 无 `--fit`（老引擎） |
-| --- | --- | --- |
-| `--n-gpu-layers` | `auto` | `99` |
-| `--cache-type-k/v` | `q8_0` | 不下发（老版本类型表窄） |
-| `--fit on` | 下发 | 不下发 |
-
-`llamaCppAutoArgs` 的返回值里带 `modernEngine`，面板日志能看出走的是哪一套。
-
-### 显存探测的三条路
-
-`detectGpuInfo()` 依次尝试，谁先答上算谁：
-
-1. **NVIDIA** — `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits`，
-   三个平台通用（Windows 上它在 `system32`，PATH 里有）。
-2. **AMD** — `rocm-smi --showmeminfo vram`，认 `VRAM Total Memory (B): 17163091968`
-   和 `VRAM Total Memory (B): 24.0 GiB` 两种写法。
-3. **Apple Silicon** — 没有独立 VRAM，统一内存。取 `sysctl -n hw.memsize` 的**四分之一**
-   作为「GPU 侧可用」的粗估，并标 `unified: true`（面板上会显示这是统一内存，不是真显存）。
-4. 都没有（Intel 核显 / 无独显 / 容器里）→ 返回 0，预检退化成「不算显存」，不报错。
-
-**统一内存要特殊处理。** Apple Silicon 的「显存」和内存是同一个池子，
-`hostBytes = 模型 − 显存` 会凭空多出余量（24GB 的 Mac 装 16GB 模型会被算成只占 10GB）。
-所以 `detectGpuInfo()` 对 Apple Silicon 返回 `unified: true`，预检见到它就按
-`sizeBytes` 全额比 `totalMemBytes`，上限也只算一次。AMD 核显走的是独立 VRAM 路径，
-不受这条影响。
-
-### 预留内存可配
-
-预检给系统留多少内存是 `reserveMb`（默认 2048 MiB）。桌面 Windows + 宿主 + 浏览器差不多
-要这么多；Linux 服务器可以调到 1024，内存紧张的机器调大，`0` 表示不预留（只跟 free 比）。
-取值夹在 0–262144 之间（256 GiB）：v0.5.7 前只有下限没有上限，填个 `999999999` 会把
-「可用内存」算成负数，于是每个模型都判 risky、面板硬拦着不让起，而且文案只会说
-「内存不够」—— 现在这种明显写错的数字会被夹到上限，并在预检结论里说清是预留把它吃光了。
-
-```yaml
-reserveMb: 1024
-```
-
----
+配置项 `modelDirs` 可以再补几个目录，支持 `~`。参数能力靠 `--help` 探测：老版 llama-server 没有 `--fit` 就自动换 `--n-gpu-layers 99`，且不下发 KV 量化。
 
 ## 已知边界
 
-- 只做本进程内的裁剪，不碰模型权重，不改任何第三方插件源码。
-- `dsh-purge` 是可选增强，不是前提：装了就把注入段写进它的段名（它按精确名认段，宿主也
-  被它的补丁改成只留 `name.startsWith('dsh-purge')` 的段，换名字注入会被丢掉）；没装就写进
-  本插件自己的 `local-trim:inject`，接管原生 `prompt.assemble`，只是没有头 80 / 尾 96 的
-  保留逻辑（没有那层兜底就不需要）。
-- 段名来自各插件的 `systemPrompt.section({ name })`，插件升级改段名后要在 `dropSections` 里同步。
-- **插件不会去改你已经写好的 provider 配置。** 0.5.3 之前写进去的 provider 里带着
-  `apiKeyEnv: DSH_LOCAL_LLM_API_KEY` 这类凭据引用，如果那个 ref 从没被赋过值，宿主会抛
-  `MISSING_CREDENTIAL` → `listModels` 返回空 → 模型目录把整组过滤掉，**选择器里就一个本地
-  模型都没有**（配置看着是好的，所以特别难查）。升级后新写入的 provider 不再带 `apiKeyEnv`，
-  但旧的那几条要你自己动手：删掉 `apiKeyEnv` 那行、或给那个 ref 配上值。面板会把「凭据没有值
-  → 选择器里看不到」标成 warn 提示。
-- llama.cpp 侧的调参只到「一键拉起时给一组能跑的默认值」（`--n-gpu-layers auto --fit on --cache-type-k/v q8_0`）；要换量化、换 KV cache 精度、限并发，改高级配置里的启动命令，插件不替你优化推理性能。
-- **资源预检是估算，不是保证。** `checkModelFit` 用 `os.freemem()` / `os.totalmem()`、
-  模型文件体积、以及探测到的显存总量做减法：`hostBytes = sizeBytes − gpuBytes`。
-  显存探测按厂商分三条路（见「跨平台」一节）。这几个数都不精确（本机实测：32GB 机器
-  Windows 只报 16.37GB 可见，其中 GPU 拿走 14.5GB；`freemem` 还把 page cache 算成已占用）。
-  所以它只会**拦住明显起不来的**，不会替你算出真实占用。拿不到显存时退化成「不算显存」，
-  不报错。判 `ok` 也不代表不会慢。
-- **面板只能停自己起的进程。** `stop` 路由走一张内存表（`launched`），表里只有本插件
-  `spawn` 过的 pid。宿重重启后这张表就空了，此时手动起的后端要自己关。
-
----
+- 只做进程内裁剪，不碰权重、不改第三方源码。
+- dsh-purge 是可选增强，不是前提。
+- 不改你已经写好的 provider 配置。0.5.3 之前的 `apiKeyEnv` 需要自己删掉或配值。
+- llama.cpp 调参只到「一组能跑的默认值」：`--n-gpu-layers auto --fit on --cache-type-k/v q8_0 -c 65536 --n-predict 8192`。
+- 资源预检是估算不是保证：`hostBytes = sizeBytes − gpuBytes`，`reserveMb` 默认 2048 MiB（夹 0–262144）。
+- 面板只能停自己拉起的进程（内存表，重启即空）。
 
 ## 开发
 
 ```bash
-npm run verify                  # = check + test，24 个文件语法 + 12 套单元测试 + 跨平台推演
-npm run check                   # 只跑 node --check（lib/*.js + client.js + test/ 里带平台/渲染逻辑的那几个）
-npm test                        # 只跑测试（unit + portable + host）
-npm run test:portable           # 只跑跨平台候选表推演（linux / darwin / win32 各一遍）
-npm run test:sim                # 假装自己是 linux / darwin，把整套测试再跑一遍
-
-node test/selfcheck.mjs         # 三个场景：装了 dsh-purge / 没装 / 默认值普适性
-node test/autodetect.mjs        # 四个本地后端 + 五个云端 provider（含两个「名字像本地」的公网地址）的路由判定
-node test/provision.mjs         # 探测 → 写 settings 的一步到位
-node test/panel.mjs             # 面板视图模型 + 导入流程（离线，不起浏览器）
-node test/client.mjs            # 真渲染 client.js（自带最小 React 替身），点「扫描本机模型」验面板不塌
-node test/client-host.mjs       # 有没有 client 宿主都要说出来：headless profile 上不许静默
-node test/publish.mjs           # 发布就绪自检（publishConfig / files / dsh 声明 / optional peer）
-node test/panel-host.mjs        # 真跑 apply()，假 settings / 假后端把 15 条 bridge 路由全打一遍（含一份现造的 Ollama 存储 fixture）
-node test/bridge.mjs            # 直接造路由表验节流：同路由并发必须串行、纯读不排队、配错的间隔回落 800ms、各条错误码
-node test/launcher.mjs          # 一键拉起 + 扫本机权重（含 Ollama manifest 解析与 GGUF KV 真名）+ 资源预检 + 停进程（不真起进程）
-node test/portable.mjs          # 路径推导 / 显存探测 / --help 能力探测（假 platform + 假 exec）
-node test/platform-sim.mjs linux    # 假装自己是 Linux，验候选表不会吐 Windows 路径
-node test/platform-sim.mjs darwin   # 同上，macOS
-node test/platform-sim.mjs win32    # 同上，Windows（本机就是，但断言的是「全 .exe」）
-node test/run-sim.mjs           # 上面那三套 + launcher / panel-host，按 linux + darwin 各一遍
-node test/stranger.mjs          # 抹掉本机所有有利条件（无 GPU / 无模型 / 空 PATH）
+npm run verify         # check + test：25 个文件语法 + 12 套单元 + 跨平台推演
+npm run check          # 逐文件 node --check
+npm run test           # 全部套件
+npm run test:portable  # 三平台路径推演
+npm run test:sim       # 模拟宿主
+node test/selfcheck.mjs   # 单套：三个场景
 ```
-
-`test/stranger.mjs` 是「别人第一次装」的等价物：清空 `PATH`、抹掉显卡、家目录里不放模型，
-然后要求每一步都优雅退化 —— 显存读不到就是 0（不是 NaN），`--help` 探不到就不裁剪（不是全丢），
-没有 gguf 就回 `no-model` 并列目录。本机什么都有，这些分支永远走不到。
-
-`test/run-sim.mjs` 把同一招用到**整套**测试上：它用 `child_process` 起子进程并显式传
-`DSH_SIM_PLATFORM`，而不是写 `DSH_SIM_PLATFORM=linux node …` —— 那种前缀语法只在
-POSIX shell 成立，Windows 的 npm script 会直接报「不是内部或外部命令」。这一步存在的理由
-很具体：`test/portable.mjs` 里曾断言 `endsWith("lms.exe")`，macOS runner 上
-`exeName()` 不加后缀就红，而本机是 Windows，永远踩不到。
-
-`test/platform-sim.mjs` 靠 `Object.defineProperty(process, "platform", …)` 在 import
-之前改平台 —— `lib/launcher.js` 顶部的 `const WIN = process.platform === 'win32'` 是
-import 时求值的，改掉之后整个模块都会按目标平台展开。
-
-`os.homedir()` 也能骗，但有坑：真实 Windows 上它只读 `USERPROFILE`（删掉反而退回
-真实家目录，`HOME` 根本不看），Linux/macOS 才读 `HOME`。一开始只改 `HOME`，模拟 darwin
-时家目录仍是 `C:/Users/<你>`，候选表里混进一堆 `C:/...` —— 而那正是要抓的东西，等于
-这套测试白跑。现在 `test/fake-platform.mjs` 把两个变量都指到 `/sim/nobody`，并且有三条
-用例专门断言「家目录里没有本机真实路径」。剩下骗不到的只有 `process.env.PATH`、真实文件
-系统和 `nvidia-smi`；把这三样也删掉的是 `test/stranger.mjs`。
-
-`test/panel.mjs` 只测纯逻辑：`lib/status.js`（接管文案、收益计算、provider 判定与点灯计数）
-和 `lib/import-model.js`（入参校验、provider id 生成、profile 拼装、试跑请求与四类失败分支，
-全部用假 `fetch`）。
-
-`test/panel-host.mjs` 是宿主侧集成：用一份内存 settings、一个假 `webServer`、一个假
-llama.cpp（`/v1/models` + `/v1/chat/completions`）跑真的 `apply(ctx)`，让插件自己注册路由，
-然后逐条断言 status / check / import / test / launch / stop / models / adopt / delete 的返回 ——
-包括同源守卫 403、同名不覆盖、端点连不上、模型不在列表里、provider 不存在、
-资源预检拦截、以及「只肯停自己起的进程」这几种路径。它不需要真起 DSH。
-
-> 这份用例显式传 `bridgeThrottleMs: 0`：它是在几毫秒内连着打同一批重活路由的，
-> 默认 800ms 间隔会把它们全挡掉。节流本身由最后几组用例单独验。
-
-`test/client.mjs` 是唯一碰 `client.js` 的用例，也是唯一能抓住「渲染期炸掉」的用例。它用
-一个最小 React 替身（`createElement` / `useState` / `useCallback` / `useEffect` / `useMemo` /
-`useRef` / `class Component`）载入真的 `client.js`（走 `window.__ModuleLoader__.load`），
-**真调函数组件、真在渲染期执行 `setState` 的 updater、真递归渲染出 DOM 树**，然后像用户那样
-点「扫描本机模型」，断言面板还活着、自动选中的是最大的那个模型、端口回到了 8090。
-数据用真机 `/status` 与 `/models` 的载荷回放（35B + 两个 Ollama tag + 一个 mmproj）。
-v0.4.9 之前 `portFor` 声明在 `AdoptBox` 里却从 `Panel` 引用，`node --check` 报不出任何问题
-（语法合法），只有这条回路会在那一行打出 `ReferenceError: portFor is not defined`。
-
-`test/launcher.mjs` 覆盖一键拉起的纯逻辑：端口解析、命令行切分（认双引号）、
-`whichOnPath` 补扩展名、四种后端的计划生成、找不到可执行文件与「需要模型参数」两条错误路径、
-自定义命令优先、`runDetached` 的 `detached/stdio/env` 传参，以及 `waitForEndpoint` 的
-命中与超时。`spawnImpl` 与 `probe` 全部注入，CI 上不会留下后台进程。
-
-v0.3.9 起还覆盖 `scanLocalModels`（跳过 mmproj、按大小降序、目录下探）与「自选端口 +
-指定 gguf」的拼装（端口和 alias 都得按用户填的走）。v0.4.0 补上了
-`mergeEnv`（Windows 上 PATH / Path 大小写去重）、`envPathValue`、`checkModelFit`
-（五档结论 + 显存外的 hostBytes + 拿不到体积时的 unknown）、`--load-mode` 白名单（`normalizeLoadMode` / `LOAD_MODES`）、`detectGpuBytes`、`stopProcess`
-（SIGTERM → SIGKILL → 报失败，幂等）、`isProcessAlive`（EPERM 算活着），
-以及扫描的三道上限（`maxModels` / `maxEntries` / Downloads 只扫一层）与 `truncated` 标记。
-
-v0.4.4 补上 `unregisterProvider`（`lib/provision.js`）：删 provider 配置只能用 `mutate` 的
-`unset`，所以用例分成三条 —— ① 真删（假 mutate 里 `Reflect.deleteProperty` 那套语义）、
-② 幂等（删第二次回 `already: true`）、③ **继承来的删不掉**（假 `mutate` 什么都不做，回读
-发现键还在 → 必须回 `removed: false, inherited: true`，并把原因指到下层 patch）。
-还有「没有 `mutate()` 的老版本 DSH 要明说」「空 id 直接拒」「settings 缺失不抛」三条。
-宿主侧（`test/panel-host.mjs` 第 20 组）额外断言**没走 `update` 写 null**、`unset` 的
-`path` 恰好是 `['providers', <id>]`、以及别的 provider 一个没动。
-
-`adopt` 的 `sizeBytes` / `gpuBytes` / `totalMemBytes` 可以从入参覆盖（非正数或省略就回落真实探测）。
-CI 的 runner 上没有 `nvidia-smi`、内存也只有 15.6GB，不覆盖的话「能跑的机器不该被判 risky」
-这条断言在 CI 上永远测不到 —— 它会一路走 `risky` 分支。生产路径不吃这三个参数。
-
-本地不要为了验证去真起 17GB 的模型 —— `planLaunch` 已经把命令和参数摆出来了，看一眼就够；
-真要端到端跑，挑个空闲时段。**别把冷启动当成卡死**：27.2B MoE 在这里实测预热
-1000–2000 token 后稳定 76 tok/s（见上文「一键配置」下的说明）。
-
-`lib/config.js` 顶层 `import z from '@deepseek-ai/schemastery'` —— 运行时由 DSH 宿主提供
-（`peerDependencies`，optional，不会再给装插件的人拉第二份副本），跑测试前需要
-`npm ci`（它同时也写在 `devDependencies` 里）。CI 就是这么做的。
-
-`scripts/restore-bash.ps1` 修 pnpm 把 `@dsh-ops/bash-win32-x64` 当不匹配平台剪掉的问题
-（arm64 Windows 上会遇到）：重新 pack 该可选依赖并放回 `node_modules/@dsh-ops/`。
 
 ## License
 

@@ -4,6 +4,170 @@
 每条都写「为什么」而不只是「改了什么」—— 这个插件的坑大多来自 DSH 宿主的隐式约定，
 不记下来下次还会踩。
 
+## [0.5.8] - 2026-11-26
+
+一句话：**0.5.7 发布之后又做了两轮独立审查，补掉 18 处接缝（其中 1 处 P0 换了个壳复活、1 处只在别人的机器上才踩到），README 与 package.json 重写成「能一眼看懂这是干什么的」。**
+
+0.5.7 已经发到 npm（2026-11-25T17:25Z，与 tag `v0.5.7` 同一个 commit），所以下面这三段不能像原计划那样补进 0.5.7 的段落里 —— 它们落在发布之后，单独成一版。
+
+三段按顺序是：**第一轮审查**（把 42 条旧结论逐条回现码复核，再按「规则写在 A 处、B 处没跟上」重扫）、**第二轮审查**（把第一轮修完的代码本身当审查对象，找出「修复引入的新接缝」）、**跨设备核验**（换一台机器还成不成立）。每一条都配了回归，能反向验证的都在 CHANGELOG 里写了「改回旧写法哪条用例会红」。
+
+后面还有一段「文档重写」：README 从 1336 行压到 368 行，把「痛点 → 做了什么 → 怎么装 → 怎么配」的顺序摆正；`package.json` 的 `description` 改成中文，`keywords` 补齐到 10 个便于 npm 检索。
+
+### 第一轮审查之后的 8 处接缝
+
+审查报告见仓库根的 `代码审查报告-v0.5.7.md`。它做的是另一件事：把 42 条旧结论逐条回到现码复核
+（确认哪些真修了、哪些是误报），再按「规则写在 A 处、B 处没跟上」这个共同形状重新扫一遍。
+扫出来的 8 条里 1 条是 P0，其余 7 条都会在特定条件下悄悄做错事。**这些都是在 0.5.7 发布之后才发现的，所以落在这一版。**
+
+**① 停不掉后端（P0）。** Windows 上 `stopProcess` 的 SIGTERM 轮发的是 `taskkill /PID n /T` —— 没有 `/F`。
+实测对自成进程组的 console 子进程直接 exit 255、stderr 回「只能强制终止此进程(带 /F 选项)」，
+而代码把「stderr 非空」当成失败 `return`，**后面那轮带 `/F` 的 SIGKILL 永远跑不到**，pid 仍然活着。
+用户看到的是「停止」点完什么都没发生，只能手动 `taskkill /F`。改三处：SIGTERM 轮就带 `/F`、
+第一轮失败不再提前 return 而是记进 `firstNote` 继续走第二轮、退出码 `128`（本机实测 = 进程已不存在）也算成功。
+**为什么活到发版**：这条分支在 CI 的 Linux runner 上根本走不到，而 `stopProcess` 原来没有注入点
+⇒ 测不了 ⇒ 没人测。顺手加了 `[test-seam] input.platform` 与 `fakeTaskkill` 桩，补了 4 条用例。
+
+**② `taskkill` 的中文报错识别不了。** 中文 Windows 的 stderr 是 GBK，Node 按 UTF-8 解出来全是 U+FFFD，
+于是 `/not found|没有找到|找不到/i` 永不命中，「进程早就没了」被当成失败报给面板。改成先看退出码，
+再看解码结果里有没有替换字符，有就提示「系统输出不是 UTF-8，无法显示原文」而不是瞎猜。
+
+**③ `.cmd` 包装不存在也报「已启动」。** `needsShell` 走 `cmd.exe` 时 `child.pid` 是 cmd 的 pid，
+脚本根本没被调用也照样 `spawn` 成功。补一条存在性校验（`safeExists`），并让 `setImmediate` 的
+`spawn` 兜底在 shell 模式下不再算成功 —— 那个信号只证明 cmd 起来了。
+
+**④ 半开连接能把整条 bridge 锁死（P1）。** 路由原来先 `enter(name)` 拿锁、再 `await readJsonBody`。
+如果客户端发完 header 就不发 body（也不关连接），`readJsonBody` 永不 settle，锁永久 inflight，
+**之后所有同路由请求排到死，不重启 DSH 不恢复**。改成先读 body 再拿锁，并给 body 读取加 15 秒超时
+（`BODY_READ_TIMEOUT_MS`）、补齐 `aborted` / `close` 两条路径。失败回 413 / 400 / 408，各带稳定 code。
+
+**⑤ 排队等太久只说「在跑」。** 锁被占住时后来的请求无限等，面板一直显示「在跑」。加 10 分钟上限
+（`GATE_WAIT_TIMEOUT_MS`），超时回 503 `gate-timeout`。**这里有个坑**：`releaseLock` 是「原地交接」
+语义 —— 队列里第一个等待者拿到锁的所有权，**不等了却没人接，锁就永久泄露**。所以超时必须把后账做完：
+`abandoned` 标记 + 派生的 promise 在值到达时自己 `release()`。
+
+**⑥ KV 预检口径没闭环（P1）。** `planLaunch` 定下「现代引擎用 `q8_0` KV 缓存」（`lib/launcher.js:757`），
+但两处 `estimateKvBytes` 调用都没把 `cacheType` 传进去 ⇒ 按 f16 估。实测同一个模型：f16 = 16384.0 MiB、
+q8_0 = 8704.0 MiB，**高估 1.882 倍**，后果是「一键配置」把一个装得下的模型判成 `risky` 拦在预检。
+面板不能跑 `--help` 去现探（那是同步 8 秒子进程 × 每行模型），所以记「上次真起进程用的类型」
+（`kvCacheTypeHint`），实测起过一次之后预检就是对的。顺手把「只探到 K 侧」的式子也修了：
+缺一侧时原来拿已知侧乘 2（低估），现在补 f16 再取平均。
+
+**⑦ 一处忙、全盘灰（P1）。** `client.js` 里 15 个按钮的 `disabled` 全是 `busy !== ''` ——
+「扫描本机模型」要跑十几秒，期间连「看日志」「刷新」都点不动，用户唯一能做的就是等。按域建模：
+`lockKeysOf(label)` 把动作分到 `endpoint` / `disk` / `status` / `config` / `process` / `provider:<id>`
+六个域，`busyBlocks` 只在域相交时才灰。纯读的「看日志」永远不挡。
+
+**⑧ 一键配置成功会冲掉草稿（P1）。** `runAdopt` / `runImport` 成功后无条件 `await load()` 重载表单 ——
+用户在表单里改了一半（比如刚加了 `--numa`）再点「一键配置」，改动被悄悄覆盖，没有任何提示。
+改为 `reloadIfClean()`：草稿没动就照常重载，动过就只刷新状态并明说「没敢覆盖你的草稿」。
+
+**另外两处「测试本身不可信」：**
+
+- **CI 少了三套件（P1）。** `.github/workflows/test.yml` 手写 `node test/xxx.mjs` 清单，漏了
+  `bridge.mjs` / `client.mjs` / `legacy.mjs` —— 也就是上一段刚加的那三套。等于回归网有三个洞。
+  补进 unit job；`bridge` / `client` 另补进 windows / macos job（它们只有真机跑才有意义）。
+- **`platform-sim.mjs` 可能什么都没验（P1）。** 它的全部结论建立在「`Object.defineProperty` 改
+  `process.platform` 之后 `launcher.js` 的 WIN 常量跟着变」之上。改不动时后面的断言会按**本机平台**
+  全绿。补一条自检：模拟生效 + `exeName('probe')` 对得上目标平台。反向验证时把模拟注释掉，它立刻
+  报 9 处问题、首两条正是「模拟没生效」。
+
+**测试**：`launcher.mjs` 69 → 78 项、`client.mjs` 7 → 11 项、`bridge.mjs` 新增半开连接与排队超时两组、
+`platform-sim.mjs` 三平台自检。变异验证两条新用例确实会红：把 `busyBlocks` 换回
+`busyStack.length > 0` → `test/client.mjs:421` 的 `assert.notEqual(reload.disabled, true)` 失败；
+把 `reloadIfClean` 换回无条件 `load()` → 草稿断言 `actual: ''`、`expected: 'ollama serve --numa'` 失败。
+全套回归 17 个套件（12 unit + 三平台 sim + run-sim + panel-host）全部 exit 0。
+
+### 第二轮审查之后的 8 处接缝
+
+审查报告见仓库根的 `代码审查报告-v0.5.7-第二轮.md`。那一轮把第一轮修完的代码当审查对象，
+新找出 6 条「修复本身引入的接缝」（R 系列）与 30 条仍未修的老问题。作者的选择是**只修 8 条、
+避免引入更多新问题**——C3、C8、L9、L11、C9–C17 与结构性延后的 C4/T2/D4/L6 都明确不动。
+8 条全部落码并各自配了回归。
+
+**① Windows 上不核对 pid 就强杀（P2）。** `stopProcess` 的核对段原本是
+`if (expected.length > 0 && (typeof input.readCommand === 'function' || platform !== 'win32'))` ——
+Windows 天然不满足这个条件，于是 `expectedCommand` 在 Windows 上**永远不生效**。后果是：面板记录的
+pid 被系统复用了（重启后尤其常见），「停止」会去杀一棵完全无关的进程树。现在补了 win32 分支：
+`readProcessCommand` 走 `tasklist /FI "PID eq N" /FO CSV /NH`，新增 `sameImageName(expected, actual)`
+（取末段、去 `.exe`、小写比对，任一侧空则放行），不匹配就返回「pid 被复用了，不动它」。
+
+**② bridge 的三个选项在挂载期就固化（P2）。** `minGapMs` / `trustedHosts` / `trustedPeers` 原来在
+`ctx.inject` 的回调里求值一次就进了闭包，面板把 `bridgeThrottleMs` 从 800 改成 100、把某个主机加进
+`trustedHosts`，**看起来保存成功、实际不生效，而且没有任何提示**。改成传 thunk（`() => …`），
+`makeBridgeRoutes` 里新增 `readOption` / `resolveGap` / `trustedSet`，三者每次请求现取。
+**这处第一版写错过一次**：把「取一个值」改成「取一个取值函数」时顺手把类型校验也换成了更宽松的
+`Number.isFinite(Number(raw))`，而 `Number(null) === 0`、`Number('') === 0` ⇒ 一个 `null` 配置被当成
+「显式关掉节流」，等于把节流整段关掉。被 `test/bridge.mjs` 第 8 组当场抓住，改回只认真正的 number。
+
+**③ 只读态下输入框照样能改（P2）。** `state.writable === false` 原来只渲染一句「当前不可写」的提示，
+输入框本身不 `disabled`——用户能把一屏改完，点保存才报错，改动全丢。现在把 `readOnly` 下沉到
+13 处 Panel 级控件与 `AdoptBox` / `ImportBox` 的 15 处按钮（共 15 处 `disabled: readOnly === true`），
+保存按钮是 `blocked('save') || readOnly`。
+
+**④ `contextWindow` 没有 512 下限（P2）。** `adoptPanel` 里是 `Number(input?.contextWindow) || 65536`，
+而 `planLaunch` 的规则是 `>= 512 ? floor : 65536`。填 1–511 时预检按 1–511 估、实际按 65536 起，
+预检放行了一个装不下的模型。改成同一条规则（`Number.isFinite(raw) && raw >= 512 ? floor : 65536`）。
+
+**⑤ 宿主换一句文案就整轮裁剪抛错（P3）。** `applyRestrict` 里 `if (listed === null) throw error`——
+正则对得上宿主现在的 `unknown global tool(s) "x"; known global tools: [...]` 文案，但宿主哪天改一句话，
+整轮裁剪就抛错。改成 `report(...)` + `return undefined`：降级为「本轮不裁剪 + 一条报告」。
+
+**⑥ 日志尾部从半个汉字开始（P3）。** `readLogTail` 取末 N 字节后直接 `toString('utf8')`，切在多字节
+字符中间时首字符是 U+FFFD。现在先跳前导续字节（`(buffer[skip] & 0xc0) === 0x80`，最多 4 字节），
+返回的 `bytes` 是 `read - skip`。
+
+**⑦ WorkBuddy 的 build 号按字典序挑（P3）。** `builds.sort()` 没有比较器，`b9999` 会压过 `b11012`，
+于是「挑最新」挑到旧的。改成 `localeCompare(b, 'en', { numeric: true })`。
+
+**⑧ `joinPath` 的 `..` 没有根保护（P2）。** `if (segments.length > 0) segments.pop()` 在
+`joinPath('C:/models','..','..')` 上会一路弹到空串。现在认根：只有盘符算一格（`rootSegments`，
+POSIX 的前导斜杠是 leading、不进 `segments`），`..` 到根就停。顺带保证 `joinPath('C:/models','..')`
+得 `'C:/'` 而不是 `'C:'`（后者在 Windows 上会被当成「C 盘的当前目录」而不是盘根）。
+
+**测试**：`launcher.mjs` 78 → **81** 项、`portable.mjs` 37 → **38** 项、`client.mjs` 11 → **13** 项、
+`bridge.mjs` 新增第 11 组「配置改成函数后，改完下一条请求就生效」10 条断言（含 thunk 抛错时退回默认
+800ms 且不抛 500）。`npm run verify` **1373 ✓ / 0 ✗**（第一轮记录 1309）。
+反向验证：L12 去掉 win32 核对段 → 「pid 复用成 chrome.exe」用例变红；C5 去掉 `readOnly` → 「只读态下
+输入框全是灰的」变红；D5 把 thunk 换回值 → 第 11 组变红。
+
+### 跨设备环境核验（发版前最后一遍）
+
+8 条修完之后又按「换一台机器还成不成立」重扫了一遍：现代 API 面（无 `toSorted`/`Object.groupBy`/
+`import.meta.dirname` 之类，`engines.node >= 20` 站得住）、内置模块全走 `node:` 前缀、硬编码平台路径
+全部落在 `WIN`/`MAC` 三元分支内。另外查出**两处真的只在别的机器上才会踩到**的问题：
+
+**⑨ `.cmd` / `.bat` 包装器让「停止」永久失效（P1）。** `runDetached` 里
+`needsShell = platform === 'win32' && /\.(cmd|bat)$/i.test(commandText)` 会走 `shell: true`，
+真正被 spawn 的是 **`cmd.exe`**、pid 也是 `cmd.exe` 的；而调用侧登记的是 `plan.command`
+（那个 `.cmd` 路径）。第 ① 条新加的 `sameImageName` 拿 `pnpm.cmd` 去比 `cmd.exe` 必然不等 ⇒
+每次点「停止」都报「pid 被复用了，不动它」，后端杀不掉——第一轮的 P0 换了个壳复活，而且只在
+把 `launchCommand` 填成包装器的用户身上出现（README 明确支持 pnpm/npx 这类写法）。
+现在 `sameImageName` 把 `cmd`/`cmd.exe` 认作「可能是任何 `.cmd`/`.bat` 的包装器」，
+但**只对 `.cmd`/`.bat` 期望值放行**：期望 `llama-server.exe`、实际 `cmd.exe` 时照旧拦。
+
+**⑩ UNC 路径被压成单斜杠（P2）。** `joinPath` 只留一个前导斜杠，
+`\\\\NAS\\share\\models` → `/NAS/share/models`：变成当前盘根下的路径，扫描结果就是
+「一个模型都没有」且**不报错**；`..` 还能一路退到 `/`。而 README 给的用法正是「用环境变量指
+自己放 gguf 的目录」，网络盘很常见。现在 `//server/share` 两段先摘出来当根，
+`..` 退到共享名就停，两种写法（`//` 与 `\\`）归一后同一条路径。
+
+**测试**：`launcher.mjs` 81 → **84** 项（`.cmd` 放行 / `.bat` 放行 / 期望 `exe` 遇到 `cmd.exe` 仍拦），
+`portable.mjs` 38 → **39** 项（UNC 七条断言）。全套 `npm.cmd run verify` **exit 0**，日志 `✓` 共
+**1385** 条、无 `✗`。
+
+### 文档重写
+
+代码修完之后，README 已经和实际行为脱节得比较厉害：1336 行里大半是历史排查过程与逐条参数推导，
+新用户找不到「这东西解决什么问题」「装完怎么确认它真在干活」。重写成 368 行，顺序改成
+**一句话定位 → 痛点 → 裁了哪四面 → 怎么装 → 怎么确认生效 → 四种后端怎么接 → 配置参考 → 面板 → 七个坑**。
+删掉的是过程记录（那些留在本文件的 0.5.0–0.5.7 段落里），保留的是「照抄就能跑」的命令与默认值。
+
+`package.json` 的 `description` 原来是英文长句，改成中文一句说清「本地模型 + 按 provider 裁剪工具白名单」；
+`keywords` 从 8 个补到 10 个（`dsh` / `dsh-plugin` / `deepseek-harness` / `local-llm` / `llama.cpp` /
+`ollama` / `vllm` / `lm-studio` / `context-window` / `prompt-trim`），去掉 `prompt-engineering`
+（那是方法论词，不是检索词）。`test/publish.mjs` 不校验这两项，所以文案可以自由改而不用动测试。
+
 ## [0.5.7] - 2026-11-26
 
 一句话：**对 v0.5.6 做了一轮纯逻辑复审，又挖出 3 个 P0、28 个 P1、14 个 P2 —— 它们的形状高度一致：把「我不知道」压成了「正常」，或者同一件事在两处各写一遍、只改了一处。**
@@ -173,7 +337,6 @@ endpoint / provider id / 显示名就永久丢了**，而且面板上没有任�
 - 变异验证：把 `portOfBaseURL` 换回手写正则、把 `FLAG_ALIASES` 拆掉、把 `routes.delete` 删掉、
   把 `releaseLock` 换回「一次唤醒所有等待者」，对应的用例立刻变红 —— 断言确实盯着这些 bug。
 - `npm run verify` **1309 ✓ / 0 ✗**（0.5.6 是 1253）。
-
 ## [0.5.6] - 2026-11-17
 
 一句话：**判「这是不是本地端点」以前是拿正则 match 整串 URL，两个方向都在错 —— 其中一个是误判。**

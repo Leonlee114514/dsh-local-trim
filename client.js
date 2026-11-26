@@ -107,6 +107,59 @@ const PANEL_MODULE = {
       }
     }
 
+    /**
+     * [C1-2026-11-26] 「一件事在忙」原来等于「整块变灰」。
+     *
+     * 面板上每个按钮都写 `disabled: busy !== ''`：扫个盘（几秒）点不了「试跑」，
+     * 试跑一条慢模型（可能几十秒）点不了「看日志」，起后端（冷加载十几秒）点不了
+     * 任何一行 —— 可这些动作根本不共享资源。用户的感受是「面板卡了」，实际它在忙
+     * 一件跟你想做的事无关的事。
+     *
+     * 现在按资源分域：每个动作声明自己要占哪些键，只有键相交才互斥。
+     *   config    settings 与面板草稿（load / save / import / adopt / align / delete / reconcile）
+     *   process   本机后端进程（launch / stop / adopt）
+     *   disk      扫模型目录
+     *   endpoint  探一个 HTTP 端点
+     *   status    重新检测
+     *   provider:<id>  单条 provider 的远端调用（test / align）
+     * 互斥仍要留：两个写 settings 的动作并行会撞 revision，两个 launch 并行会起两份进程。
+     */
+    function lockKeysOf(label) {
+      const text = String(label ?? '')
+      if (text.length === 0) return []
+      if (text === 'probe') return ['endpoint']
+      if (text === 'scan') return ['disk']
+      if (text === 'check') return ['status']
+      if (text === 'load' || text === 'save' || text === 'import' || text === 'reconcile') return ['config']
+      // 看日志是纯读，不占任何资源：别的动作在跑时也该让人看日志。
+      if (text === 'log') return []
+      if (text.startsWith('delete:')) return ['config']
+      // 对齐会改写这条 provider 的 models，所以既占 config 也占这条 provider。
+      if (text.startsWith('align:')) return ['config', 'provider:' + text.slice('align:'.length)]
+      if (text.startsWith('test:')) return ['provider:' + text.slice('test:'.length)]
+      // 采用 = 起进程 + 写 provider + 试跑，三样都碰。
+      if (text === 'adopt') return ['process', 'config']
+      if (text.startsWith('launch:') || text.startsWith('stop:')) return ['process']
+      // 认不出来的标签按「独占」处理：宁可多灰一个按钮，也别让两条未知动作撞在一起。
+      return ['*']
+    }
+
+    /**
+     * 某个动作现在能不能点。
+     *
+     * 空的 busyStack 一律能点；否则看键有没有交集。'*'（认不出的标签）与任何键都相交
+     * —— 一条未知动作在跑时整个面板都该等着，这是保守的方向。
+     */
+    function busyBlocks(busyStack, label) {
+      if (!Array.isArray(busyStack) || busyStack.length === 0) return false
+      const want = lockKeysOf(label)
+      if (want.length === 0) return false
+      const busy = busyStack.flatMap(lockKeysOf)
+      if (busy.includes('*')) return true
+      if (want.includes('*')) return true
+      return want.some((key) => busy.includes(key))
+    }
+
     /** 节流拒绝的人话。不是失败，所以不能拼「失败：」前缀。 */
     function throttleNote(error) {
       if (error?.status !== 429) return ''
@@ -491,7 +544,7 @@ const PANEL_MODULE = {
     }
 
     // ── provider 表 ───────────────────────────────────────────────────────
-    function ProviderList({ rows, counts, busy, onTest, onCheck, onLaunch, onStop, onDelete, onAlign, onReconcile, launchedPorts, reconcileConfirm }) {
+    function ProviderList({ rows, counts, busy, blocked, onTest, onCheck, onLaunch, onStop, onDelete, onAlign, onReconcile, launchedPorts, reconcileConfirm }) {
       const list = Array.isArray(rows) ? rows : []
       const mine = new Set(Array.isArray(launchedPorts) ? launchedPorts.map((item) => Number(item?.port ?? item)) : [])
       // 删配置不可撤销（虽然能重新导入），点一次只进入确认态，第二次才真删。
@@ -543,7 +596,7 @@ const PANEL_MODULE = {
                 ...(counts?.stale > 0 || reconcileConfirm === true ? { color: TONE.warn } : {}),
                 ...(reconcileConfirm === true ? { fontWeight: 600 } : {}),
               },
-              disabled: busy !== '',
+              disabled: blocked('reconcile'),
               title:
                 reconcileConfirm === true
                   ? '上一步只列了要改的东西，没有写配置。点这一下才真的删/摘。'
@@ -554,7 +607,7 @@ const PANEL_MODULE = {
             },
             busy === 'reconcile' ? '对账中…' : reconcileConfirm === true ? '确认对账' : '对账',
           ),
-          h('button', { style: S.small, onClick: onCheck, disabled: busy !== '' }, busy === 'check' ? '检测中…' : '重新检测'),
+          h('button', { style: S.small, onClick: onCheck, disabled: blocked('check') }, busy === 'check' ? '检测中…' : '重新检测'),
         ),
         list.length === 0
           ? h('div', { style: S.hint }, 'settings 里还没有 provider。下面填端点导入一个试试。')
@@ -617,7 +670,7 @@ const PANEL_MODULE = {
                       'button',
                       {
                         style: S.small,
-                        disabled: busy !== '',
+                        disabled: blocked('launch:' + row.id),
                         title: '在这台机器上找到后端并起一个脱离宿主的进程，等到端口应答（已经在跑就不会重复起）',
                         onClick: () => onLaunch(row),
                       },
@@ -631,7 +684,7 @@ const PANEL_MODULE = {
                       'button',
                       {
                         style: { ...S.small, color: RED },
-                        disabled: busy !== '',
+                        disabled: blocked('stop:' + row.id),
                         title: '停掉本插件在这个端口上拉起的进程（SIGTERM，赖着不走再 SIGKILL）',
                         onClick: () => onStop(row),
                       },
@@ -642,7 +695,7 @@ const PANEL_MODULE = {
                   'button',
                   {
                     style: S.small,
-                    disabled: busy !== '' || row.local !== true,
+                    disabled: blocked('test:' + row.id) || row.local !== true,
                     title: row.local ? '发一次最小真实请求' : '只对本地 provider 试跑',
                     onClick: () => onTest(row),
                   },
@@ -655,7 +708,7 @@ const PANEL_MODULE = {
                       'button',
                       {
                         style: { ...S.small, ...(row.models.tone === 'bad' ? { color: TONE.bad } : {}) },
-                        disabled: busy !== '',
+                        disabled: blocked('align:' + row.id),
                         title:
                           '按后端此刻真的有的模型改写这条 provider 的 models —— ' +
                           '摘掉已删除的、补上后端有但没注册的；baseURL / 显示名 / compat 都不动',
@@ -677,7 +730,7 @@ const PANEL_MODULE = {
                       pending === row.id
                         ? "再点一次就从配置里删掉这条（磁盘上的模型文件不受影响）"
                         : "把这条 provider 配置删掉（不删磁盘上的 gguf）",
-                    disabled: busy !== '',
+                    disabled: blocked('delete:' + row.id),
                     onClick: () => {
                       if (pending !== row.id) {
                         setPending(row.id)
@@ -706,7 +759,7 @@ const PANEL_MODULE = {
      * gguf」—— 服务还不存在。这里把顺序倒过来：先列出磁盘上的模型文件，选一个，
      * 插件负责起服务 + 写 provider + 试跑，一步到位。
      */
-    function AdoptBox({ scan, setScan, busy, onScan, onAdopt, form, setForm, result }) {
+    function AdoptBox({ scan, setScan, busy, blocked, readOnly, onScan, onAdopt, form, setForm, result }) {
       // allModels 是磁盘上全部 gguf（含 mmproj，用来删）；models 只留能当主模型的那些。
       const allModels = Array.isArray(scan?.models) ? scan.models : []
       const models = Array.isArray(scan?.models) ? scan.models.filter((item) => item.mmproj !== true) : []
@@ -746,7 +799,7 @@ const PANEL_MODULE = {
           { style: S.row },
           h(
             'button',
-            { style: S.button, onClick: onScan, disabled: busy !== '' },
+            { style: S.button, onClick: onScan, disabled: blocked('scan') },
             busy === 'scan' ? '扫描中…' : scan === null ? '扫描本机模型' : '重新扫描',
           ),
           scan === null
@@ -831,7 +884,7 @@ const PANEL_MODULE = {
                         title: item.mmproj === true
                           ? '视觉投影（mmproj）不能单独当主模型用'
                           : titleOf(item),
-                        disabled: busy !== '' || item.mmproj === true,
+                        disabled: blocked('adopt') || readOnly === true || item.mmproj === true,
                         onClick: () => {
                           if (item.mmproj === true) return
                           // 端口跟着点中的这一条走：Ollama 的模型 → 11434，普通 .gguf → 8090。
@@ -884,12 +937,14 @@ const PANEL_MODULE = {
               h('span', { style: S.label }, '端口 / 上下文'),
               h('input', {
                 style: { ...S.input, maxWidth: 90 },
+                disabled: readOnly === true,
                 value: String(form.port),
                 spellCheck: false,
                 onChange: (event) => setForm((prev) => ({ ...prev, port: event.target.value })),
               }),
               h('input', {
                 style: { ...S.input, maxWidth: 110 },
+                disabled: readOnly === true,
                 value: String(form.contextWindow),
                 spellCheck: false,
                 onChange: (event) => setForm((prev) => ({ ...prev, contextWindow: event.target.value })),
@@ -899,6 +954,7 @@ const PANEL_MODULE = {
                 { style: { ...S.hint, display: 'inline-flex', gap: 6, alignItems: 'center' } },
                 h('input', {
                   type: 'checkbox',
+                  disabled: readOnly === true,
                   checked: form.thinking === true,
                   onChange: (event) => setForm((prev) => ({ ...prev, thinking: event.target.checked })),
                 }),
@@ -910,6 +966,7 @@ const PANEL_MODULE = {
                 'select',
                 {
                   style: { ...S.select, maxWidth: 190 },
+                  disabled: readOnly === true,
                   value: String(form.loadMode ?? ''),
                   title: '--load-mode：auto=引擎自己决定，mmap=分页读盘（默认最稳），none=全量进内存',
                   onChange: (event) => setForm((prev) => ({ ...prev, loadMode: event.target.value })),
@@ -933,6 +990,7 @@ const PANEL_MODULE = {
                     { style: { ...S.hint, display: 'inline-flex', gap: 6, alignItems: 'center' } },
                     h('input', {
                       type: 'checkbox',
+                      disabled: readOnly === true,
                       checked: form.confirmHeavy === true,
                       onChange: (event) => setForm((prev) => ({ ...prev, confirmHeavy: event.target.checked })),
                     }),
@@ -944,7 +1002,11 @@ const PANEL_MODULE = {
                 {
                   style: { ...S.button, ...S.primary },
                   onClick: onAdopt,
-                  disabled: busy !== '' || form.modelPath === '' || (heavy && form.confirmHeavy !== true),
+                  disabled:
+                    blocked('adopt') ||
+                    readOnly === true ||
+                    form.modelPath === '' ||
+                    (heavy && form.confirmHeavy !== true),
                 },
                 busy === 'adopt'
                   ? '起服务 + 注册 + 试跑中…（首次加载权重十几秒）'
@@ -974,7 +1036,7 @@ const PANEL_MODULE = {
       )
     }
 
-    function ImportBox({ form, setForm, busy, onProbe, onImport, result }) {
+    function ImportBox({ form, setForm, busy, blocked, readOnly, onProbe, onImport, result }) {
       const models = Array.isArray(form.models) ? form.models : []
       return h(
         'div',
@@ -991,12 +1053,13 @@ const PANEL_MODULE = {
           h('span', { style: S.label }, '端点'),
           h('input', {
             style: { ...S.input, maxWidth: 380 },
+            disabled: readOnly === true,
             value: form.endpoint,
             placeholder: 'http://127.0.0.1:8090',
             spellCheck: false,
             onChange: (event) => setForm((prev) => ({ ...prev, endpoint: event.target.value, models: [], model: '' })),
           }),
-          h('button', { style: S.button, onClick: onProbe, disabled: busy !== '' }, busy === 'probe' ? '探测中…' : '探测'),
+          h('button', { style: S.button, onClick: onProbe, disabled: blocked('probe') }, busy === 'probe' ? '探测中…' : '探测'),
         ),
         models.length > 0
           ? h(
@@ -1007,6 +1070,7 @@ const PANEL_MODULE = {
                 'select',
                 {
                   style: S.select,
+                  disabled: readOnly === true,
                   value: form.model,
                   onChange: (event) => setForm((prev) => ({ ...prev, model: event.target.value })),
                 },
@@ -1021,6 +1085,7 @@ const PANEL_MODULE = {
           h('span', { style: S.label }, 'provider id'),
           h('input', {
             style: { ...S.input, maxWidth: 240 },
+            disabled: readOnly === true,
             value: form.provider,
             placeholder: '留空自动生成（local-llamacpp-…）',
             spellCheck: false,
@@ -1031,6 +1096,7 @@ const PANEL_MODULE = {
             { style: { ...S.hint, display: 'inline-flex', gap: 6, alignItems: 'center' } },
             h('input', {
               type: 'checkbox',
+              disabled: readOnly === true,
               checked: form.thinking === true,
               onChange: (event) => setForm((prev) => ({ ...prev, thinking: event.target.checked })),
             }),
@@ -1041,6 +1107,7 @@ const PANEL_MODULE = {
             { style: { ...S.hint, display: 'inline-flex', gap: 6, alignItems: 'center' } },
             h('input', {
               type: 'checkbox',
+              disabled: readOnly === true,
               checked: form.overwrite === true,
               onChange: (event) => setForm((prev) => ({ ...prev, overwrite: event.target.checked })),
             }),
@@ -1055,7 +1122,7 @@ const PANEL_MODULE = {
             {
               style: { ...S.button, ...S.primary },
               onClick: onImport,
-              disabled: busy !== '' || form.model === '',
+              disabled: blocked('import') || readOnly === true || form.model === '',
             },
             busy === 'import' ? '导入并试跑中…' : '导入并试跑',
           ),
@@ -1083,6 +1150,8 @@ const PANEL_MODULE = {
       const setBusy = React.useCallback((label) => {
         setBusyStack((prev) => (label === '' ? prev.slice(0, -1) : [...prev, label]))
       }, [])
+      // [C1-2026-11-26] 「这个按钮现在能不能点」按资源域判断，不再「有一件事在忙就全灰」。
+      const blocked = React.useCallback((label) => busyBlocks(busyStack, label), [busyStack])
       // [seq] 每次 load/refreshStatus 领一个号，回来时号不是最新的就丢掉 ——
       // 否则先发的慢请求后到，会把新的 draft / status 覆盖成旧值。
       const loadSeq = React.useRef(0)
@@ -1200,6 +1269,28 @@ const PANEL_MODULE = {
           /* 状态刷新失败不影响已显示的内容 */
         }
       }, [])
+
+      /**
+       * [C2-2026-11-26] 「写完之后要不要重画面板」只有一处判断。
+       *
+       * adopt（一键配置）和 import（导入并试跑）都写 settings，回来后要重载面板。
+       * 原来 adopt 是 `if (result.ok === true) await load()` —— 直接把草稿冲掉，
+       * 用户在高级配置里改了一半的东西没了；import 那条早就做了指纹比较并留了提示，
+       * 两条路径对同一件事给了两个答案。
+       *
+       * 现在共用这一个：草稿脏就只刷状态并返回 false（调用方负责把提示拼上），
+       * 干净才真重载。
+       */
+      const reloadIfClean = React.useCallback(async () => {
+        const clean =
+          draft === null || draftSignature(draft) === draftSignature(normalizeDraft(state.values))
+        if (clean) {
+          await load()
+          return true
+        }
+        await refreshStatus()
+        return false
+      }, [draft, load, refreshStatus, state.values])
 
       const scanModels = React.useCallback(async () => {
         setBusy('scan')
@@ -1319,14 +1410,16 @@ const PANEL_MODULE = {
             lines.push('试跑失败：' + (result.smoke.error ?? '没拿到回复'))
           }
           if (result.ok !== true) lines.push('卡在 ' + (result.stage ?? '?') + '：' + (result.error ?? ''))
+          if (result.ok === true && (await reloadIfClean()) === false) {
+            lines.push('（面板上有没保存的改动，没敢覆盖你的草稿；要按新配置重画就点「刷新」）')
+          }
           setAdoptResult({ ok: result.ok === true, text: lines.join('\n') })
-          if (result.ok === true) await load()
         } catch (error) {
           setAdoptResult({ ok: false, text: '一键配置失败：' + String(error?.message ?? error) })
         } finally {
           setBusy('')
         }
-      }, [adoptForm, load, setBusy])
+      }, [adoptForm, load, reloadIfClean, setBusy])
 
       if (!mine) return null
 
@@ -1541,16 +1634,12 @@ const PANEL_MODULE = {
           // [P1-26-2026-11-25] 导入写的是 settings，重载会把面板上所有草稿字段换成服务端值。
           // 用户如果正改到一半（描述上限、路由、注入文本…），这一下等于白改。
           // 所以先比指纹：草稿跟「最后一次载入的服务端值」不一致就不重载，只刷状态。
-          const dirty =
-            draft !== null && draftSignature(draft) !== draftSignature(normalizeDraft(state.values))
-          if (dirty) {
-            await refreshStatus()
+          const reloaded = await reloadIfClean()
+          if (!reloaded) {
             setImportResult({
               ok: true,
               text: head + '\n' + tail + '\n（面板上有没保存的改动，没敢覆盖你的草稿；要按新配置重画就点「刷新」）',
             })
-          } else {
-            await load()
           }
         } catch (error) {
           setImportResult({ ok: false, text: String(error?.message ?? error) })
@@ -1678,7 +1767,7 @@ const PANEL_MODULE = {
         { style: S.row },
         h('p', { style: { ...S.title, margin: 0 } }, '轻量 harness'),
         h('span', { style: S.grow }),
-        h('button', { style: S.button, onClick: load, disabled: busy !== '' }, busy === 'load' ? '读取中…' : '刷新'),
+        h('button', { style: S.button, onClick: load, disabled: blocked('load') }, busy === 'load' ? '读取中…' : '刷新'),
       )
 
       if (state.loading) return h('div', { style: S.card }, head, h('div', { style: S.hint }, '读取中…'))
@@ -1705,6 +1794,10 @@ const PANEL_MODULE = {
       const provision = status.provision ?? {}
       const flags = status.flags ?? {}
       const legacy = status.legacy ?? null
+      // [C5-2026-11-26] 只读态（宿主没把本插件登记成可写设置条目）原来只在顶上挂一句提示，
+      // 输入框照旧能改：用户改满一屏、点保存才吃到一条错误，改的东西全丢。现在把只读
+      // 直接压到控件上 —— 改不动就不会白改。
+      const readOnly = state.writable === false
 
       return h(
         'div',
@@ -1757,6 +1850,7 @@ const PANEL_MODULE = {
           rows: status.providers,
           counts: status.counts,
           busy,
+          blocked,
           onTest: test,
           onCheck: check,
           onLaunch: launch,
@@ -1800,6 +1894,8 @@ const PANEL_MODULE = {
           scan,
           setScan,
           busy,
+          blocked,
+          readOnly,
           onScan: scanModels,
           onAdopt: runAdopt,
           form: adoptForm,
@@ -1808,7 +1904,16 @@ const PANEL_MODULE = {
         }),
 
         // ④ 导入
-        h(ImportBox, { form, setForm, busy, onProbe: probeEndpoint, onImport: runImport, result: importResult }),
+        h(ImportBox, {
+          form,
+          setForm,
+          busy,
+          blocked,
+          readOnly,
+          onProbe: probeEndpoint,
+          onImport: runImport,
+          result: importResult,
+        }),
 
         // ⑤ 高级配置（折叠）
         h(
@@ -1825,6 +1930,7 @@ const PANEL_MODULE = {
               h('span', { style: S.label }, label),
               h('input', {
                 type: 'checkbox',
+                disabled: readOnly,
                 checked: draft.booleans[key] === true,
                 onChange: (event) =>
                   setDraft((prev) => ({ ...prev, booleans: { ...prev.booleans, [key]: event.target.checked } })),
@@ -1839,6 +1945,7 @@ const PANEL_MODULE = {
               h('input', {
                 type: 'number',
                 min: 0,
+                disabled: readOnly,
                 style: { ...S.input, maxWidth: 120 },
                 value: draft.numbers[key] ?? '',
                 onChange: (event) =>
@@ -1859,6 +1966,7 @@ const PANEL_MODULE = {
             ),
             h('input', {
               style: { ...S.input, width: '100%' },
+              disabled: readOnly,
               value: draft.launchCommand,
               placeholder: '留空 = 自动找',
               spellCheck: false,
@@ -1875,6 +1983,7 @@ const PANEL_MODULE = {
               h('div', { style: S.hint }, hint),
               h('textarea', {
                 rows: key === 'keep' || key === 'dropSections' ? 8 : 3,
+                disabled: readOnly,
                 style: S.code,
                 value: draft.lists[key],
                 onChange: (event) =>
@@ -1891,6 +2000,7 @@ const PANEL_MODULE = {
             h('div', { style: S.hint }, '留空则用 ~/.dsh/local-llm/light-inject.md，再没有就用内置默认。'),
             h('textarea', {
               rows: 6,
+              disabled: readOnly,
               style: S.code,
               value: draft.injectText,
               onChange: (event) => setDraft((prev) => ({ ...prev, injectText: event.target.value })),
@@ -1904,6 +2014,7 @@ const PANEL_MODULE = {
             h('span', { style: S.label }, '一步到位'),
             h('input', {
               type: 'checkbox',
+              disabled: readOnly,
               checked: draft.provision === true,
               onChange: (event) =>
                 setDraft((prev) => ({
@@ -1934,6 +2045,7 @@ const PANEL_MODULE = {
                 h('span', { style: S.label }, '端点（可选）'),
                 h('input', {
                   style: { ...S.input, minWidth: 220 },
+                  disabled: readOnly,
                   value: provisionField('endpoint'),
                   placeholder: 'http://127.0.0.1:8081/v1（留空 = 探测内置端口表）',
                   spellCheck: false,
@@ -1942,6 +2054,7 @@ const PANEL_MODULE = {
                 h('span', { style: S.label }, 'provider id'),
                 h('input', {
                   style: { ...S.input, maxWidth: 150 },
+                  disabled: readOnly,
                   value: provisionField('provider'),
                   placeholder: '留空 = 自动',
                   spellCheck: false,
@@ -1950,6 +2063,7 @@ const PANEL_MODULE = {
                 h('span', { style: S.label }, '显示名'),
                 h('input', {
                   style: { ...S.input, maxWidth: 150 },
+                  disabled: readOnly,
                   value: provisionField('displayName'),
                   placeholder: '留空 = 自动',
                   spellCheck: false,
@@ -1962,10 +2076,10 @@ const PANEL_MODULE = {
             { style: { ...S.row, marginTop: 14 } },
             h(
               'button',
-              { style: { ...S.button, ...S.primary }, onClick: save, disabled: busy !== '' },
+              { style: { ...S.button, ...S.primary }, onClick: save, disabled: blocked('save') || readOnly },
               busy === 'save' ? '保存中…' : '保存',
             ),
-            h('button', { style: S.button, onClick: showLog, disabled: busy !== '' }, '看日志'),
+            h('button', { style: S.button, onClick: showLog, disabled: blocked('log') }, '看日志'),
             h('span', { style: S.grow }),
             h('span', { style: S.hint }, 'revision ' + (state.revision ?? '—')),
           ),
